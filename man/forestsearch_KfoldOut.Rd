@@ -4,7 +4,7 @@
 \alias{forestsearch_KfoldOut}
 \title{ForestSearch K-Fold Cross-Validation Output Summary}
 \usage{
-forestsearch_KfoldOut(res, details = FALSE, outall = FALSE)
+forestsearch_KfoldOut(res, details = FALSE, outall = FALSE, digits = 4)
 }
 \arguments{
 \item{res}{List. Result object from ForestSearch cross-validation, must contain
@@ -15,6 +15,14 @@ elements: \code{cv_args}, \code{sg_analysis}, \code{sg0.name}, \code{sg1.name},
 
 \item{outall}{Logical. If TRUE, returns all summary tables; if FALSE, returns
 only metrics (default: FALSE).}
+
+\item{digits}{Integer. Decimal places for construction-time numeric
+formatting in the per-fold summary tables built when
+\code{outall = TRUE} (arm summaries, Diff, effect-estimate CI).
+Default 4 to provide round-down headroom for downstream display
+reformatting (e.g., \code{\link{cv_summary_tables}(digits = ...)}).
+Threaded through \code{\link{SG_tab_estimates_glm}} for GLM
+outcomes.  Ignored when \code{outall = FALSE}.}
 }
 \value{
 If \code{outall=FALSE}, a list with \code{sens_metrics_original} and
@@ -23,4 +31,16 @@ If \code{outall=FALSE}, a list with \code{sens_metrics_original} and
 \description{
 Summarizes cross-validation results for ForestSearch, including subgroup
 agreement and performance metrics.
+}
+\examples{
+\dontrun{
+library(survival)
+df <- survival::gbsg
+df$grade3 <- as.integer(df$grade == "3")
+fs <- forestsearch(df,
+  confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+  outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+oob <- forestsearch_Kfold(fs.est = fs, Kfolds = nrow(df))
+result <- forestsearch_KfoldOut(oob, outall = TRUE)
+}
 }

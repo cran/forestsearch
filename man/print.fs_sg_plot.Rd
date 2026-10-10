@@ -12,9 +12,18 @@
 \item{...}{Additional arguments (unused)}
 }
 \value{
-Invisibly returns \code{x}.
+\code{x}, invisibly. Called for its side effect of printing the
+subgroup definition, summary statistics and hazard ratio estimates.
 }
 \description{
 Print Method for fs_sg_plot Objects
 }
-\keyword{internal}
+\examples{
+\dontrun{
+fs <- forestsearch(gbsg,
+  confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+  outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+p <- plot_subgroup(fs)
+print(p)
+}
+}

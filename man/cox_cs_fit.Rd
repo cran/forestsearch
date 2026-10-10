@@ -121,7 +121,7 @@ The \code{plot_params} argument accepts a list with:
 }
 }
 \examples{
-\donttest{
+\dontrun{
 # Simulate data
 set.seed(123)
 df <- data.frame(

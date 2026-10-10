@@ -64,6 +64,31 @@
 #' @param theme An fs_forest_theme object from \code{create_forest_theme()}.
 #'   Use this to control plot sizing (fonts, row height, CI appearance,
 #'   CV annotation font size). Default: NULL (uses default theme).
+#' @param outcome_type Character or \code{NULL}. One of \code{"survival"}
+#'   (default), \code{"binary"}, or \code{"continuous"}.  If \code{NULL},
+#'   auto-detected from \code{fs_results$fs.est$outcome_type}.
+#' @param effect_measure Character or \code{NULL}. Effect measure for GLM
+#'   outcomes (e.g., \code{"OR"}, \code{"RR"}, \code{"IRR"}, \code{"RD"},
+#'   \code{"IRD"}, \code{"MD"}).  Auto-detected from
+#'   \code{fs_results$fs.est$effect_measure} if \code{NULL}.
+#' @param offset.name Character or \code{NULL}. Follow-up time column for
+#'   rate-based measures (IRR, IRD).
+#' @param adjust_covariates Character vector or \code{NULL}. Baseline
+#'   covariates to adjust the GLM-row effect models for, matching the
+#'   adjustment used during search/estimation.  When \code{NULL}, resolved
+#'   from \code{fs_results$fs.est$args_call_all$adjust_covariates} so the
+#'   forest-plot CIs share the fit's scale.  Applies to GLM rows only.
+#' @param extreme_ci_cap Numeric. Multiplier for outlier-resistant axis
+#'   limits when \code{xlim_method = "data"}.  If the most extreme CI bound
+#'   exceeds twice the second-most extreme, the axis limit is capped at
+#'   \code{extreme_ci_cap} times the second-most extreme bound.
+#'   Default 1.5.  Set to \code{Inf} to disable.
+#' @param xlim_method Character. Method for computing default axis limits
+#'   for GLM measures when \code{xlim} is not user-supplied.
+#'   \code{"clinical"} (default) uses fixed clinically meaningful ranges:
+#'   HR/OR/RR/IRR = (0.25, 4.0), RD/IRD = (-0.50, 0.50), MD = data-driven.
+#'   \code{"data"} computes limits from the actual estimates with
+#'   outlier resistance controlled by \code{extreme_ci_cap}.
 #'
 #' @return A list containing:
 #'   \describe{
@@ -95,6 +120,58 @@
 #' For \code{est.scale = "1/hr"} (searching for benefit):
 #' \itemize{
 #'   \item Roles are reversed: H becomes the benefit group
+#' }
+#'
+#' @examples
+#' \dontrun{
+#' # Load ForestSearch results
+#' load("fs_analysis_results.Rdata")  # Contains fs.est, fs_bc, fs_kfold
+#'
+#' # Define subgroups to display
+#' subgroups <- list(
+#'   bm_gt1 = list(
+#'     subset_expr = "BM > 1",
+#'     name = "BM > 1",
+#'     type = "reference"
+#'   ),
+#'   bm_gt1_size_gt19 = list(
+#'     subset_expr = "BM > 1 & tmrsize > 19",
+#'     name = "BM > 1 & Tumor Size > 19",
+#'     type = "posthoc"
+#'   )
+#' )
+#'
+#' # Create the forest plot with default theme
+#' result <- plot_subgroup_results_forestplot(
+#'   fs_results = list(fs.est = fs.est, fs_bc = fs_bc, fs_kfold = fs_kfold),
+#'   df_analysis = df_itt,
+#'   subgroup_list = subgroups,
+#'   outcome.name = "os_time",
+#'   event.name = "os_event",
+#'   treat.name = "combo",
+#'   E.name = "Experimental+CT",
+#'   C.name = "CT"
+#' )
+#'
+#' # Create with custom theme for larger plot
+#' large_theme <- create_forest_theme(
+#'   base_size = 14,
+#'   row_padding = c(6, 4),
+#'   cv_fontsize = 11
+#' )
+#'
+#' result <- plot_subgroup_results_forestplot(
+#'   fs_results = list(fs.est = fs.est, fs_bc = fs_bc, fs_kfold = fs_kfold),
+#'   df_analysis = df_itt,
+#'   subgroup_list = subgroups,
+#'   outcome.name = "os_time",
+#'   event.name = "os_event",
+#'   treat.name = "combo",
+#'   theme = large_theme
+#' )
+#'
+#' # Display the plot
+#' render_forestplot(result)
 #' }
 #'
 #' @seealso
@@ -130,7 +207,13 @@ plot_subgroup_results_forestplot <- function(
     reference_colors = c("yellow", "powderblue"),
     ci_column_spaces = 20,
     conf.level = 0.95,
-    theme = NULL
+    theme = NULL,
+    outcome_type = NULL,
+    effect_measure = NULL,
+    offset.name = NULL,
+    adjust_covariates = NULL,
+    extreme_ci_cap = 1.5,
+    xlim_method = c("clinical", "data")
 ) {
 
   # ==========================================================================
@@ -154,6 +237,7 @@ plot_subgroup_results_forestplot <- function(
   # Match cv_source argument
 
   cv_source <- match.arg(cv_source)
+  xlim_method <- match.arg(xlim_method)
 
  # Determine which CV sources to use based on cv_source parameter
   cv_data_kfold <- NULL
@@ -188,12 +272,206 @@ plot_subgroup_results_forestplot <- function(
   # Calculate z-multiplier for confidence intervals
   z_alpha <- qnorm(1 - (1 - conf.level) / 2)
 
-  # Create dynamic CI column label
-  ci_label <- sprintf("HR (%d%% CI)", round(conf.level * 100))
+  # ==========================================================================
+  # GLM Outcome Type Detection and Display Defaults
+  # ==========================================================================
+
+  # Auto-detect outcome_type and effect_measure from fs_results
+  if (is.null(outcome_type) && !is.null(fs.est)) {
+    outcome_type <- fs.est$outcome_type
+  }
+  if (is.null(outcome_type)) outcome_type <- "survival"
+
+  if (is.null(effect_measure) && !is.null(fs.est)) {
+    effect_measure <- fs.est$effect_measure
+  }
+
+  if (is.null(offset.name) && !is.null(fs.est) &&
+      !is.null(fs.est$args_call_all$offset.name)) {
+    offset.name <- fs.est$args_call_all$offset.name
+  }
+
+  # Adjustment terms for the GLM rows: match the search/estimate adjustment so
+  # the forest-plot CIs are on the same scale as the reported estimate.
+  # Resolved from the call record unless the caller overrides explicitly.
+  if (is.null(adjust_covariates) && !is.null(fs.est) &&
+      !is.null(fs.est$args_call_all$adjust_covariates)) {
+    adjust_covariates <- fs.est$args_call_all$adjust_covariates
+  }
+
+  is_glm <- outcome_type != "survival"
+  is_log_scale <- is_glm && !is.null(effect_measure) &&
+    effect_measure %in% c("OR", "RR", "IRR")
+
+  # Set display defaults based on outcome type and effect measure
+  if (is_glm && !is.null(effect_measure)) {
+    measure_label <- effect_measure_to_label(effect_measure)
+
+    # CI column label
+    ci_label <- sprintf("%s (%d%% CI)", effect_measure,
+                        round(conf.level * 100))
+
+    # Reference line: 1 for ratio measures, 0 for difference measures
+    ref_line <- if (is_log_scale) 1 else 0
+
+    if (missing(xlog)) {
+      xlog <- is_log_scale
+    }
+
+    # xlim / ticks_at resolution:
+    #   1. User-supplied xlim/ticks_at always win
+    #   2. xlim_method = "clinical" (default): fixed per-measure defaults
+    #   3. xlim_method = "data": data-driven, computed after rows are built
+    xlim_user <- !missing(xlim)
+    ticks_user <- !missing(ticks_at)
+
+    if (!xlim_user) {
+      if (xlim_method == "clinical") {
+        # Clinically meaningful fixed defaults
+        xlim <- switch(effect_measure,
+          "HR" =, "OR" =, "RR" =, "IRR" = c(0.25, 4.0),
+          "RD" =, "IRD" = c(-0.50, 0.50),
+          "MD" = c(-10, 10)  # placeholder for MD; data-driven below
+        )
+        # MD has no natural clinical scale -- always use data-driven
+        xlim_deferred <- (effect_measure == "MD")
+      } else {
+        # Data-driven: defer all measures
+        xlim_deferred <- TRUE
+        xlim <- if (is_log_scale) c(0.25, 4.0) else c(-10, 10)
+      }
+    } else {
+      xlim_deferred <- FALSE
+    }
+
+    if (!ticks_user) {
+      if (!xlim_deferred) {
+        # Compute ticks from known xlim
+        if (is_log_scale) {
+          ticks_at <- c(0.25, 0.50, 1.0, 2.0, 4.0)
+          ticks_at <- ticks_at[ticks_at >= xlim[1] & ticks_at <= xlim[2]]
+        } else {
+          ticks_at <- pretty(xlim, n = 5)
+          if (!0 %in% ticks_at) ticks_at <- sort(c(0, ticks_at))
+          ticks_at <- ticks_at[ticks_at >= xlim[1] & ticks_at <= xlim[2]]
+        }
+      } else {
+        ticks_at <- NULL  # computed after data-driven xlim
+      }
+      ticks_deferred <- xlim_deferred
+    } else {
+      ticks_deferred <- FALSE
+    }
+
+    if (missing(arrow_text)) {
+      arrow_text <- c("Favors Experimental", "Favors Control")
+    }
+  } else {
+    # Survival defaults (unchanged from original)
+    ci_label <- sprintf("HR (%d%% CI)", round(conf.level * 100))
+    ref_line <- 1
+    xlim_deferred <- FALSE
+    ticks_deferred <- FALSE
+  }
 
   # ==========================================================================
   # Helper Functions
   # ==========================================================================
+
+  # Create GLM effect row for a subgroup (parallel to create_hr_row)
+  create_glm_row <- function(dfa, sg_name, outcome.name, treat.name,
+                             effect_measure, offset.name, E.name, C.name) {
+
+    if (nrow(dfa) < 10) {
+      warning(paste("Subgroup", sg_name, "has fewer than 10 observations"))
+      return(NULL)
+    }
+
+    Treat <- dfa[[treat.name]]
+    Y     <- dfa[[outcome.name]]
+    if (length(unique(Treat)) < 2) {
+      warning(paste("Subgroup", sg_name, "has no variation in treatment"))
+      return(NULL)
+    }
+
+    ntreat   <- sum(Treat)
+    ncontrol <- sum(1 - Treat)
+
+    # For binary outcomes, check per-arm event counts
+    # Sparse cells (0 or all events in one arm) produce unreliable estimates
+    if (outcome_type == "binary") {
+      events_t <- sum(Y[Treat == 1])
+      events_c <- sum(Y[Treat == 0])
+      nonevents_t <- ntreat - events_t
+      nonevents_c <- ncontrol - events_c
+
+      if (events_t < 1 || events_c < 1 ||
+          nonevents_t < 1 || nonevents_c < 1) {
+        # Return row with NA -- shows sample sizes but no CI bar
+        row <- data.frame(Subgroup = sg_name, stringsAsFactors = FALSE)
+        row[[E.name]] <- ntreat
+        row[[C.name]] <- ncontrol
+        row$est <- NA_real_
+        row$low <- NA_real_
+        row$hi  <- NA_real_
+        row$se  <- NA_real_
+        return(row)
+      }
+    }
+
+    fn <- make_effect_estimator(
+      outcome_type   = outcome_type,
+      treat.name     = treat.name,
+      outcome.name   = outcome.name,
+      offset.name    = offset.name,
+      effect_measure = effect_measure,
+      adjust_covariates = adjust_covariates,
+      ps_adjust_method = "none"
+    )
+
+    res <- tryCatch(fn(dfa), error = function(e) {
+      warning(paste("GLM model failed for", sg_name, ":", e$message))
+      NULL
+    })
+
+    if (is.null(res) || is.na(res$estimate)) return(NULL)
+
+    est_raw <- res$estimate
+    se_raw  <- res$se
+
+    # Transform to display scale
+    if (is_log_scale) {
+      est_disp <- exp(est_raw)
+      low_disp <- exp(est_raw - z_alpha * se_raw)
+      hi_disp  <- exp(est_raw + z_alpha * se_raw)
+    } else {
+      est_disp <- est_raw
+      low_disp <- est_raw - z_alpha * se_raw
+      hi_disp  <- est_raw + z_alpha * se_raw
+    }
+
+    row <- data.frame(Subgroup = sg_name, stringsAsFactors = FALSE)
+    row[[E.name]] <- ntreat
+    row[[C.name]] <- ncontrol
+    row$est <- est_disp
+    row$low <- low_disp
+    row$hi  <- hi_disp
+    row$se  <- se_raw
+
+    return(row)
+  }
+
+  # Dispatcher: use GLM or Cox row creation
+  create_row <- function(dfa, sg_name, outcome.name, event.name, treat.name,
+                         E.name, C.name) {
+    if (is_glm) {
+      create_glm_row(dfa, sg_name, outcome.name, treat.name,
+                     effect_measure, offset.name, E.name, C.name)
+    } else {
+      create_hr_row(dfa, sg_name, outcome.name, event.name, treat.name,
+                    E.name, C.name)
+    }
+  }
 
   # Create HR table row for a subgroup
   # Uses robust (sandwich) standard errors for consistency with cox_summary()
@@ -343,7 +621,7 @@ plot_subgroup_results_forestplot <- function(
   # ==========================================================================
 
   # Start with ITT row
-  dt <- create_hr_row(df_analysis, "ITT", outcome.name, event.name, treat.name,
+  dt <- create_row(df_analysis, "ITT", outcome.name, event.name, treat.name,
                       E.name, C.name)
   row_types <- c("itt")
   cv_texts <- list()
@@ -364,7 +642,7 @@ plot_subgroup_results_forestplot <- function(
 
 
         if (!is.null(df_sg) && nrow(df_sg) > 10) {
-          sg_row <- create_hr_row(df_sg, sg$name, outcome.name, event.name,
+          sg_row <- create_row(df_sg, sg$name, outcome.name, event.name,
                                   treat.name, E.name, C.name)
           if (!is.null(sg_row)) {
             dt <- rbind(dt, sg_row)
@@ -390,7 +668,7 @@ plot_subgroup_results_forestplot <- function(
         df_sg <- safe_subset(df_analysis, sg$subset_expr)
 
         if (!is.null(df_sg) && nrow(df_sg) > 10) {
-          sg_row <- create_hr_row(df_sg, paste0("  ", sg$name), outcome.name,
+          sg_row <- create_row(df_sg, paste0("  ", sg$name), outcome.name,
                                   event.name, treat.name, E.name, C.name)
           if (!is.null(sg_row)) {
             dt <- rbind(dt, sg_row)
@@ -409,7 +687,16 @@ plot_subgroup_results_forestplot <- function(
   # -----------------------------------------------------------------
   # SECTION 3: Add identified subgroups from ForestSearch
   # -----------------------------------------------------------------
-  if (!is.null(fs.est) && !is.null(fs.est$df.est)) {
+  # Only add FS subgroup rows when a subgroup was actually identified.
+  # The DINA/GRF selection paths return a populated df.est WITHOUT a
+  # treat.recommend column on their no-subgroup result, so gating on df.est
+  # alone entered this block for a no-subgroup DINA/GRF fit and crashed at
+  # the subset(df_fs, treat.recommend == ...) calls below with the cryptic
+  # "object 'treat.recommend' not found".  Key on sg.harm (the actual
+  # no-subgroup contract) so no-subgroup fits simply skip these rows.  A
+  # subgroup-found fit has sg.harm non-NULL AND df.est populated, so the
+  # block runs unchanged.
+  if (!is.null(fs.est) && !is.null(fs.est$sg.harm) && !is.null(fs.est$df.est)) {
 
     df_fs <- fs.est$df.est
 
@@ -424,7 +711,10 @@ plot_subgroup_results_forestplot <- function(
     # IMPORTANT: sg.harm defines the HARM subgroup (H), NOT benefit
     sg_harm <- fs.est$sg.harm
     if (!is.null(sg_harm)) {
-      harm_label <- paste(sg_harm, collapse = " & ")
+      # Display-only: round post-operator thresholds for the row label.  The
+      # membership-defining sg.harm is unaffected (tidy_cut_display() touches
+      # only numbers following a comparison operator).
+      harm_label <- paste(tidy_cut_display(sg_harm, digits = 3L), collapse = " & ")
     } else {
       harm_label <- "Identified Subgroup"
     }
@@ -485,7 +775,7 @@ plot_subgroup_results_forestplot <- function(
     row_types <- c(row_types, "posthoc_header")
 
     if (nrow(df_benefit) > 10) {
-      benefit_row <- create_hr_row(df_benefit, "  Full-analysis",
+      benefit_row <- create_row(df_benefit, "  Full-analysis",
                                    outcome.name, event.name, "treat",
                                    E.name, C.name)
       if (!is.null(benefit_row)) {
@@ -520,7 +810,7 @@ plot_subgroup_results_forestplot <- function(
     row_types <- c(row_types, "posthoc_complement_header")
 
     if (nrow(df_question) > 10) {
-      question_row <- create_hr_row(df_question, "  Full-analysis",
+      question_row <- create_row(df_question, "  Full-analysis",
                                     outcome.name, event.name, "treat",
                                     E.name, C.name)
       if (!is.null(question_row)) {
@@ -574,6 +864,151 @@ plot_subgroup_results_forestplot <- function(
           }
         }
       }
+    }
+  }
+
+  # ==========================================================================
+  # Compute Data-Driven xlim/ticks_at for GLM Measures
+  #
+  # After all rows are built, compute axis limits from the actual data.
+  # Outlier-resistant: if the most extreme bound is more than 2x the
+  # second-most extreme, the limit is capped at extreme_ci_cap times
+  # the second-most extreme bound.  This prevents a single subgroup
+  # with a sparse-cell estimate from compressing all other CIs.
+  #
+  # Per-measure hard guardrails still apply as a safety net:
+  #   OR/RR/IRR: axis bounded to [0.05, 20.0]
+  #   RD/IRD:    axis bounded to [-0.80, 0.80]
+  #   MD:        no hard cap (outcome scale is arbitrary)
+  # ==========================================================================
+
+  if (isTRUE(xlim_deferred) && is_glm) {
+
+    # Collect non-NA values from data rows only (exclude header/separator)
+    est_valid <- dt$est[!is.na(dt$est)]
+    low_valid <- dt$low[!is.na(dt$low)]
+    hi_valid  <- dt$hi[!is.na(dt$hi)]
+
+    # Helper: outlier-resistant upper bound
+    # If max(vals) > 2 * second_max, cap at extreme_ci_cap * second_max
+    robust_upper <- function(vals, cap_frac) {
+      vals <- sort(unique(vals[is.finite(vals)]))
+      if (length(vals) < 2) return(max(vals, na.rm = TRUE))
+      top <- vals[length(vals)]
+      second <- vals[length(vals) - 1]
+      if (top > 2 * second) cap_frac * second else top
+    }
+
+    # Helper: outlier-resistant lower bound (analogous, on the low side)
+    robust_lower <- function(vals, cap_frac) {
+      vals <- sort(unique(vals[is.finite(vals)]))
+      if (length(vals) < 2) return(min(vals, na.rm = TRUE))
+      bottom <- vals[1]
+      second <- vals[2]
+      if (bottom < second / 2) second / cap_frac else bottom
+    }
+
+    if (is_log_scale) {
+      # Ratio measures: work on the exponentiated scale
+      ref_val <- 1
+      hard_floor <- 0.05
+      hard_ceil  <- 20.0
+
+      # Upper limit from hi values
+      hi_capped <- pmin(hi_valid, hard_ceil)
+      if (length(hi_capped) >= 2) {
+        upper_lim <- robust_upper(hi_capped, extreme_ci_cap)
+      } else if (length(hi_capped) == 1) {
+        upper_lim <- hi_capped
+      } else {
+        upper_lim <- 4.0
+      }
+
+      # Lower limit from low values
+      low_capped <- pmax(low_valid, hard_floor)
+      if (length(low_capped) >= 2) {
+        lower_lim <- robust_lower(low_capped, extreme_ci_cap)
+      } else if (length(low_capped) == 1) {
+        lower_lim <- low_capped
+      } else {
+        lower_lim <- 0.25
+      }
+
+      # Ensure ref_line = 1 is within range
+      lower_lim <- min(lower_lim, ref_val)
+      upper_lim <- max(upper_lim, ref_val)
+
+      # Add padding on log scale
+      log_pad <- max(0.1, (log(upper_lim) - log(lower_lim)) * 0.10)
+      xlim <- c(
+        max(hard_floor, exp(log(lower_lim) - log_pad)),
+        min(hard_ceil, exp(log(upper_lim) + log_pad))
+      )
+      # Round to nice values
+      xlim[1] <- max(hard_floor, floor(xlim[1] * 20) / 20)
+      xlim[2] <- min(hard_ceil, ceiling(xlim[2] * 2) / 2)
+
+    } else {
+      # Identity measures (RD, IRD, MD)
+      ref_val <- 0
+      all_vals <- c(est_valid, low_valid, hi_valid, ref_val)
+
+      # Hard guardrails for proportion-scale measures
+      if (!is.null(effect_measure) && effect_measure %in% c("RD", "IRD")) {
+        hard_ceil  <- 0.80
+        hard_floor <- -0.80
+        all_vals <- pmin(pmax(all_vals, hard_floor), hard_ceil)
+      }
+
+      # Upper limit
+      if (length(hi_valid) >= 2) {
+        upper_lim <- robust_upper(
+          c(hi_valid, est_valid, ref_val), extreme_ci_cap)
+      } else {
+        upper_lim <- max(all_vals, na.rm = TRUE)
+      }
+
+      # Lower limit
+      if (length(low_valid) >= 2) {
+        lower_lim <- robust_lower(
+          c(low_valid, est_valid, ref_val), extreme_ci_cap)
+      } else {
+        lower_lim <- min(all_vals, na.rm = TRUE)
+      }
+
+      # Ensure ref_line = 0 is within range
+      lower_lim <- min(lower_lim, ref_val)
+      upper_lim <- max(upper_lim, ref_val)
+
+      # Padding
+      rng <- upper_lim - lower_lim
+      pad <- max(0.05, rng * 0.10)
+      xlim <- c(lower_lim - pad, upper_lim + pad)
+
+      if (!is.null(effect_measure) && effect_measure %in% c("RD", "IRD")) {
+        xlim[1] <- floor(xlim[1] * 20) / 20
+        xlim[2] <- ceiling(xlim[2] * 20) / 20
+      } else {
+        xlim[1] <- floor(xlim[1] * 2) / 2
+        xlim[2] <- ceiling(xlim[2] * 2) / 2
+      }
+    }
+  }
+
+  # Compute ticks_at from final xlim if deferred
+  if (isTRUE(ticks_deferred) && is_glm) {
+    if (is_log_scale) {
+      log_range <- log10(xlim)
+      ticks_at <- sort(unique(c(
+        10^pretty(log_range, n = 4),
+        ref_line
+      )))
+      ticks_at <- round(ticks_at, 2)
+      ticks_at <- ticks_at[ticks_at >= xlim[1] & ticks_at <= xlim[2]]
+    } else {
+      ticks_at <- pretty(xlim, n = 5)
+      if (!0 %in% ticks_at) ticks_at <- sort(c(0, ticks_at))
+      ticks_at <- ticks_at[ticks_at >= xlim[1] & ticks_at <= xlim[2]]
     }
   }
 
@@ -679,13 +1114,101 @@ plot_subgroup_results_forestplot <- function(
   # Add spacing column for CI plot (width controlled by ci_column_spaces)
   dt$` ` <- paste(rep(" ", ci_column_spaces), collapse = " ")
 
-  # Create HR (xx% CI) text column with dynamic label
-  dt[[ci_label]] <- ifelse(is.na(dt$se), "",
-                           sprintf("%.2f (%.2f to %.2f)", dt$est, dt$low, dt$hi))
+  # -----------------------------------------------------------------------
+  # Create effect estimate text column with dynamic label
+  #
+  # For GLM measures, extreme CI bounds from sparse cells are capped in the
+  # text display.  The CI bar is handled by forestploter's own xlim
+  # clipping.  Point estimates beyond xlim are set to NA (no bar drawn)
+  # and displayed as "NE" (not estimable).
+  # -----------------------------------------------------------------------
 
-  # Suppress footnote if no CV data
-  if (!has_cv_data) {
-    footnote_text <- NULL
+  if (is_glm) {
+    has_trimmed <- FALSE
+    ci_text <- character(nrow(dt))
+
+    for (i in seq_len(nrow(dt))) {
+      if (is.na(dt$se[i])) {
+        ci_text[i] <- ""
+        next
+      }
+
+      est_i <- dt$est[i]
+      low_i <- dt$low[i]
+      hi_i  <- dt$hi[i]
+
+      if (is_log_scale) {
+        # Ratio scale (OR, RR, IRR)
+        # Point estimate beyond xlim -> not estimable
+        if (est_i > xlim[2] || est_i < xlim[1]) {
+          ci_text[i] <- "NE"
+          dt$est[i] <- NA_real_
+          dt$low[i] <- NA_real_
+          dt$hi[i]  <- NA_real_
+          has_trimmed <- TRUE
+          next
+        }
+        # Cap CI bounds in text, clip bars
+        hi_txt <- if (!is.na(hi_i) && hi_i > xlim[2]) {
+          has_trimmed <- TRUE
+          dt$hi[i] <- xlim[2]
+          sprintf(">%.1f", xlim[2])
+        } else {
+          sprintf("%.2f", hi_i)
+        }
+        low_txt <- if (!is.na(low_i) && low_i < xlim[1]) {
+          has_trimmed <- TRUE
+          dt$low[i] <- xlim[1]
+          sprintf("<%.2f", xlim[1])
+        } else {
+          sprintf("%.2f", low_i)
+        }
+        ci_text[i] <- sprintf("%.2f (%s to %s)", est_i, low_txt, hi_txt)
+      } else {
+        # Identity scale (RD, IRD, MD)
+        hi_txt <- if (!is.na(hi_i) && hi_i > xlim[2]) {
+          has_trimmed <- TRUE
+          dt$hi[i] <- xlim[2]
+          sprintf(">%.2f", xlim[2])
+        } else {
+          sprintf("%.3f", hi_i)
+        }
+        low_txt <- if (!is.na(low_i) && low_i < xlim[1]) {
+          has_trimmed <- TRUE
+          dt$low[i] <- xlim[1]
+          sprintf("<%.2f", xlim[1])
+        } else {
+          sprintf("%.3f", low_i)
+        }
+        ci_text[i] <- sprintf("%.3f (%s to %s)", est_i, low_txt, hi_txt)
+      }
+    }
+
+    dt[[ci_label]] <- ci_text
+
+    if (has_trimmed) {
+      trim_note <- "CI bounds exceeding axis limits are capped; NE = not estimable"
+      if (is.null(footnote_text)) {
+        footnote_text <- trim_note
+      } else {
+        footnote_text <- c(footnote_text, trim_note)
+      }
+    }
+  } else {
+    # Survival: unchanged
+    dt[[ci_label]] <- ifelse(is.na(dt$se), "",
+                             sprintf("%.2f (%.2f to %.2f)", dt$est, dt$low, dt$hi))
+  }
+
+  # Suppress CV-specific footnote if no CV data, but preserve trimming notes
+  if (!has_cv_data && !is.null(footnote_text)) {
+    # Keep only trimming-related footnotes
+    keep <- grepl("CI bounds|NE =|not estimable|clipped", footnote_text)
+    if (any(keep)) {
+      footnote_text <- footnote_text[keep]
+    } else {
+      footnote_text <- NULL
+    }
   }
 
   # Generate the forest plot
@@ -697,7 +1220,7 @@ plot_subgroup_results_forestplot <- function(
     upper = dt$hi,
     sizes = 0.4,
     ci_column = 4,
-    ref_line = 1,
+    ref_line = ref_line,
     arrow_lab = arrow_text,
     xlim = xlim,
     ticks_at = ticks_at,

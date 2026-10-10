@@ -20,7 +20,6 @@
 #'   continuation indent. Default: 48 (suitable for half-slide columns at
 #'   scriptsize).
 #'
-#' @keywords internal
 #' @return Invisibly returns a list with \code{left} and \code{right}
 #'   character vectors. Side effect: emits LaTeX via \code{cat()} for use
 #'   in a chunk with \code{results='asis'}.
@@ -34,6 +33,23 @@
 #' \code{echo=FALSE}, first capture the forestsearch output with
 #' \code{capture.output()}, then call \code{format_fs_details(fs_output)}.
 #'
+#' @examples
+#' \dontrun{
+#' fs_output <- capture.output(
+#'   fs_res <- forestsearch(
+#'     df = dat, outcome.name = "time", event.name = "status",
+#'     treat.name = "trt", id.name = "id",
+#'     confounders.name = confs, details = TRUE
+#'   )
+#' )
+#' # Default: split after candidate factors
+#' format_fs_details(fs_output, fontsize = "tiny")
+#'
+#' # Custom split: after filtering summary
+#' format_fs_details(fs_output, split_after = "Found.*candidate")
+#' }
+#'
+#' @export
 format_fs_details <- function(fs_output,
                               split_after = "Candidate factors",
                               fontsize = "scriptsize",

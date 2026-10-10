@@ -88,6 +88,37 @@
 #' ratios with confidence intervals for: ITT population, H subgroup,
 #' and H^c complement.
 #'
+#' @examples
+#' \dontrun{
+#' # Run ForestSearch analysis
+#' fs <- forestsearch(
+#'   df.analysis = my_data,
+#'   outcome.name = "os_time",
+#'   event.name = "os_event",
+#'   treat.name = "treatment",
+#'   confounders.name = c("age_cat", "stage", "biomarker")
+#' )
+#'
+#' # Create combined visualization
+#' result <- plot_sg_results(
+#'   fs.est = fs,
+#'   outcome.name = "os_time",
+#'   event.name = "os_event",
+#'   treat.name = "treatment"
+#' )
+#'
+#' # View the Kaplan-Meier plots only
+#' plot_sg_results(fs, plot_type = "km")
+#'
+#' # Customize labels
+#' plot_sg_results(
+#'   fs,
+#'   sg0_name = "High Risk",
+#'   sg1_name = "Standard Risk",
+#'   treat_labels = c("0" = "Placebo", "1" = "Active Drug")
+#' )
+#' }
+#'
 #' @seealso
 #' \code{\link{forestsearch}} for running the subgroup analysis
 #' \code{\link{sg_consistency_out}} for consistency evaluation
@@ -97,7 +128,7 @@
 #' @importFrom stats quantile confint pchisq
 #' @importFrom graphics par plot lines legend axis box abline text mtext
 #' @importFrom grDevices adjustcolor
-#' @keywords internal
+#' @export
 plot_sg_results <- function(
     fs.est,
     outcome.name = "Y",
@@ -827,8 +858,18 @@ plot_sg_summary_panel <- function(
 #'
 #' @param x An fs_sg_plot object
 #' @param ... Additional arguments (unused)
-#' @keywords internal
-#' @return Invisibly returns \code{x}.
+#' @return `x`, invisibly. Called for its side effect of printing the
+#'   subgroup definition, summary statistics and hazard ratio estimates.
+#'
+#' @examples
+#' \dontrun{
+#' fs <- forestsearch(gbsg,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+#' p <- plot_subgroup(fs)
+#' print(p)
+#' }
+#' @export
 print.fs_sg_plot <- function(x, ...) {
   cat("ForestSearch Subgroup Visualization\n")
   cat("====================================\n\n")
@@ -862,9 +903,19 @@ print.fs_sg_plot <- function(x, ...) {
 #' @param which Character or integer. Which plot to display.
 #'   Default: 1 (first available)
 #' @param ... Additional arguments passed to plot functions
-#' @keywords internal
-#' @return Invisibly returns \code{x}.
+#' @return `x`, invisibly. No plot is drawn: a message names the
+#'   `plot_sg_results()` call that produces the requested plot. An error is
+#'   raised when a character `which` does not name an available plot.
 #'
+#' @examples
+#' \dontrun{
+#' fs <- forestsearch(gbsg,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+#' p <- plot_subgroup(fs)
+#' plot(p)
+#' }
+#' @export
 plot.fs_sg_plot <- function(x, which = 1, ...) {
   if (length(x$plots) == 0) {
     message("No plots available")

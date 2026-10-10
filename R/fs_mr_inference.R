@@ -1,0 +1,1452 @@
+# =============================================================================
+# fs_mr_inference.R
+#
+# Multiplier resampling (MR) for a selected forestsearch subgroup.
+#
+# After forestsearch() selects a harm subgroup H-hat, this computes a fast
+# multiplier-bootstrap approximation of the bootstrap bias-corrected treatment
+# effect and flags whether that de-biased estimate is still consistent with
+# harm.  It is a leading-order approximation of the full bootstrap (FB)
+# correction (forestsearch_bootstrap_dofuture()) and does NOT replace it.
+#
+# The expensive quantity -- the per-subject treatment dfbeta for each candidate
+# -- is exactly what the resample consistency engine already computes via
+# .consistency_glm_pieces() / .consistency_cox_pieces().  Phase 1 re-derives
+# those pieces from the candidate family (a few seconds at the ACTG175 scale);
+# Phase 2 retains them in the consistency engine so MR is near-zero cost.
+#
+# Closed form (see consistency_resample.R / the resampling-theory note):
+#   beta*(b) = beta_hat + D(b),   D_g(b) = sum_i G_i(b) dfbeta_{g,i}
+#   selection bias = mean_b D_{H*_b}(b)        (winner's curse of the re-selected
+#                                               candidate on draw b)
+#   de-biased beta = beta_hat(H-hat) - selection_bias - mean_b D_{H-hat}(b)
+#
+# Variance: infinitesimal jackknife (Leon et al. 2024, Eq. VInfJ_bc), computed
+# from the same draws -- the centered multipliers play the role of the bootstrap
+# multiplicities (K*_bi - Kbar*_i) and the per-draw residual is
+#   r_b = (selection_bias + fixed_bias) - D_{H*_b}(b) - D_{H-hat}(b).
+# This is the leading-order analogue of the FB IJ variance; with
+# ci_method = "wald" MR falls back to the subgroup robust SE.
+# =============================================================================
+
+
+#' Default near-null harm-confirmation threshold for a measure
+#'
+#' The value `t_confirm` takes when left `NULL`: the null effect on the effect
+#' scale, i.e. no effect at all rather than the screening threshold.
+#'
+#' @param effect_measure Character measure label (`"OR"`, `"RR"`, `"IRR"`,
+#'   `"HR"`, `"RD"`, `"MD"`, ...) or `NULL`.
+#' @return `1` for ratio measures (effect scale), `0` for differences.
+#' @keywords internal
+.fs_mr_confirm_null <- function(effect_measure) {
+  if (is.null(effect_measure)) return(1)
+  if (effect_measure %in% c("OR", "RR", "IRR", "HR")) 1 else 0
+}
+
+
+#' Per-candidate influence pieces (Cox / GLM dispatch)
+#'
+#' Thin dispatch onto the existing forestsearch internals so MR uses the
+#' identical treatment `dfbeta`, `beta_hat`, and robust `sigma_D` the resample
+#' consistency engine uses.
+#'
+#' @param df_sub Data frame for one candidate subgroup's members.
+#' @param spec List with `outcome_type`, `effect_measure`, `treat.name`,
+#'   `outcome.name`, `event.name`, `offset.name`, `adjust_covariates`,
+#'   `adverse_outcome`.
+#' @return Output of [.consistency_glm_pieces()] / [.consistency_cox_pieces()],
+#'   or `NULL`.
+#' @keywords internal
+.fs_mr_pieces <- function(df_sub, spec) {
+  if (identical(spec$outcome_type, "survival")) {
+    .consistency_cox_pieces(
+      df_sub, tte.name = spec$outcome.name, event.name = spec$event.name,
+      treat.name = spec$treat.name, adjust_covariates = spec$adjust_covariates)
+  } else {
+    .consistency_glm_pieces(
+      df_sub, outcome_type = spec$outcome_type, effect_measure = spec$effect_measure,
+      treat.name = spec$treat.name, outcome.name = spec$outcome.name,
+      offset.name = spec$offset.name, adjust_covariates = spec$adjust_covariates,
+      adverse_outcome = if (is.null(spec$adverse_outcome)) TRUE else spec$adverse_outcome)
+  }
+}
+
+
+#' Assemble the influence matrix from candidate membership lists
+#'
+#' For each candidate (a vector of row indices into `df`), fit the treatment
+#' effect once and place its `dfbeta` into the candidate's rows (zero elsewhere).
+#' Candidates whose fit fails or whose `dfbeta` length does not match are dropped.
+#'
+#' @param df Analysis data frame.
+#' @param candidates Named list of integer row-index vectors.
+#' @param spec See [.fs_mr_pieces()].
+#' @return List with `B` (`N x S_kept`), `beta_hat`, `sigma_D`, `sizes`,
+#'   `names`, `keep`, `log_scale`.
+#' @keywords internal
+.fs_mr_assemble <- function(df, candidates, spec) {
+  N <- nrow(df); S <- length(candidates)
+  B  <- matrix(0, N, S)
+  bh <- rep(NA_real_, S); sdv <- rep(NA_real_, S); sz <- rep(NA_integer_, S)
+  keep <- logical(S); log_scale <- TRUE
+  for (g in seq_len(S)) {
+    idx <- candidates[[g]]
+    if (length(idx) < 6L) next
+    pc <- tryCatch(.fs_mr_pieces(df[idx, , drop = FALSE], spec), error = function(e) NULL)
+    if (is.null(pc) || length(pc$dfbeta) != length(idx)) next
+    B[idx, g] <- pc$dfbeta
+    bh[g] <- pc$beta_hat; sdv[g] <- pc$sigma_D; sz[g] <- length(idx)
+    keep[g] <- TRUE; log_scale <- isTRUE(pc$log_scale)
+  }
+  list(B = B[, keep, drop = FALSE], beta_hat = bh[keep], sigma_D = sdv[keep],
+       sizes = sz[keep], names = names(candidates)[keep], keep = keep,
+       log_scale = log_scale)
+}
+
+
+#' Mean-zero unit-variance multiplier vectors (one column per draw)
+#' @keywords internal
+.fs_mr_multipliers <- function(n, draws, type) {
+  switch(type,
+    rademacher = matrix(sample(c(-1, 1), n * draws, replace = TRUE), n, draws),
+    gaussian   = matrix(stats::rnorm(n * draws), n, draws),
+    poisson    = matrix(stats::rpois(n * draws, 1) - 1, n, draws),
+    stop("unknown multiplier: ", type))
+}
+
+
+#' Apply a selection rule among passing candidates on one draw
+#'
+#' For the size-within-band rules (`effMaxSG`/`effMinSG`) the inclusion band is
+#' built to match the search's `selection_rule`:
+#'   * `"neighborhood"` - effect within `nbhd` of the max, on the NATURAL effect
+#'     scale and multiplicative (`eff >= (1 - nbhd) * max(eff)`), matching
+#'     `sort_subgroups()` exactly (G3);
+#'   * `"pareto"` - the 2-D non-dominated set in (effect, size), via the same
+#'     dominance core the search uses (`.pareto_dominated_xy()`) (G2);
+#'   * `"both"` - the intersection of the two.
+#' `beta` is on the working scale (log for ratio measures); `log_scale` controls
+#' the conversion to the natural effect for the band.
+#' @keywords internal
+.fs_mr_select <- function(beta, zcons, sizes, passers, rule, nbhd,
+                          selection_rule = "neighborhood", log_scale = TRUE) {
+  if (!length(passers)) return(NA_integer_)
+  .inband <- function() {
+    eff <- if (log_scale) exp(beta[passers]) else beta[passers]  # natural effect
+    sz  <- sizes[passers]
+    # Band from the shared helper, the same one the consistency engine, DINA
+    # and (since the frontier fix) GRF use.  This replaces a local copy that
+    # reimplemented the same three rules.  The local copy differed in its NA
+    # handling: it used a plain max() with no is.na() guard, so a single
+    # non-finite effect made the threshold NA, made the whole band NA, and --
+    # via the emptiness fallback below -- silently degraded the band to ALL
+    # passers rather than to a sensible band.  The shared helper uses
+    # max(na.rm = TRUE) and guards !is.na(), degrading one candidate instead
+    # of the draw.  That is a bug fix, not a preference.
+    ib <- .compute_inclusion_band(hr_vec = eff, n_vec = sz,
+                                  selection_rule = selection_rule,
+                                  effect_neighborhood = nbhd) == 1L
+    # EMPTY-BAND FALLBACK -- deliberately here, at the call site, not inside
+    # the shared helper.  The two callers want different things and the
+    # difference is not reconcilable:
+    #
+    #   * In the consistency/DINA sort an all-zero band is harmless: -in_band
+    #     is the leading sort key and the next key breaks the tie, so nothing
+    #     is lost.
+    #   * Here the band is a FILTER inside a draw.  Returning nothing loses
+    #     that draw from sel_bias -- and it loses exactly the draws where the
+    #     perturbed effects were extreme enough to empty the band, which
+    #     biases the correction rather than protecting it.  Same failure mode
+    #     as an over-tight admission floor.
+    #
+    # Keeping it visible at the call site records that it is a deliberate
+    # choice for MR, not a property of the band.
+    if (!any(ib)) ib <- rep(TRUE, length(passers))
+    passers[ib]
+  }
+  pick <- switch(rule,
+    maxcons  = passers[which.max(zcons[passers])],
+    maxeff   = passers[which.max(beta[passers])],
+    maxSG    = passers[which.max(sizes[passers])],
+    minSG    = passers[which.min(sizes[passers])],
+    effMaxSG = { b <- .inband(); b[which.max(sizes[b])] },
+    effMinSG = { b <- .inband(); b[which.min(sizes[b])] },
+    stop("unknown reselection rule: ", rule))
+  as.integer(pick)
+}
+
+
+#' Infinitesimal-jackknife variance of the de-biased (bagged) estimate
+#'
+#' Implements Leon et al. (2024) Eq. (VInfJ)/(VInfJ_bc) in multiplier form.
+#' The multiplier matrix `Xi` supplies the centered bootstrap multiplicities
+#' \eqn{K^*_{bi} - \bar K^*_i}, and `r` is the per-draw residual
+#' \eqn{r_b = \hat\beta(\widehat H) - \eta^*_b(\widehat H^*_b) - \eta^*_b(\widehat H) - \hat\beta^*(\widehat H)},
+#' i.e. `(selection_bias + fixed_bias) - D_{H*_b}(b) - D_{H}(b)`, evaluated only
+#' on the draws in `ok` that produced a re-selected winner.
+#'
+#' @param Xi `N x draws` multiplier matrix (one column per draw).
+#' @param r Length-`draws` residual vector (`NA` where no winner).
+#' @param ok Integer indices of usable draws.
+#' @return List with `tilde_V` (raw IJ), `hat_V` (Wager 2014 bias-corrected),
+#'   and `B_ok` (number of usable draws).
+#' @keywords internal
+.fs_mr_ij_var <- function(Xi, r, ok) {
+  if (length(ok) < 2L)
+    return(list(tilde_V = NA_real_, hat_V = NA_real_, B_ok = length(ok)))
+  Xk  <- Xi[, ok, drop = FALSE]            # N x B_ok
+  rb  <- r[ok]
+  Bok <- length(ok)
+  Xc  <- Xk - rowMeans(Xk)                 # centered multiplicities over used draws
+  cov_i   <- as.numeric(Xc %*% rb) / Bok   # cov_i = (1/B) sum_b (K* - Kbar) r_b
+  tilde_V <- sum(cov_i^2)
+  hat_V   <- tilde_V - (nrow(Xi) / Bok) * mean(rb^2)
+  list(tilde_V = tilde_V, hat_V = hat_V, B_ok = Bok)
+}
+
+
+#' Resolve a de-biased SE from the IJ variance, with graceful fallback
+#'
+#' Prefers the bias-corrected IJ variance; if it is non-positive (too few
+#' draws), falls back to the raw IJ variance, then to the subgroup robust SE.
+#'
+#' @param ij Output of [.fs_mr_ij_var()].
+#' @param se_fallback Robust subgroup SE (`sigma_D`) used as last resort.
+#' @return List with `se`, `var`, and `source`
+#'   (`"ij"`, `"ij_raw"`, or `"wald_fallback"`).
+#' @keywords internal
+.fs_mr_se_from_ij <- function(ij, se_fallback) {
+  if (is.finite(ij$hat_V) && ij$hat_V > 0)
+    return(list(se = sqrt(ij$hat_V), var = ij$hat_V, source = "ij"))
+  if (is.finite(ij$tilde_V) && ij$tilde_V > 0)
+    return(list(se = sqrt(ij$tilde_V), var = ij$tilde_V, source = "ij_raw"))
+  list(se = se_fallback, var = se_fallback^2, source = "wald_fallback")
+}
+
+
+#' Multiplier resampling (MR) for a selected forestsearch subgroup
+#'
+#' Computes a multiplier-bootstrap approximation of the bootstrap
+#' bias-corrected treatment effect for the selected subgroup and flags whether
+#' it is still consistent with harm.  Reuses the resample consistency engine's
+#' per-candidate treatment `dfbeta`; see the file header for the closed form.
+#'
+#' This is **post-selection inference on a completed analysis**: it runs after
+#' [forestsearch()] has chosen the subgroup and cannot change that choice.  It
+#' is the fast, refit-free counterpart of the full bootstrap (FB,
+#' [forestsearch_bootstrap_dofuture()]), which re-runs the entire search in
+#' every replicate; MR perturbs the influence contributions of a single fit
+#' instead.  MR approximates FB to leading order and does not replace it.
+#'
+#' @param df Analysis data frame (the standardized `df.fs` inside
+#'   `forestsearch()`); must contain the columns named in `spec`.
+#' @param candidates Named list of integer row-index vectors, one per screened
+#'   candidate subgroup (the family the selection rule chose among).
+#' @param spec List with `outcome_type`, `effect_measure`, `treat.name`,
+#'   `outcome.name`, `event.name`, `offset.name`, `adjust_covariates`,
+#'   `adverse_outcome`.
+#' @param selected_members Integer row indices of the observed selected subgroup
+#'   (`which(grp.consistency$sg.harm.id == 1)`).
+#' @param admission The resolved admission set, as returned by
+#'   `.fs_resolve_admission()`: a list with `effect_floor` (numeric on the
+#'   **comparison scale** -- log for ratio measures -- or `NULL`) and
+#'   `consistency` (a list with `c_cons` and `p_star`, or `NULL`).
+#'
+#'   This replaces the former `c_screen` / `c_consistency` / `p_star`
+#'   arguments, from which MR used to rebuild
+#'   `t_g <- pmax(c_screen, c_consistency + z * sigma_D)` at this site. That
+#'   reconstruction was the defect: the identifier resolved its floors in one
+#'   place and MR re-derived them in another, so the two could disagree about
+#'   which candidates were ever in contention -- and under
+#'   `sg_focus = "maxeff"` they did. MR is a linearization of the selection
+#'   *map*, which is a ranking and a domain; passing the resolved domain makes
+#'   the two equal by construction.
+#'
+#'   `NULL` means the floor does not apply, and is handled by a separate code
+#'   path rather than by sentinel arithmetic. With neither floor present there
+#'   is no admission filter at all.
+#' @param t_confirm Harm-confirmation threshold on the **effect scale** (HR/OR/
+#'   RR/IRR, or RD/MD for differences -- not the working log scale). `NULL` uses
+#'   the near-null default: `1` for ratio measures, `0` for differences. Set it
+#'   near the null rather than at the screening threshold, because the
+#'   de-biasing correction over-shrinks true effects.
+#' @param confirm_rule Which harm-confirmation rule to apply to the de-biased
+#'   estimate: `"point"` requires the de-biased point estimate to clear
+#'   `t_confirm`; `"ci"` requires the one-sided 95% selection-adjusted lower
+#'   bound to clear it, and is therefore the stricter of the two.
+#' @param reselection Bootstrap re-selection rule for the bias term; default
+#'   `"maxcons"` (validated). `"effMaxSG"` etc. are available but approximate.
+#' @param effect_neighborhood Band for the `eff*SG` re-selection rules.
+#' @param draws,multiplier,seed Multiplier-bootstrap controls. `multiplier`
+#'   defaults to `"poisson"` (mimics the nonparametric bootstrap).
+#' @param include_complement Logical.  When `TRUE`, also de-bias the complement
+#'   subgroup (everyone not in the selected subgroup).  The complement is not
+#'   selected independently -- its bias is induced by selecting the subgroup --
+#'   so on each multiplier draw the complement of the re-selected winner is
+#'   tracked and de-biased with the complement's own influence.  Complements are
+#'   fit only for candidates that win across draws (plus the selected one), so
+#'   the extra cost is small.  Default `FALSE`.
+#' @param return_reselection Logical. When `TRUE`, the return list gains a
+#'   `reselection` element exposing the per-draw re-selection already computed
+#'   for the bias term: `winner` (integer vector of length `draws`, the index
+#'   of the re-selected candidate in the kept family on each draw, `NA` where
+#'   no draw winner exists) and `p_hat` (named numeric over the kept family,
+#'   `tabulate(winner) / draws` -- so `sum(p_hat) == selection_rate`, and the
+#'   frequencies sum to 1 exactly when every draw produced a winner). Default
+#'   `TRUE`: the re-selection diagnostics are part of the recommended output
+#'   (\eqn{\hat p} is reported by print() and summary() as a descriptive diagnostic).
+#'   Nothing in the arithmetic depends on this switch, so `FALSE` reproduces
+#'   the previous, smaller return object exactly.
+#' @param ci_method `"field"` (default, the recommendation) computes everything
+#'   the `"ij"` path computes -- the `debiased` element, its IJ SE and its IJ
+#'   intervals are identical, and are returned in every call regardless of this
+#'   argument -- and **additionally** runs the field-calibrated interval, whose
+#'   one-sided bounds are the primary reported products (the lower bound on the harm
+#'   subgroup, the studentized complement's upper bound, and the Bonferroni
+#'   joint pair).  Nothing is removed by choosing it; it adds a per-fit Monte
+#'   Carlo cost (`field_R_out` x `field_R_in`, defaults 1000 / 500, plus the
+#'   complement's own block under `field_complement = TRUE`).  `"ij"` restores
+#'   the previous default: the **de-biased** CI from the infinitesimal-jackknife
+#'   variance (Leon et al. 2024, Eq. VInfJ_bc), computed from the same
+#'   multiplier draws -- the leading-order analogue of the FB interval -- with
+#'   the field block omitted.  `"wald"` uses the subgroup robust SE
+#'   (`sigma_D`) for the de-biased CI and also omits the field block.  The
+#'   naive CI always uses the robust SE.  The field block (León and Anderson,
+#'   2026) is returned as a `field`
+#'   element: Gaussian-multiplier perturbations of the shrunk candidate-effect
+#'   field (`w = beta_hat` with the winner's entry replaced by the de-biased
+#'   estimate) are pushed through the configured re-selection map, with an
+#'   inner Monte Carlo estimating the selection drift, and the resulting
+#'   `Lambda*` distribution is inverted around the de-biased estimate
+#'   (basic-bootstrap form).  Drawn under `seed + 900000L` when `seed` is
+#'   given, after -- never inside -- the main multiplier stream, so `"ij"` and
+#'   `"wald"` output is unaffected byte-for-byte.
+#' @param field_R_out,field_R_in Outer and inner Monte Carlo sizes for
+#'   `ci_method = "field"` (defaults 1000 / 500); ignored otherwise.  The
+#'   inner draws are shared across outer draws.
+#' @param field_uniform Logical (default `FALSE`); only consulted under
+#'   `ci_method = "field"`.  When `TRUE`, after the field block completes the
+#'   gate additionally runs the uniform (kappa) calibration
+#'   (`fs_mr_field_uniform()`) and attaches its result
+#'   as `field$uniform`: the smallest widening factor `kappa` in `[1, 2]`
+#'   such that the widened two-sided interval attains 95% coverage uniformly
+#'   over the **winner-profile protection family** -- hypothetical true
+#'   fields equal to the shrunk field `w` with the winner's entry set to the
+#'   runner-up level plus `delta` winner-SEs, `delta` on a 0-4 grid --
+#'   computed from the trial's own influence structure (`Sigma_hat` via
+#'   `B_eff`), restricted to the **mass-carrying candidate set** (smallest
+#'   `M <= 12` candidates holding >= 99% of the re-selection mass, winner
+#'   always included).  Experimental option. Intended properties: the one-sided field
+#'   bound is uniformly valid; the two-sided interval widened by the
+#'   reported `kappa` is uniformly valid over the winner-profile family; the
+#'   plain quantile interval is approximate.  The sweep draws under
+#'   `seed + 910000L` after -- never inside -- the field's own stream, so
+#'   every other output, the field block included, is byte-identical whether
+#'   or not it runs.
+#' @param field_M_cap Optional override of the uniform sweep's mass-carrying
+#'   cap (`fs_mr_field_uniform()`'s `M_cap`); `NULL` (default) uses that
+#'   function's default.  Pass a value at least the family size to lift the
+#'   cap to the full family (the GBSG frozen-intervals illustration does).
+#'   Consulted only when `field_uniform = TRUE`; add-only, default-inert.
+#' @param field_complement Logical (default `TRUE`, the recommended
+#'   construction); consulted only under
+#'   `ci_method = "field"` with `include_complement = TRUE`.  When `TRUE`,
+#'   after the harm field block completes, the same field procedure is
+#'   evaluated for the complement subgroup and attached as
+#'   `field$complement`.  **Orientation:** selection acts on the harm-subgroup
+#'   effects; the complement is its by-product, and its naive estimate is
+#'   pushed toward *benefit*.  For a benefit claim ("the effect in the
+#'   complement is at most U") the exposed limit is therefore the **upper**
+#'   bound on the complement's working-scale effect, and the primary product
+#'   here is the one-sided 95% upper bound `upper_1s`.  The guarantee is the
+#'   mirror of the harm side's: an upper bound is vulnerable to
+#'   under-correction of the beneficial optimism (U too low over-claims) and
+#'   immune to over-correction.  Selection is the harm field's own -- every
+#'   outer and inner draw's winner is re-read, never re-selected -- and the
+#'   complement's perturbations use the harm field's own multipliers projected
+#'   through the complement's influence, so its noise carries its correct
+#'   correlation with every candidate's noise; complements of draw winners the
+#'   multiplier stage did not fit are fit lazily.  The block draws nothing, so
+#'   every other output -- the harm `field` block and its `uniform` sub-block
+#'   included -- is byte-identical whether or not it runs, so `FALSE`
+#'   reproduces the pre-complement output exactly.
+#' @param field_decompose Logical (default `FALSE`); consulted only when the
+#'   complement field block runs.  When `TRUE`, `field$complement` gains a
+#'   `decomp_fields` list of add-only scale diagnostics (the selected
+#'   complement's influence-norm scale, the draw-weighted mean and CV of the
+#'   outer winners' scales, their ratio `scale_ratio_c`, and the variance /
+#'   covariance of the two pieces of `Lambda*c`); it reads existing objects only, so every
+#'   pre-existing output is unchanged whether or not it runs.
+#' @param field_scale_complement `"selected"` (default, the recommended
+#'   construction: the studentized complement field, "field-s") or `"none"`;
+#'   consulted only when the complement field block runs.  Under `"selected"` the
+#'   complement's field readings are studentized to the selected complement's
+#'   own scale before differencing -- each outer reading `zeta^c_{r, G_r}` is
+#'   multiplied by `s_sel / s_{G_r}` and each inner reading by `s_sel /
+#'   s_{G(v_r + zeta'_j)}`, with `s_g = sqrt(sum(Bc[, g]^2))` the candidate's
+#'   complement influence-norm scale (the percentile-t root) -- and `field$complement` gains
+#'   the `_s` companions of its bounds (`est2_s`, `upper_1s_s`, `lower_1s_s`,
+#'   `lower_2s_s`, `upper_2s_s`, `lower_se_s`, `upper_se_s`, `se_field_s`,
+#'   `lambda_mean_s`) with `field$joint_s` beside `field$joint`.  Add-beside:
+#'   no existing field changes under either setting; the default reproduces
+#'   prior output exactly.
+#' @param ij_residual Which IJ residual populates the **reported** de-biased
+#'   SE and interval (`debiased$se_ij`/`lower`/`upper`/`lower_1s`, and the
+#'   complement's).  `"two_term"`
+#'   (default) is the paper's residual
+#'   \eqn{r_b = (bias_{sel} + bias_{fix}) - D_{H^*_b}(b) - D_{\hat H}(b)},
+#'   whose limit variance is \eqn{(p + e_{\hat H})' \Sigma (p + e_{\hat H})} --
+#'   \eqn{4\sigma^2} when one candidate dominates, a doubled SE exactly where
+#'   there is least to correct (the complement is effectively always in that
+#'   regime).  `"winner"` uses the winner-only (total-derivative) residual
+#'   \eqn{r^w_b = bias_{sel} - D_{H^*_b}(b)}, exact when one candidate
+#'   dominates but under-covering at ties on the harm side (the delta method
+#'   does not hold in the local regime), likewise retained for comparison
+#'   only; `"winner_floor"` floors it at the
+#'   naive robust variance, \eqn{\max(V^w, \hat\sigma^2_D)}, retained for comparison only
+#'   and not recommended.  All three SEs are computed from the same draws
+#'   and returned side by side in every call (`se_ij_two_term`,
+#'   `se_ij_winner`, `se_ij_winner_floor` with their bounds `*_w` / `*_wf`);
+#'   the argument only selects the reported one, and the point estimates
+#'   never change.  Add-only: the default reproduces prior output exactly
+#'   (the new elements aside).
+#' @param field_recovery Logical (default `FALSE`); consulted only under
+#'   `ci_method = "field"`.  When `TRUE`, `field` gains a `recovery` list of
+#'   **descriptive membership-agreement diagnostics**: over the outer
+#'   draws that produced a winner, each re-selected candidate's patient set
+#'   `kept[[G_r]]` is compared with the observed pick's `kept[[sel]]`, and the
+#'   four classification metrics of the CV membership cross-tab
+#'   (`forestsearch_Kfold()`'s `sens_H` / `sens_Hc` / `ppv_H` / `ppv_Hc`) are
+#'   averaged over draws, with `npv_Hc` reported as the standing-convention
+#'   name of the same quantity as `ppv_Hc`.  These are computed **from draws
+#'   already made**: no new fits, no new randomness, no RNG consumption, and
+#'   **no construction reads them** -- every bound, bias and SE is
+#'   byte-identical whether or not the block runs.  They answer a narrower
+#'   question than the full bootstrap (FB) or cross-validation (CV) recovery
+#'   diagnostics: re-selection *within the fixed kept family* under
+#'   multiplier perturbation, not re-discovery of a subgroup from scratch on
+#'   resampled data.  The two are related but not interchangeable, and a
+#'   report that quotes one should say which.
+#' @param keep_declaration_field Logical (default `FALSE`).  When `TRUE`, the
+#'   return gains a `declaration_field` element: the standardized perturbation
+#'   field of the main multiplier stream, `Zstar[b, g] = D_g(b) / sigma_D(g)`,
+#'   summarized by its family maxima `Mstar` (length `draws`), with the
+#'   per-candidate `beta_hat`, `sigma_D`, `family_id` and a `meta` list (the
+#'   multiplier law, `B`, the resolved `c_cons` / `p_star` / effect floor, and
+#'   the field's scaling diagnostics).  It is what
+#'   [fs_declaration_calibration()] reads.  It re-reads the influence matrix
+#'   and the multipliers already drawn -- no fit, no draw, no RNG consumption
+#'   -- so every other output is byte-identical whether or not it runs, and
+#'   with `FALSE` nothing is computed or stored.
+#' @param keep_field_matrix Logical (default `FALSE`); consulted only when
+#'   `keep_declaration_field = TRUE`.  When `TRUE`, `declaration_field` also
+#'   keeps the full `draws x G` matrix `Zstar`, which the reduced-family
+#'   diagnostic of [fs_declaration_calibration()] needs.  Off by default
+#'   because `G` can be large.
+#' @param declaration_c0 `NULL` (default) or a numeric vector of clinically
+#'   specified, pre-specified protected null levels `c0`; consulted only when
+#'   `keep_declaration_field = TRUE` (ignored otherwise).  Each `c0` is on the
+#'   natural scale of the consistency threshold `c2` (the HR itself on the
+#'   survival path; the ratio for OR / RR / IRR; the difference for RD / MD)
+#'   and is mapped to the comparison scale exactly as `c2` is (`log()` for
+#'   ratio measures, identity otherwise).  `c0 <= c2` is required.  With
+#'   `delta_g = (c_cons - c0_cmp) / sigma_D(g)`, `declaration_field` then also
+#'   stores `Mstar_c0`, a `draws x K` matrix of the shifted family maxima
+#'   `max_g { Zstar[b, g] - delta_g }`, column names `as.character(c0)`, and
+#'   `meta$c0` / `meta$c0_cmp`.  At `c0 = c2` the column equals `Mstar`
+#'   exactly.  On an identity-scale path a `c0` given on the wrong scale
+#'   cannot be detected; on a ratio path a non-positive `c0` (a log supplied
+#'   by mistake) errors.  With `NULL` nothing is computed or stored.
+#' @param pconsistency.digits Integer or `NULL` (default).  The digits the
+#'   search rounded `Pcons` to before comparing it with `p_star`; consulted
+#'   only when the admission set carries a consistency floor.  MR's
+#'   consistency floor is built from the screen's effective threshold
+#'   (`.fs_pcons_eff(p_star, digits)`, mapped to z by `qnorm((1 + .) / 2)`),
+#'   not from the exact cutoff `qnorm((1 + p_star) / 2)`, so that MR
+#'   re-selects under the admission rule that produced the selected subgroup.
+#'   [forestsearch()] passes its own `pconsistency.digits`; `NULL` falls back
+#'   to the [subgroup.consistency()] default.
+#' @return List with the selected index/label, `naive` and `debiased` estimates
+#'   (effect scale, with approximate 95% CIs), `selection_bias`, `fixed_bias`,
+#'   `selection_rate`, `mean_r`, `mean_r_c`, the `settings` actually used (`t_confirm`,
+#'   `confirm_rule`, `reselection`, `selection_rule`, `multiplier`, `draws`),
+#'   `harm_flag`, family/subgroup sizes, and `timing_seconds`. The `debiased`
+#'   element carries `se_ij`, `se_wald`, `var_ij`, and `ij_source`; its CI uses
+#'   the IJ SE under `ci_method = "field"` (the default) and `"ij"` (the FB
+#'   analogue in both cases) and the robust SE under `"wald"`.
+#'   When `include_complement = TRUE`, a `complement` element carries the
+#'   complement subgroup's `naive`/`debiased` estimates and bias terms in the
+#'   same form, including its own IJ variance.  The complement's de-biased CI
+#'   follows the same SE convention as the winner's: the IJ SE under
+#'   `ci_method = "ij"` and `"field"` (under `"field"` the complement, like the
+#'   `debiased` element, is identical to the `"ij"` output), the robust SE
+#'   under `"wald"`.
+#'
+#'   `mean_r` is the mean of the IJ residual \eqn{r_b} over `ok_H` -- exactly
+#'   the draws entering the variance, not all `draws`, since on an excluded
+#'   draw \eqn{r_b} is not a meaningful quantity. **The invariant is that it is
+#'   zero by construction whenever both bias terms share a denominator**, which
+#'   is the convention the package implements: `selection_bias` and
+#'   `fixed_bias` both average over the draws that produced a winner, and the
+#'   IJ runs on that same set. A non-zero value therefore means the two terms
+#'   are being normalised differently somewhere -- the defect corrected in
+#'   `dad0415`, whose signature was precisely a non-zero residual mean.
+#'   `mean_r_c` is the same quantity for the complement over `use_c`, and is
+#'   `NA_real_` when no complement was fit. Both are diagnostics of the
+#'   correction's internal consistency rather than properties of the estimate,
+#'   which is why they sit beside `selection_rate` and not inside `debiased`.
+#'
+#'   Note the mixed scales in the flat `debiased` list: `est`/`lower`/`upper`/
+#'   `lower_1s` are on the **effect** scale, while `se`/`se_ij`/`se_wald`/
+#'   `var_ij` and the two bias terms are on the **working** (log, for ratio
+#'   measures) scale.
+#'
+#'   When the selected subgroup cannot be fit in the reconstructed family the
+#'   return is a short variant carrying only `selected_index` (`NA`),
+#'   `selected_label`, `harm_flag` (`NA`), `settings`, `note` and `n_family`;
+#'   consumers must tolerate that shape.
+#'
+#'   Under `return_reselection = TRUE` the full return additionally carries a
+#'   `reselection` element (see that argument); the short variant never does.
+#'
+#'   Under `ci_method = "field"` the full return additionally carries a
+#'   `field` element: `lambda_mean`, `lambda_sd`/`se_field` and the
+#'   `Lambda*` quantiles `q05/q25/q50/q75/q95/q025/q975` on the **working**
+#'   scale; `n_out_used`, `n_in_used_mean`, `R_out`, `R_in`, `seed_offset`,
+#'   `timing_seconds`; and, on the **effect** scale (the `debiased`
+#'   convention), the second-order point estimate `est2` (de-biased estimate
+#'   minus `lambda_mean`), the primary one-sided 95% bound `lower_1s`
+#'   (de-biased minus `q95`), the two-sided quantile interval
+#'   `lower_2s`/`upper_2s`, and the supplementary SE-type interval
+#'   `lower_se`/`upper_se` around `est2`.
+#'
+#'   Under `field_recovery = TRUE` the `field` element additionally carries
+#'   `recovery`: `sens_H` (the primary quantity -- the mean share of the
+#'   identified patients that the re-selections retain), `ppv_H`, `sens_Hc`,
+#'   `ppv_Hc` and its alias `npv_Hc`; the containment quantiles `q10`, `q50`,
+#'   `q90` and `share_equal_1` (the share of draws whose re-selection contains
+#'   all of the observed subgroup); and the accounting `n_draws`, `n_used`,
+#'   `n_skipped`, `n_selected`, `n_all`, `timing_seconds`.  Descriptive only;
+#'   absent when `field_recovery = FALSE`.
+#'
+#'   Under `field_complement = TRUE` (with `include_complement = TRUE`) the
+#'   `field` element additionally carries `complement`, the complement's own
+#'   field block in the same form and scales, inverted around the complement's
+#'   two-term de-biased estimate: `lambda_mean`, `lambda_sd`/`se_field`, the
+#'   seven `Lambda*c` quantiles; on the effect scale `est2`, the **primary**
+#'   one-sided 95% upper bound `upper_1s` (de-biased minus `q05`), the
+#'   one-sided lower bound `lower_1s`, the two-sided `lower_2s`/`upper_2s`
+#'   and the SE-type `lower_se`/`upper_se`; the draw accounting
+#'   `n_out_used`, `n_in_used_mean`, `n_out_dropped_unfit`; the fit accounting
+#'   `n_complement_fits` (distinct complement fits, the multiplier stage's
+#'   included), `n_new_fits`, `share_draws_new_fit` (share of outer + inner
+#'   draw-winner readings whose candidate the multiplier stage had not fit);
+#'   `R_out`, `R_in`, `timing_seconds`.  A `note` replaces the numbers when
+#'   the selected complement is unfit or fewer than 2 outer draws survive.
+#'
+#'   With the complement field on, `field` also carries `joint`: the
+#'   simultaneous (harm lower, complement upper) pair from the aligned outer
+#'   draws \eqn{(\Lambda^*_r, \Lambda^{*c}_r)} -- same multipliers, same
+#'   winners, no new draws.  `gamma` is the equal-tail level (grid from
+#'   `alpha` down to `alpha / 2`, step 0.001; the largest value whose joint
+#'   probability \eqn{P^*(\Lambda^* \le q_{1-\gamma}, \Lambda^{*c} \ge
+#'   q_\gamma) \ge 1 - \alpha}), `joint_prob` the achieved probability,
+#'   `lower_H`/`upper_Hc` the calibrated pair (effect scale),
+#'   `bonf_lower_H`/`bonf_upper_Hc` the Bonferroni pair at `gamma = alpha/2`
+#'   with its `bonf_joint_prob`, `corr` the draws' correlation,
+#'   `n_joint_draws`, and the `grid_gamma`/`grid_joint_prob` profile.  The
+#'   marginal one-sided bounds are unchanged.  The top-level `ij_residual`
+#'   records the residual that populated the reported IJ SEs.
+#' @section Alignment is assumed, not checked here:
+#' This is an engine-level entry point. Its arguments are a candidate family,
+#' a specification, and a selected membership vector -- the identifier
+#' configuration that produced them is not visible, so the alignment
+#' conditions MR requires (selection ranking on the inferential coefficient
+#' \eqn{\hat\beta(g)}, and a fixed candidate family) cannot be verified at
+#' this level and are assumed to have been established upstream.
+#'
+#' They are enforced by `.validate_mr_configuration()` at the three
+#' configuration-visible entry points -- [forestsearch()] under
+#' `mr_inference = TRUE`, and [forestsearch_bootstrap_dofuture()] and
+#' [forestsearch_Kfold()] under `mr_in_replicates = TRUE`. Calling
+#' `fs_mr_inference()` directly bypasses those guards: a family ranked on
+#' DINA's native tau-hat, on GRF's doubly-robust score, or on a GRF
+#' policy-tree objective will still produce numbers, but they do not de-bias
+#' the reported effect.
+#'
+#' @seealso [forestsearch()] for the `mr_inference` switch and the
+#'   vocabulary section; [mr_estimates_table()] to render the result;
+#'   [forestsearch_bootstrap_dofuture()] for the full bootstrap (FB) this
+#'   approximates; [fs_fdr_report()] which sweeps `c_confirm` thresholds.
+#' @keywords internal
+#' @export
+fs_mr_inference <- function(df, candidates, spec, selected_members,
+                           admission,
+                           t_confirm = NULL, confirm_rule = c("point", "ci"),
+                           reselection = c("maxcons", "maxeff", "maxSG",
+                                           "minSG", "effMaxSG", "effMinSG"),
+                           effect_neighborhood = 0.10,
+                           selection_rule = c("neighborhood", "pareto", "both"),
+                           draws = 2000L,
+                           multiplier = c("poisson", "gaussian", "rademacher"),
+                           include_complement = FALSE,
+                           ci_method = c("field", "ij", "wald"),
+                           seed = NULL,
+                           return_reselection = TRUE,
+                           field_R_out = 1000L,
+                           field_R_in = 500L,
+                           field_uniform = FALSE,
+                           field_M_cap = NULL,
+                           field_complement = TRUE,
+                           field_decompose = FALSE,
+                           field_scale_complement = c("selected", "none"),
+                           ij_residual = c("two_term", "winner", "winner_floor"),
+                           field_recovery = FALSE,
+                           keep_declaration_field = FALSE,
+                           keep_field_matrix = FALSE,
+                           declaration_c0 = NULL,
+                           pconsistency.digits = NULL) {
+  confirm_rule <- match.arg(confirm_rule); reselection <- match.arg(reselection)
+  ij_residual <- match.arg(ij_residual)
+  field_scale_complement <- match.arg(field_scale_complement)
+  selection_rule <- match.arg(selection_rule)
+  multiplier <- match.arg(multiplier); ci_method <- match.arg(ci_method)
+  if (!is.null(seed)) set.seed(seed)
+  df <- as.data.frame(df)
+  if (!length(candidates)) candidates <- list()
+  if (is.null(names(candidates)))
+    names(candidates) <- paste0("cand", seq_along(candidates))
+
+  # Ensure the observed selected subgroup is in the family and is the target.
+  H_lab <- ".selected_H"
+  hit <- if (length(candidates))
+    which(vapply(candidates, function(ix) setequal(ix, selected_members), logical(1)))
+  else integer(0)
+  if (length(hit)) sel_lab <- names(candidates)[hit[1]]
+  else { candidates[[H_lab]] <- selected_members; sel_lab <- H_lab }
+
+  asm <- .fs_mr_assemble(df, candidates, spec)
+  if (is.null(t_confirm)) t_confirm <- if (asm$log_scale) 1 else 0
+  sel <- match(sel_lab, asm$names)
+
+  mr_settings <- list(t_confirm = t_confirm, confirm_rule = confirm_rule,
+                      reselection = reselection,
+                      selection_rule = selection_rule,
+                      multiplier = multiplier, draws = as.integer(draws))
+  if (is.na(sel)) {
+    return(list(selected_index = NA_integer_, selected_label = sel_lab,
+                harm_flag = NA, settings = mr_settings,
+                note = "selected subgroup could not be fit in the reconstructed family",
+                n_family = length(asm$names)))
+  }
+
+  B <- asm$B; bh <- asm$beta_hat; sdv <- asm$sigma_D; sz <- asm$sizes
+  log_scale <- asm$log_scale
+  to_eff    <- function(x) if (log_scale) exp(x) else x
+  z975   <- stats::qnorm(0.975)
+
+  # ---------------------------------------------------------------------------
+  # ADMISSION SET
+  # ---------------------------------------------------------------------------
+  # MR linearizes the identifier's selection MAP, which is a ranking AND a
+  # domain.  The domain is resolved once by .fs_resolve_admission() and carried
+  # here; it is NOT reconstructed from raw thresholds at this site, because
+  # reconstruction is what let MR's admission set drift from the identifier's.
+  #
+  # Absence is absence: a floor that does not apply is NULL, not -Inf.  The
+  # three cases are three code paths, not one expression fed sentinels -- with
+  # a sentinel, "no filter" is arithmetically indistinguishable from "a filter
+  # that happens to admit everything", and only the second is testable.
+  .has_effect <- !is.null(admission$effect_floor)
+  .has_cons   <- !is.null(admission$consistency)
+  c_cons <- if (.has_cons) admission$consistency$c_cons else NULL
+
+  if (.has_effect && .has_cons) {
+    # The search admits on round(Pcons, digits) >= p_star, i.e. on the
+    # effective threshold .fs_pcons_eff(p_star, digits), not on p_star itself;
+    # MR's floor uses the same rule so its re-selection map is the one that ran.
+    # Applies on both consistency paths (under "split" the closed form was
+    # already the approximation; only the rounding is corrected).
+    digits <- pconsistency.digits
+    if (is.null(digits))
+      digits <- eval(formals(subgroup.consistency)$pconsistency.digits)
+    z   <- stats::qnorm((1 + .fs_pcons_eff(admission$consistency$p_star,
+                                           as.integer(digits))) / 2)
+    t_g <- pmax(admission$effect_floor, c_cons + z * sdv)
+    .admit <- function(bs) which(bs >= t_g)
+  } else if (.has_effect) {
+    t_g <- admission$effect_floor
+    .admit <- function(bs) which(bs >= t_g)
+  } else {
+    # Unrestricted: every estimable candidate is admissible, matching an
+    # identifier that applied no auxiliary selection condition.
+    t_g <- NULL
+    .admit <- function(bs) seq_along(bs)
+  }
+
+  # The consistency-standardized score is only defined when a consistency floor
+  # exists, and only the "maxcons" rule consults it.  Ranking on it without one
+  # would be the same class of mismatch this change removes, in the ranking
+  # rather than the domain, so it is refused rather than silently centred at 0.
+  if (identical(reselection, "maxcons") && !.has_cons) {
+    stop("reselection = \"maxcons\" ranks on a consistency-standardized ",
+         "statistic, but the resolved admission set has no consistency floor ",
+         "(subgroup_method without a consistency screen, or ",
+         "sg_focus = \"maxeff\").  MR would then rank on a quantity the ",
+         "identifier never computed.", call. = FALSE)
+  }
+  .zcons <- function(bs) if (.has_cons) (bs - c_cons) / sdv else NULL
+
+  t0 <- proc.time()
+  Xi <- .fs_mr_multipliers(nrow(B), draws, multiplier)
+  P  <- crossprod(B, Xi)                 # S x draws : D_g(b)
+  beta_star <- bh + P
+  sel_bias <- rep(NA_real_, draws)
+  winner   <- rep(NA_integer_, draws)    # which candidate won on draw b
+  for (b in seq_len(draws)) {
+    bs <- beta_star[, b]
+    pass <- .admit(bs)
+    if (!length(pass)) next
+    s <- .fs_mr_select(bs, .zcons(bs), sz, pass, reselection,
+                       effect_neighborhood, selection_rule, log_scale)
+    if (!is.na(s)) { sel_bias[b] <- P[s, b]; winner[b] <- s }
+  }
+  timing <- as.numeric((proc.time() - t0)["elapsed"])
+
+  # BOTH BIAS TERMS ARE CONDITIONAL ON IDENTIFICATION, over the same draws.
+  #
+  # The defect was never the denominator on its own -- it was that the two terms
+  # carried DIFFERENT ones: selection_bias over the draws that produced a
+  # winner, fixed_bias over all B.  The residual then mixed differently
+  # normalised quantities and mean(r) was not zero, which is the condition
+  # Eq. 13's uncentered rbar2 needs in order to be Wager's centered v-hat.
+  #
+  # Averaging BOTH over `ok` repairs that.  The alternative repair -- both over
+  # B, with D := 0 on a no-winner draw -- is equally centered, so centering does
+  # not choose between them; they differ in ESTIMAND.  Conditioning is the
+  # deliberate choice: the reported analysis exists only because a subgroup was
+  # identified, beta(H-hat) is already a conditional estimand, and a bootstrap
+  # replicate that identifies nothing contributes nothing to the full bootstrap
+  # MR approximates.  It also avoids having to invent a convention for the
+  # complement of an empty winner, whose complement is everyone.
+  # Named ok_H, not ok: the complement block below rebinds `ok` to its own draw
+  # set, and two different index sets under one name is the kind of quiet
+  # aliasing this change exists to remove.
+  ok_H <- which(is.finite(sel_bias))
+  selection_rate <- mean(!is.na(sel_bias))
+  selection_bias <- mean(sel_bias, na.rm = TRUE)   # over `ok_H`
+  fixed_bias     <- mean(P[sel, ok_H])             # over `ok_H`, was all B
+  fb             <- if (is.finite(fixed_bias)) fixed_bias else 0
+  beta_naive <- bh[sel]
+  beta_deb   <- beta_naive - selection_bias - fb
+  se_wald    <- sdv[sel]
+
+  # Infinitesimal-jackknife variance of the de-biased estimate (Eq. VInfJ_bc),
+  # from the same draws: r_b = (selection_bias + fixed_bias) - D_{H*_b}(b) - D_H(b).
+  # Evaluated on `ok`, the same draws both bias terms average over -- which is
+  # what makes mean(r_b) identically zero there.
+  r_H   <- (selection_bias + fb) - sel_bias - P[sel, ]
+  # Exposure only -- reads the residual the IJ is about to consume, over the
+  # same `ok_H`.  Zero by construction while both bias terms share a
+  # denominator; a non-zero value means they do not, which is what F13 was.
+  mean_r <- mean(r_H[ok_H])
+  ijH   <- .fs_mr_ij_var(Xi, r_H, ok_H)
+  se_ij <- .fs_mr_se_from_ij(ijH, se_wald)
+  # Winner-only IJ variants (TASK_complement_refinements_2026-09-06, method A):
+  # the total-derivative residual r_b^w = bias_sel - D_{H*_b}(b) drops the
+  # same-draws term (exact when one candidate dominates; under-covers at ties
+  # on the harm side unless floored at the naive variance).  Always computed
+  # from the same draws -- add-only elements -- and ij_residual chooses which
+  # variance populates the REPORTED se_ij / bounds; the default "two_term"
+  # reports se_ij exactly as before.
+  ijH_win   <- .fs_mr_ij_var(Xi, selection_bias - sel_bias, ok_H)
+  se_ij_win <- .fs_mr_se_from_ij(ijH_win, se_wald)
+  se_ij_wfl <- .fs_mr_ij_floor(se_ij_win, se_wald)
+  se_ij_rep <- switch(ij_residual, two_term = se_ij, winner = se_ij_win,
+                      winner_floor = se_ij_wfl)
+  # "field" keeps the debiased element on the IJ interval (identical to "ij");
+  # only "wald" switches it to the robust SE.
+  se    <- if (ci_method == "wald") se_wald else se_ij_rep$se
+
+  t_cmp    <- if (log_scale) log(t_confirm) else t_confirm
+  ci_lo_1s <- beta_deb - stats::qnorm(0.95) * se
+  flag <- if (confirm_rule == "point") (beta_deb >= t_cmp) else (ci_lo_1s >= t_cmp)
+
+  # ---------------------------------------------------------------------------
+  # Complement subgroup (optional).  The complement is induced by the selection,
+  # not chosen independently, so its bias is the perturbation of the complement
+  # of the re-selected winner on each draw.  Fit complements only for candidates
+  # that win across draws (plus the selected one) to keep the cost small.
+  # ---------------------------------------------------------------------------
+  complement <- NULL
+  mean_r_c   <- NA_real_        # stays NA when no complement is fit
+  bdc_w      <- NA_real_        # beta-tilde^c on the working scale, read by the
+                                # complement field block; NA when unfit
+  # HOIST (TASK_field_recovery_2026-09-09, R1).  These three were built inside
+  # the include_complement branch below; the field-recovery diagnostics need
+  # `kept` and `Nall` whether or not that branch runs.  The hoist is
+  # byte-identical: all three are pure functions of objects already fixed above
+  # (`candidates` and `asm` at the top of the function, `df` unchanged since),
+  # with no fitting, no drawing, no RNG consumption and no side effects --
+  # a list subset, a length and a row count.  Nothing between here and the
+  # branch reads or writes them.
+  kept   <- candidates[asm$keep]              # aligns with asm columns
+  Ncol   <- length(asm$names)
+  Nall   <- nrow(df)
+  if (isTRUE(include_complement)) {
+    winset <- sort(unique(c(winner[!is.na(winner)], sel)))
+    Bc   <- matrix(0, Nall, Ncol)
+    bh_c <- rep(NA_real_, Ncol); sdv_c <- rep(NA_real_, Ncol)
+    for (w in winset) {
+      comp_idx <- setdiff(seq_len(Nall), kept[[w]])
+      if (length(comp_idx) < 6L) next
+      pcc <- tryCatch(.fs_mr_pieces(df[comp_idx, , drop = FALSE], spec),
+                      error = function(e) NULL)
+      if (is.null(pcc) || length(pcc$dfbeta) != length(comp_idx)) next
+      Bc[comp_idx, w] <- pcc$dfbeta
+      bh_c[w] <- pcc$beta_hat; sdv_c[w] <- pcc$sigma_D
+    }
+    Pc <- crossprod(Bc, Xi)                      # Ncol x draws : D_{complement}(b)
+    ok <- which(!is.na(winner))
+    selb_c <- rep(NA_real_, draws)
+    if (length(ok)) {
+      vals <- Pc[cbind(winner[ok], ok)]
+      vals[is.na(bh_c[winner[ok]])] <- NA_real_  # winner's complement not fit
+      selb_c[ok] <- vals
+    }
+    # Same principle as the selected subgroup: both bias terms and the IJ share
+    # one denominator.  Here that is the draws on which the complement's
+    # perturbation EXISTS, which is_finite(selb_c) already identifies -- it
+    # excludes two distinct events at once, and under this convention both are
+    # excluded rather than one being substituted:
+    #
+    #   (a) the draw admitted no candidate      -- winner[b] is NA;
+    #   (b) the winner's complement was not fit -- set NA at the line above.
+    #
+    # (b) is missing data, not a selection outcome, so it must never be
+    # substituted with a value.  Conditioning makes (a) excluded too, so the
+    # distinction needs no code: naming the shared set is enough.  It also
+    # avoids the question of what the complement of an EMPTY winner is -- under
+    # this convention that draw is excluded on both sides, and the complement is
+    # always a genuine complement.
+    use_c     <- which(is.finite(selb_c))
+    selbias_c <- mean(selb_c[use_c])
+    fixed_c   <- mean(Pc[sel, use_c])            # over `use_c`, was all B
+    bnc       <- bh_c[sel]
+    if (is.finite(bnc)) {
+      sbc <- if (is.finite(selbias_c)) selbias_c else 0
+      fcc <- if (is.finite(fixed_c)) fixed_c else 0
+      bdc <- bnc - sbc - fcc
+      bdc_w <- bdc
+      sec <- sdv_c[sel]
+      r_c   <- (sbc + fcc) - selb_c - Pc[sel, ]
+      mean_r_c <- mean(r_c[use_c])          # exposure only; see mean_r above
+      ijC   <- .fs_mr_ij_var(Xi, r_c, use_c)
+      se_ijc <- .fs_mr_se_from_ij(ijC, sec)
+      # Winner-only variants for the complement (see the harm block above):
+      # residual sbc - selb_c over the same use_c draws; floor = naive SE.
+      ijC_win    <- .fs_mr_ij_var(Xi, sbc - selb_c, use_c)
+      se_ijc_win <- .fs_mr_se_from_ij(ijC_win, sec)
+      se_ijc_wfl <- .fs_mr_ij_floor(se_ijc_win, sec)
+      se_ijc_rep <- switch(ij_residual, two_term = se_ijc, winner = se_ijc_win,
+                           winner_floor = se_ijc_wfl)
+      sec_used <- if (ci_method %in% c("ij", "field")) se_ijc_rep$se else sec
+      z95c <- stats::qnorm(0.95)
+      complement <- list(
+        naive    = list(est = to_eff(bnc),
+                        lower = to_eff(bnc - z975 * sec),
+                        upper = to_eff(bnc + z975 * sec)),
+        debiased = list(est = to_eff(bdc),
+                        lower = to_eff(bdc - z975 * sec_used),
+                        upper = to_eff(bdc + z975 * sec_used),
+                        lower_1s = to_eff(bdc - stats::qnorm(0.95) * sec_used),
+                        se = sec_used, se_ij = se_ijc_rep$se, se_wald = sec,
+                        var_ij = se_ijc_rep$var, ij_source = se_ijc_rep$source,
+                        ij_draws = ijC$B_ok,
+                        # Add-only: the winner-only variants, both recorded
+                        # regardless of ij_residual (method A).
+                        se_ij_two_term = se_ijc$se,
+                        se_ij_winner = se_ijc_win$se,
+                        ij_source_winner = se_ijc_win$source,
+                        se_ij_winner_floor = se_ijc_wfl$se,
+                        ij_source_winner_floor = se_ijc_wfl$source,
+                        lower_w  = to_eff(bdc - z975 * se_ijc_win$se),
+                        upper_w  = to_eff(bdc + z975 * se_ijc_win$se),
+                        lower_1s_w = to_eff(bdc - z95c * se_ijc_win$se),
+                        upper_1s_w = to_eff(bdc + z95c * se_ijc_win$se),
+                        lower_wf = to_eff(bdc - z975 * se_ijc_wfl$se),
+                        upper_wf = to_eff(bdc + z975 * se_ijc_wfl$se),
+                        lower_1s_wf = to_eff(bdc - z95c * se_ijc_wfl$se),
+                        upper_1s_wf = to_eff(bdc + z95c * se_ijc_wfl$se)),
+        selection_bias = selbias_c, fixed_bias = fixed_c,
+        n = Nall - sz[sel])
+    } else {
+      complement <- list(note = "complement subgroup could not be fit")
+    }
+  }
+
+  # ---------------------------------------------------------------------------
+  # Field-calibrated interval (ci_method = "field") -- method proposal,
+  # TASK_mr_field_vs_guohe_2026-09-05.  Add-only: this block runs only when
+  # requested, after the main multiplier stream is fully consumed, under a
+  # derived seed -- so the "ij"/"wald" paths above are untouched, RNG stream
+  # included.
+  #
+  # Shrunk field w = beta_hat with the winner's entry replaced by the two-term
+  # de-biased estimate (E1).  Gaussian-multiplier perturbations zeta = B' xi,
+  # xi ~ N(0, I_n) -- no Cholesky, no explicit Sigma.  Per outer draw r:
+  #   v_r = w + zeta*_r;  G_r = S(v_r);
+  #   m-hat(v_r) = mean_j zeta'_{j, S(v_r + zeta'_j)}  (shared inner draws,
+  #                draws with no winner skipped, the bias_sel convention);
+  #   Lambda*_r  = zeta*_{r, G_r} - m-hat(v_r).
+  # The interval inverts Lambda* around beta_deb (basic-bootstrap form).
+  # S is the gate's own re-selection: under maxeff with no admission floor it
+  # is a plain argmax (vectorized over inner draws; ties.method = "first"
+  # matches which.max); any other configuration goes through .fs_mr_select
+  # per draw, identically to the main loop above.
+  # ---------------------------------------------------------------------------
+  field <- NULL
+  if (ci_method == "field") {
+    t0f <- proc.time()
+    if (!is.null(seed)) set.seed(as.integer(seed) + 900000L)
+    Np <- nrow(B)
+    # The raw N(0, I) multipliers are held in Xo / Xi_f so the complement
+    # field (field_complement, TASK_mr_field_complement_2026-09-06) can
+    # project the SAME xi through the complement's own influence.  Two rnorm
+    # calls of the same sizes in the same order as before: the stream, Zo and
+    # Zi are byte-identical whether or not the complement block runs.
+    Xo   <- matrix(stats::rnorm(Np * field_R_out), Np, field_R_out)
+    Xi_f <- matrix(stats::rnorm(Np * field_R_in), Np, field_R_in)
+    Zo <- crossprod(B, Xo)
+    Zi <- crossprod(B, Xi_f)
+    w <- bh; w[sel] <- beta_deb
+    fast <- identical(reselection, "maxeff") && is.null(t_g)
+    sel_one <- function(v) {
+      pass <- .admit(v)
+      if (!length(pass)) return(NA_integer_)
+      .fs_mr_select(v, .zcons(v), sz, pass, reselection,
+                    effect_neighborhood, selection_rule, log_scale)
+    }
+    lam <- rep(NA_real_, field_R_out)
+    n_in_used <- rep(NA_real_, field_R_out)
+    ii <- seq_len(field_R_in)
+    # Winner record for the complement field: the outer winner G_r and the
+    # inner winners G(v_r + zeta'_j) (NA where the inner draw had none), taken
+    # as this loop computes them -- the complement re-reads them, it never
+    # re-selects.  Side assignments only; lam / n_in_used are untouched.
+    fc <- isTRUE(field_complement) && isTRUE(include_complement)
+    # The recovery diagnostics (TASK_field_recovery_2026-09-09) read the same
+    # outer-winner record, so G_out is allocated when EITHER consumer wants it.
+    # W_in is the complement's alone.  With field_recovery = FALSE, rec_g is
+    # fc and both allocations are exactly as before.
+    rec_on <- isTRUE(field_recovery)
+    rec_g  <- fc || rec_on
+    G_out <- if (rec_g) rep(NA_integer_, field_R_out) else NULL
+    W_in  <- if (fc) matrix(NA_integer_, field_R_out, field_R_in) else NULL
+    for (r in seq_len(field_R_out)) {
+      v <- w + Zo[, r]
+      G <- if (fast) which.max(v) else sel_one(v)
+      if (is.na(G)) next
+      if (fast) {
+        win <- max.col(t(v + Zi), ties.method = "first")
+        lam[r] <- Zo[G, r] - mean(Zi[cbind(win, ii)])
+        n_in_used[r] <- field_R_in
+        if (rec_g) G_out[r] <- as.integer(G)
+        if (fc) W_in[r, ] <- as.integer(win)
+      } else {
+        wi <- vapply(ii, function(j) sel_one(v + Zi[, j]), integer(1))
+        ok_in <- which(!is.na(wi))
+        if (!length(ok_in)) next
+        lam[r] <- Zo[G, r] - mean(Zi[cbind(wi[ok_in], ok_in)])
+        n_in_used[r] <- length(ok_in)
+        if (rec_g) G_out[r] <- as.integer(G)
+        if (fc) W_in[r, ] <- wi
+      }
+    }
+    ok_f <- which(is.finite(lam))
+    if (length(ok_f) >= 2L) {
+      lf <- lam[ok_f]
+      qs <- stats::quantile(lf, c(.05, .25, .50, .75, .95, .025, .975),
+                            names = FALSE, type = 7)
+      est2_w <- beta_deb - mean(lf)
+      sd_f <- stats::sd(lf)
+      field <- list(
+        lambda_mean = mean(lf), lambda_sd = sd_f,
+        q05 = qs[1], q25 = qs[2], q50 = qs[3], q75 = qs[4], q95 = qs[5],
+        q025 = qs[6], q975 = qs[7],
+        n_out_used = length(ok_f), n_in_used_mean = mean(n_in_used[ok_f]),
+        est2 = to_eff(est2_w),
+        lower_1s = to_eff(beta_deb - qs[5]),
+        lower_2s = to_eff(beta_deb - qs[7]), upper_2s = to_eff(beta_deb - qs[6]),
+        se_field = sd_f,
+        lower_se = to_eff(est2_w - z975 * sd_f),
+        upper_se = to_eff(est2_w + z975 * sd_f),
+        R_out = as.integer(field_R_out), R_in = as.integer(field_R_in),
+        seed_offset = 900000L,
+        timing_seconds = as.numeric((proc.time() - t0f)["elapsed"]))
+
+      # -- Complement field (field_complement = TRUE) -- add-only and drawn
+      # from NOTHING: it re-reads the harm field's xi (Xo / Xi_f) and winners
+      # (G_out / W_in), so the harm field above and the uniform sweep below
+      # are byte-identical whether or not it runs
+      # (TASK_mr_field_complement_2026-09-06).  Needs the gate's complement
+      # path: Bc / bh_c / winset exist only under include_complement = TRUE.
+      if (fc) {
+        fcres <- .fs_mr_field_complement(
+          df = df, spec = spec, kept = kept, Bc = Bc, bh_c = bh_c,
+          winset = winset, sel = sel, bdc = bdc_w,
+          G_out = G_out, W_in = W_in, Xo = Xo, Xi_f = Xi_f,
+          to_eff = to_eff, z975 = z975,
+          field_decompose = field_decompose,
+          field_scale_complement = field_scale_complement,
+          # Joint (H lower, Hc upper) pair from the aligned outer draws
+          # (TASK_complement_refinements_2026-09-06, method B); add-only,
+          # attached as field$joint, no new draws.
+          lam_H = lam, beta_deb = beta_deb)
+        field$complement <- fcres$complement
+        if (!is.null(fcres$joint)) field$joint <- fcres$joint
+        if (!is.null(fcres$joint_s)) field$joint_s <- fcres$joint_s   # field-s (add-beside)
+      }
+
+      # -- Uniform (kappa) calibration -- add-only, after the field's stream
+      # is fully consumed; its own derived seed (+910000L) mirrors the field
+      # block's (+900000L), so nothing above changes byte-for-byte whether or
+      # not the sweep runs (TASK_mr_field_uniform_2026-09-05).
+      if (isTRUE(field_uniform)) {
+        p_hat_u <- tabulate(winner[!is.na(winner)],
+                            nbins = length(asm$names)) / draws
+        uni <- tryCatch(
+          fs_mr_field_uniform(
+            B = B, w = w, sel = sel, sigma_sel = sdv[sel],
+            p_hat = p_hat_u, t_g = t_g,
+            reselection = reselection, sz = sz,
+            effect_neighborhood = effect_neighborhood,
+            selection_rule = selection_rule, log_scale = log_scale,
+            sdv = sdv, zcons_c = c_cons,
+            M_cap = if (is.null(field_M_cap))
+              eval(formals(fs_mr_field_uniform)$M_cap) else as.integer(field_M_cap),
+            seed = if (!is.null(seed)) as.integer(seed) + 910000L else NULL),
+          error = function(e)
+            list(note = paste("uniform sweep failed:", conditionMessage(e))))
+        field$uniform <- if (is.null(uni$note)) list(
+          kappa = uni$kappa, kappa_mcse = uni$kappa_mcse,
+          M = uni$M, mass_covered = uni$mass_covered,
+          minC1 = uni$minC1, C1 = uni$C1, C2_k1 = uni$C2_k1,
+          C2_kstar = uni$C2_kstar, delta_grid = uni$delta_grid,
+          n_kept = uni$n_kept,
+          # The uniform two-sided interval for THIS analysis: the real
+          # field's quantiles widened about its own mean (task step 6).
+          lower_2u = to_eff(beta_deb - mean(lf) - uni$kappa * (qs[7] - mean(lf))),
+          upper_2u = to_eff(beta_deb - mean(lf) - uni$kappa * (qs[6] - mean(lf))),
+          R_rep = uni$R_rep, R_out = uni$R_out, R_in = uni$R_in,
+          seed_offset = 910000L,
+          timing_seconds = uni$timing_seconds) else uni
+      }
+    } else {
+      field <- list(note = "fewer than 2 usable outer draws",
+                    n_out_used = length(ok_f),
+                    R_out = as.integer(field_R_out),
+                    R_in = as.integer(field_R_in))
+    }
+    # -- Re-selection recovery (field_recovery = TRUE) -- add-only and drawn
+    # from NOTHING: it re-reads the outer winners G_out recorded above and the
+    # fixed kept family, and compares memberships.  Attached last, after every
+    # construction is complete, because no construction reads it
+    # (TASK_field_recovery_2026-09-09).  Runs on both branches above: when
+    # fewer than 2 outer draws were usable, every metric comes back NA.
+    if (rec_on)
+      field$recovery <- .fs_mr_field_recovery(kept, G_out, sel, Nall)
+  }
+
+  out <- list(
+    selected_index = sel, selected_label = asm$names[sel],
+    measure = spec$effect_measure, log_scale = log_scale,
+    ci_method = ci_method,
+    naive    = list(est = to_eff(beta_naive),
+                    lower = to_eff(beta_naive - z975 * se_wald),
+                    upper = to_eff(beta_naive + z975 * se_wald)),
+    debiased = list(est = to_eff(beta_deb),
+                    lower = to_eff(beta_deb - z975 * se),
+                    upper = to_eff(beta_deb + z975 * se),
+                    lower_1s = to_eff(ci_lo_1s),
+                    se = se, se_ij = se_ij_rep$se, se_wald = se_wald,
+                    var_ij = se_ij_rep$var, ij_source = se_ij_rep$source,
+                    ij_draws = ijH$B_ok,
+                    # Add-only: the winner-only variants (method A), both
+                    # recorded regardless of ij_residual.
+                    se_ij_two_term = se_ij$se,
+                    se_ij_winner = se_ij_win$se,
+                    ij_source_winner = se_ij_win$source,
+                    se_ij_winner_floor = se_ij_wfl$se,
+                    ij_source_winner_floor = se_ij_wfl$source,
+                    lower_w  = to_eff(beta_deb - z975 * se_ij_win$se),
+                    upper_w  = to_eff(beta_deb + z975 * se_ij_win$se),
+                    lower_1s_w = to_eff(beta_deb - stats::qnorm(0.95) * se_ij_win$se),
+                    lower_wf = to_eff(beta_deb - z975 * se_ij_wfl$se),
+                    upper_wf = to_eff(beta_deb + z975 * se_ij_wfl$se),
+                    lower_1s_wf = to_eff(beta_deb - stats::qnorm(0.95) * se_ij_wfl$se)),
+    selection_bias = selection_bias, fixed_bias = fixed_bias,
+    selection_rate = selection_rate,
+    mean_r = mean_r, mean_r_c = mean_r_c,
+    complement = complement,
+    settings = mr_settings, harm_flag = isTRUE(flag),
+    n_family = length(asm$names), n_selected = sz[sel],
+    timing_seconds = timing)
+  if (isTRUE(return_reselection)) {
+    p_hat <- tabulate(winner[!is.na(winner)], nbins = length(asm$names)) / draws
+    names(p_hat) <- asm$names
+    out$reselection <- list(winner = winner, p_hat = p_hat)
+  }
+  if (!is.null(field)) out$field <- field
+  out$ij_residual <- ij_residual   # add-only: the residual behind the reported IJ SEs
+  # Declaration field (TASK_declaration_calibration_2026-09-22_v2) -- add-only
+  # and drawn from NOTHING: it re-reads the influence matrix B and the main
+  # stream's shared multipliers Xi, after every construction above is complete.
+  # The standardization lives in .fs_decl_field() (fs_declaration_calibration.R).
+  if (isTRUE(keep_declaration_field)) {
+    # Protected null level c0 (TASK_declcal_c0_rchange_2026-09-22): the shifted
+    # maxima are taken inside .fs_decl_field() before keep_field_matrix is
+    # consulted.  NULL leaves the shift, and the stored field, untouched.
+    c0_cmp <- if (is.null(declaration_c0)) NULL else
+      .fs_decl_c0_cmp(declaration_c0, c_cons, log_scale)
+    fld <- .fs_decl_field(B, Xi, keep_matrix = isTRUE(keep_field_matrix),
+                          shift = if (is.null(c0_cmp)) NULL else
+                            .fs_decl_c0_shift(c0_cmp, c_cons, sdv))
+    out$declaration_field <- list(
+      Mstar = fld$Mstar, Zstar = fld$Zstar,
+      beta_hat = stats::setNames(bh, asm$names),
+      sigma_D = stats::setNames(sdv, asm$names),
+      family_id = asm$names,
+      meta = list(
+        multiplier = multiplier, B = as.integer(draws), n = nrow(B),
+        G = ncol(B), shared_multipliers = fld$shared_multipliers,
+        sizes = stats::setNames(sz, asm$names), selected_index = sel,
+        selected_appended = identical(sel_lab, H_lab),
+        n_candidates_supplied = length(candidates),
+        log_scale = log_scale,
+        c_cons = c_cons, p_star = admission$consistency$p_star,
+        c_screen = admission$effect_floor,
+        sigma_D_field = fld$sigma_D, column_sd = fld$column_sd,
+        column_mean = fld$column_mean, zstar_mean = fld$zstar_mean,
+        field_cor = fld$field_cor, seed = seed))
+    if (!is.null(c0_cmp)) {
+      out$declaration_field$Mstar_c0 <- fld$Mstar_shift
+      out$declaration_field$meta$c0 <- as.numeric(declaration_c0)
+      out$declaration_field$meta$c0_cmp <- c0_cmp
+    }
+  }
+  out
+}
+
+
+#' Field re-selection recovery: membership agreement against the observed pick
+#'
+#' Descriptive diagnostics for `fs_mr_inference(field_recovery = TRUE)`
+#' (TASK_field_recovery_2026-09-09, R-1).  Computed entirely from draws
+#' already made: the outer winners `G_out` recorded by the field loop and the
+#' fixed `kept` family.  Nothing is fit, nothing is drawn, no RNG is consumed,
+#' and no construction reads the result.
+#'
+#' The metrics are the field analogues of the cross-validation membership
+#' cross-tab in `forestsearch_cross_validation.R`
+#' (`table(treat.recommend, treat.recommend.original)`), with the observed
+#' pick `kept[[sel]]` in the role of `treat.recommend.original` and each
+#' draw's re-selection `kept[[G_r]]` in the role of `treat.recommend`.  Per
+#' draw, with `n = n_all`, `a = |G_r & Hhat|`, `b = |G_r|`, `c = |Hhat|` and
+#' `d = n - b - c + a`:
+#' `sens_H = a / c`, `ppv_H = a / b`, `sens_Hc = d / (n - c)`,
+#' `ppv_Hc = d / (n - b)`.  Each is averaged over the used draws.  `npv_Hc`
+#' is returned as an alias of `ppv_Hc`: read with `Hhat` as the positive
+#' class, CV's `ppv_Hc` *is* the negative predictive value, and the standing
+#' convention names sensitivity, specificity, PPV and NPV together.
+#'
+#' Guards: a draw is used when it recorded a winner that indexes the kept
+#' family and that candidate is non-empty; the rest are counted in
+#' `n_skipped`.  With no usable draw every metric is `NA_real_`.
+#'
+#' @param kept List of integer patient-index vectors, the kept candidate
+#'   family (aligned with the `asm` columns).
+#' @param G_out Integer vector of outer-draw winners (`NA` where a draw had
+#'   none), or `NULL` when no winner record exists.
+#' @param sel Integer index of the observed selected subgroup within `kept`.
+#' @param n_all Integer, the number of patients in the analysis set.
+#' @return Named list of the metrics, quantiles and draw accounting described
+#'   in [fs_mr_inference()]'s `field_recovery` argument.
+#' @keywords internal
+#' @noRd
+.fs_mr_field_recovery <- function(kept, G_out, sel, n_all) {
+  t0  <- proc.time()
+  n_all <- as.integer(n_all)
+  out <- list(sens_H = NA_real_, ppv_H = NA_real_,
+              sens_Hc = NA_real_, ppv_Hc = NA_real_, npv_Hc = NA_real_,
+              q10 = NA_real_, q50 = NA_real_, q90 = NA_real_,
+              share_equal_1 = NA_real_,
+              n_draws = 0L, n_used = 0L, n_skipped = 0L,
+              n_selected = NA_integer_, n_all = n_all,
+              timing_seconds = NA_real_)
+  .stamp <- function(o) {
+    o$timing_seconds <- as.numeric((proc.time() - t0)[["elapsed"]]); o
+  }
+  if (is.null(G_out) || !length(kept) || length(sel) != 1L || is.na(sel) ||
+      sel < 1L || sel > length(kept))
+    return(.stamp(out))
+
+  Hh  <- kept[[sel]]
+  c_r <- length(Hh)
+  out$n_selected <- as.integer(c_r)
+  g <- G_out[!is.na(G_out)]
+  out$n_draws <- length(g)
+  if (!length(g) || c_r < 1L || n_all < 1L) return(.stamp(out))
+
+  # Membership indicator once; sizes and intersections once per DISTINCT
+  # re-selected candidate, then mapped back to draws.
+  memb <- logical(n_all); memb[Hh] <- TRUE
+  ok   <- g >= 1L & g <= length(kept)
+  ug   <- sort(unique(g[ok]))
+  bu   <- vapply(ug, function(w) length(kept[[w]]), numeric(1))
+  au   <- vapply(ug, function(w) sum(memb[kept[[w]]]), numeric(1))
+  use  <- ok & !is.na(match(g, ug[bu >= 1]))
+  out$n_used    <- sum(use)
+  out$n_skipped <- length(g) - out$n_used
+  if (!out$n_used) return(.stamp(out))
+
+  i <- match(g[use], ug)
+  a <- au[i]; b <- bu[i]
+  d <- n_all - b - c_r + a
+  contain <- a / c_r
+  .m <- function(x) if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+  out$sens_H  <- mean(contain)
+  out$ppv_H   <- mean(a / b)
+  out$sens_Hc <- if (n_all > c_r) .m(d / (n_all - c_r)) else NA_real_
+  out$ppv_Hc  <- .m(ifelse(n_all > b, d / (n_all - b), NA_real_))
+  out$npv_Hc  <- out$ppv_Hc
+  qs <- stats::quantile(contain, c(0.10, 0.50, 0.90), names = FALSE, type = 7)
+  out$q10 <- qs[1]; out$q50 <- qs[2]; out$q90 <- qs[3]
+  out$share_equal_1 <- mean(contain >= 1 - 1e-12)
+  .stamp(out)
+}
+
+
+#' Complement field block for `fs_mr_inference(field_complement = TRUE)`
+#'
+#' The one-sided **upper** bound for a benefit claim on the complement
+#' (TASK_mr_field_complement_2026-09-06).  Selection is the harm field's:
+#' each outer draw's winner `G_r` and each inner draw's winner are re-read from
+#' `G_out` / `W_in`, never re-selected.  The complement enters only through its
+#' own effects and influences: `zeta^c = Bc' xi` with the harm field's own
+#' `xi` (`Xo`, `Xi_f`), so the complement's noise carries its correct
+#' correlation with every candidate's noise; complements of candidates that
+#' win on any draw but were not fit by the multiplier stage are fit lazily
+#' into the same `Bc` / `bh_c` cache.  `Lambda*c_r = zeta^c_{r, G_r} -
+#' mean_j zeta'^c_{j, G(v_r + zeta'_j)}` over the inner draws with a winner
+#' whose complement is fit; outer draws are dropped when the harm block
+#' dropped them, when `G_r`'s complement is unfit, or when no inner draw
+#' survives.  The interval inverts `Lambda*c` around `bdc` (the two-term
+#' de-biased complement estimate on the working scale).
+#'
+#' @return List as documented under `field$complement` in
+#'   [fs_mr_inference()], or a `note`-carrying list when the selected
+#'   complement is unfit or fewer than 2 outer draws survive.
+#' @noRd
+.fs_mr_field_complement <- function(df, spec, kept, Bc, bh_c, winset, sel, bdc,
+                                    G_out, W_in, Xo, Xi_f, to_eff, z975,
+                                    lam_H = NULL, beta_deb = NA_real_,
+                                    alpha = 0.05, field_decompose = FALSE,
+                                    field_scale_complement = "none") {
+  t0c <- proc.time()
+  scale_on <- identical(field_scale_complement, "selected")
+  R_out <- length(G_out); R_in <- ncol(W_in)
+  if (!is.finite(bdc))
+    return(list(complement = list(
+      note = "complement of the selected subgroup could not be fit",
+      n_out_used = 0L, R_out = as.integer(R_out), R_in = as.integer(R_in)),
+      joint = NULL, joint_s = NULL))
+  Nall <- nrow(Bc)
+  # Lazy complement fits: every candidate winning on any outer or inner draw
+  # that the multiplier stage did not already fit -- the same loop body as the
+  # gate's own complement fits (an unfit column stays all-zero with bh_c NA).
+  readings <- c(G_out[!is.na(G_out)], W_in[!is.na(W_in)])
+  need     <- sort(unique(readings))
+  new_fit  <- setdiff(need, winset)
+  for (w in new_fit) {
+    comp_idx <- setdiff(seq_len(Nall), kept[[w]])
+    if (length(comp_idx) < 6L) next
+    pcc <- tryCatch(.fs_mr_pieces(df[comp_idx, , drop = FALSE], spec),
+                    error = function(e) NULL)
+    if (is.null(pcc) || length(pcc$dfbeta) != length(comp_idx)) next
+    Bc[comp_idx, w] <- pcc$dfbeta
+    bh_c[w] <- pcc$beta_hat
+  }
+  fit_ok <- is.finite(bh_c)
+  # -- Selected complement's ensure-fit and the per-candidate scale s (E1,
+  # TASK_field_studentize_e1_2026-09-08; the ensure-fit relocated unchanged
+  # from the Stage 1 decompose block).  Runs only under field_scale_complement
+  # = "selected" or field_decompose = TRUE.  Output invariance: sel is in
+  # winset, so the multiplier stage already attempted its fit and the lazy
+  # loop above never touches it; this block can only populate Bc[, sel] when
+  # that fit failed -- but then bdc (the complement's de-biased estimate,
+  # which needs bh_c[sel]) is NA and the function returned above.  So on every
+  # path that reaches here Bc / fit_ok are exactly what the loop left, and
+  # Zo_c / Zi_c / lam_c below are unchanged (gates G2a-G2c).
+  s <- NULL
+  if (scale_on || isTRUE(field_decompose)) {
+    if (!fit_ok[sel]) {                      # ensure the selected complement's column is populated
+      comp_idx <- setdiff(seq_len(Nall), kept[[sel]])
+      if (length(comp_idx) >= 6L) {
+        pcc <- tryCatch(.fs_mr_pieces(df[comp_idx, , drop = FALSE], spec), error = function(e) NULL)
+        if (!is.null(pcc) && length(pcc$dfbeta) == length(comp_idx)) {
+          Bc[comp_idx, sel] <- pcc$dfbeta; bh_c[sel] <- pcc$beta_hat; fit_ok[sel] <- TRUE
+        }
+      }
+    }
+    s <- sqrt(colSums(Bc * Bc))              # per-candidate complement noise scale; 0 for unfit
+  }
+  Zo_c <- crossprod(Bc, Xo)                  # Ncol x R_out : zeta^c (outer)
+  Zi_c <- crossprod(Bc, Xi_f)                # Ncol x R_in  : zeta'^c (inner)
+  lam_c  <- rep(NA_real_, R_out)
+  lam_cs <- rep(NA_real_, R_out)            # field-s (studentized) root; NA unless scale_on
+  n_in_c <- rep(NA_real_, R_out)
+  n_drop_unfit <- 0L
+  for (r in which(!is.na(G_out))) {
+    G <- G_out[r]
+    if (!fit_ok[G]) { n_drop_unfit <- n_drop_unfit + 1L; next }
+    wi <- W_in[r, ]
+    ok_in <- which(!is.na(wi))
+    ok_in <- ok_in[fit_ok[wi[ok_in]]]
+    if (!length(ok_in)) { n_drop_unfit <- n_drop_unfit + 1L; next }
+    lam_c[r]  <- Zo_c[G, r] - mean(Zi_c[cbind(wi[ok_in], ok_in)])
+    # field-s (R1): the same draws, winners and drop logic, each reading
+    # rescaled candidate-wise to the selected complement's scale s[sel].
+    if (scale_on)
+      lam_cs[r] <- (s[sel] / s[G]) * Zo_c[G, r] -
+        mean((s[sel] / s[wi[ok_in]]) * Zi_c[cbind(wi[ok_in], ok_in)])
+    n_in_c[r] <- length(ok_in)
+  }
+  ok_c <- which(is.finite(lam_c))
+  counts <- list(n_out_used = length(ok_c),
+                 n_out_dropped_unfit = n_drop_unfit,
+                 n_complement_fits = sum(fit_ok),
+                 n_new_fits = length(new_fit),
+                 share_draws_new_fit = mean(!(readings %in% winset)),
+                 R_out = as.integer(R_out), R_in = as.integer(R_in))
+  if (length(ok_c) < 2L)
+    return(list(complement = c(list(note = "fewer than 2 usable outer draws (complement)"),
+                               counts), joint = NULL, joint_s = NULL))
+  lf <- lam_c[ok_c]
+  qs <- stats::quantile(lf, c(.05, .25, .50, .75, .95, .025, .975),
+                        names = FALSE, type = 7)
+  est2_w <- bdc - mean(lf)
+  sd_c <- stats::sd(lf)
+  # -- field-s (field_scale_complement = "selected"): the studentized root's
+  # quantiles, the exact analogue of the block above, inverted around the
+  # same bdc; add-beside, nothing above is read differently.
+  if (scale_on) {
+    lfs <- lam_cs[ok_c]
+    qss <- stats::quantile(lfs, c(.05, .25, .50, .75, .95, .025, .975),
+                           names = FALSE, type = 7)
+    est2s_w <- bdc - mean(lfs)
+    sd_cs <- stats::sd(lfs)
+  }
+  # -- Scale decomposition (field_decompose = TRUE; PROPOSAL_complement_field_
+  # scale_2026-09-08_v2, Stage 1) -- add-only and drawn from NOTHING: it reads
+  # Bc / Zo_c / lam_c / G_out as the loop above left them, and s[g] =
+  # sqrt(sum(Bc[, g]^2)), candidate g's complement influence-norm scale (0
+  # for an unfit column), computed before crossprod (E1 relocation; see the
+  # invariance note there).  Nothing here alters lam_c, lf, the quantiles,
+  # est2 or any existing output.
+  decomp_fields <- NULL
+  if (isTRUE(field_decompose)) {
+    # (ensure-fit and s computed above, before crossprod; E1 relocation)
+    gG <- G_out[ok_c]; s_win <- s[gG]
+    zg <- Zo_c[cbind(gG, ok_c)]; mi <- zg - lf
+    decomp_fields <- list(
+      scale_sel      = if (fit_ok[sel]) s[sel] else NA_real_,
+      scale_win_mean = mean(s_win),
+      scale_win_cv   = stats::sd(s_win) / mean(s_win),
+      scale_ratio_c  = if (fit_ok[sel]) s[sel] / mean(s_win) else NA_real_,
+      var_zeta_G = stats::var(zg), var_m_in = stats::var(mi), cov_zeta_m = stats::cov(zg, mi))
+  }
+  # Joint (H lower, Hc upper) pair (method B): the harm field's lam and this
+  # block's lam_c are indexed by the same outer draw r, so the aligned pairs
+  # over ok_c need no re-drawing.
+  joint <- if (!is.null(lam_H) && is.finite(beta_deb))
+    .fs_mr_field_joint(lam_H[ok_c], lf, beta_deb, bdc, to_eff, alpha) else NULL
+  joint_s <- if (scale_on && !is.null(lam_H) && is.finite(beta_deb))
+    .fs_mr_field_joint(lam_H[ok_c], lfs, beta_deb, bdc, to_eff, alpha) else NULL
+  complement <- c(list(
+    lambda_mean = mean(lf), lambda_sd = sd_c,
+    q05 = qs[1], q25 = qs[2], q50 = qs[3], q75 = qs[4], q95 = qs[5],
+    q025 = qs[6], q975 = qs[7],
+    n_in_used_mean = mean(n_in_c[ok_c]),
+    est2 = to_eff(est2_w),
+    # Primary: the one-sided 95% UPPER bound (benefit claim "at most U").
+    upper_1s = to_eff(bdc - qs[1]),
+    lower_1s = to_eff(bdc - qs[5]),
+    lower_2s = to_eff(bdc - qs[7]), upper_2s = to_eff(bdc - qs[6]),
+    se_field = sd_c,
+    lower_se = to_eff(est2_w - z975 * sd_c),
+    upper_se = to_eff(est2_w + z975 * sd_c)),
+    counts,
+    list(timing_seconds = as.numeric((proc.time() - t0c)["elapsed"])))
+  if (!is.null(decomp_fields)) complement$decomp_fields <- decomp_fields   # add-only; absent when FALSE
+  if (scale_on) complement <- c(complement, list(                        # field-s companions (add-beside)
+    lambda_mean_s = mean(lfs), se_field_s = sd_cs,
+    est2_s = to_eff(est2s_w),
+    upper_1s_s = to_eff(bdc - qss[1]), lower_1s_s = to_eff(bdc - qss[5]),
+    lower_2s_s = to_eff(bdc - qss[7]), upper_2s_s = to_eff(bdc - qss[6]),
+    lower_se_s = to_eff(est2s_w - z975 * sd_cs),
+    upper_se_s = to_eff(est2s_w + z975 * sd_cs)))
+  list(complement = complement, joint = joint, joint_s = joint_s)
+}
+
+
+#' Floor an IJ SE at the naive (robust) SE -- the "winner_floor" variant
+#'
+#' `sqrt(max(V, se_floor^2))`; `source` becomes `"winner_floor"` when the floor
+#' binds, otherwise the resolved IJ source is kept.
+#' @noRd
+.fs_mr_ij_floor <- function(ij_se, se_floor) {
+  if (is.finite(se_floor) && (!is.finite(ij_se$se) || ij_se$se < se_floor))
+    return(list(se = se_floor, var = se_floor^2, source = "winner_floor"))
+  ij_se
+}
+
+
+#' Simultaneous (H lower, Hc upper) bounds from the aligned field draws
+#'
+#' Equal-tail level `gamma` on a grid from `alpha` down to `alpha / 2` (step
+#' 0.001): the largest `gamma` with
+#' `mean(Lambda <= q_{1-gamma}(Lambda) & Lambda_c >= q_gamma(Lambda_c)) >= 1 - alpha`
+#' (the harm lower bound inverts the upper tail of `Lambda*`, the complement
+#' upper bound the lower tail of `Lambda*c`).  Returns the calibrated pair, the
+#' Bonferroni pair (`gamma = alpha / 2`) for reference, the achieved joint
+#' probability, the correlation of the draws and their count.
+#' (TASK_complement_refinements_2026-09-06, method B.)
+#' @noRd
+.fs_mr_field_joint <- function(lam_H, lam_c, beta_deb, bdc, to_eff,
+                               alpha = 0.05) {
+  ok <- is.finite(lam_H) & is.finite(lam_c)
+  lh <- lam_H[ok]; lc <- lam_c[ok]; n <- length(lh)
+  if (n < 2L) return(list(note = "fewer than 2 aligned draws", n_joint_draws = n))
+  grid <- seq(alpha, alpha / 2, by = -0.001)
+  probs <- vapply(grid, function(g) {
+    qh <- stats::quantile(lh, 1 - g, names = FALSE, type = 7)
+    qc <- stats::quantile(lc, g, names = FALSE, type = 7)
+    mean(lh <= qh & lc >= qc)
+  }, numeric(1))
+  hit <- which(probs >= 1 - alpha)
+  gamma <- if (length(hit)) grid[hit[1]] else alpha / 2   # largest gamma meeting the target
+  jp    <- if (length(hit)) probs[hit[1]] else probs[length(probs)]
+  qh_g  <- stats::quantile(lh, 1 - gamma, names = FALSE, type = 7)
+  qc_g  <- stats::quantile(lc, gamma, names = FALSE, type = 7)
+  qh_b  <- stats::quantile(lh, 1 - alpha / 2, names = FALSE, type = 7)
+  qc_b  <- stats::quantile(lc, alpha / 2, names = FALSE, type = 7)
+  list(gamma = gamma, joint_prob = jp, alpha = alpha,
+       lower_H = to_eff(beta_deb - qh_g), upper_Hc = to_eff(bdc - qc_g),
+       bonf_gamma = alpha / 2,
+       bonf_lower_H = to_eff(beta_deb - qh_b), bonf_upper_Hc = to_eff(bdc - qc_b),
+       bonf_joint_prob = mean(lh <= qh_b & lc >= qc_b),
+       corr = stats::cor(lh, lc), n_joint_draws = n,
+       grid_gamma = grid, grid_joint_prob = probs)
+}

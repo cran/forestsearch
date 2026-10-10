@@ -40,4 +40,9 @@ Create GRF configuration object
 \details{
 Creates a configuration object to organize GRF parameters
 }
-\keyword{internal}
+\examples{
+cfg <- create_grf_config(frac.tau = 0.6, n.min = 60, dmin.grf = 6,
+                         RCT = TRUE, sg.criterion = "mDiff",
+                         maxdepth = 2, seedit = 42L)
+str(cfg)
+}

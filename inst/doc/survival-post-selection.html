@@ -1,0 +1,527 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.9.38">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+<meta name="author" content="Larry Leon">
+<meta name="dcterms.date" content="2026-10-09">
+
+<title>Post-selection inference for an identified survival subgroup</title>
+<style>
+
+code{white-space: pre-wrap;}
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: min(4vw, 1.5em);}
+div.column{flex: auto; overflow-x: auto;}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+width: 0.8em;
+margin: 0 0.8em 0.2em -1em;  vertical-align: middle;
+}
+.display.math{display: block; text-align: center; margin: 0.5rem auto;}
+
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+{ counter-reset: source-line 0; }
+pre.numberSource code > span
+{ position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+{ content: counter(source-line);
+position: relative; left: -1em; text-align: right; vertical-align: baseline;
+border: none; display: inline-block;
+-webkit-touch-callout: none; -webkit-user-select: none;
+-khtml-user-select: none; -moz-user-select: none;
+-ms-user-select: none; user-select: none;
+padding: 0 4px; width: 4em;
+}
+pre.numberSource { margin-left: 3em; padding-left: 4px; }
+div.sourceCode
+{ }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+
+
+<style type="text/css">body {
+background-color: #fff;
+margin: 1em auto;
+max-width: 700px;
+overflow: visible;
+padding-left: 2em;
+padding-right: 2em;
+font-family: "Open Sans", "Helvetica Neue", Helvetica, Arial, sans-serif;
+font-size: 14px;
+line-height: 1.35;
+}
+table {
+margin: 1em auto;
+border-width: 1px;
+border-color: #DDDDDD;
+border-style: outset;
+border-collapse: collapse;
+}
+table th {
+border-width: 2px;
+padding: 5px;
+border-style: inset;
+}
+table td {
+border-width: 1px;
+border-style: inset;
+line-height: 18px;
+padding: 5px 5px;
+}
+table, table th, table td {
+border-left-style: none;
+border-right-style: none;
+}
+table thead, table tr.even {
+background-color: #f7f7f7;
+}
+p {
+margin: 0.5em 0;
+}
+blockquote {
+background-color: #f6f6f6;
+padding: 0.25em 0.75em;
+}
+hr {
+border-style: solid;
+border: none;
+border-top: 1px solid #777;
+margin: 28px 0;
+}
+dl {
+margin-left: 0;
+}
+dl dd {
+margin-bottom: 13px;
+margin-left: 13px;
+}
+dl dt {
+font-weight: bold;
+}
+ul {
+margin-top: 0;
+}
+ul li {
+list-style: circle outside;
+}
+ul ul {
+margin-bottom: 0;
+}
+pre, code {
+background-color: #f7f7f7;
+border-radius: 3px;
+color: #333;
+white-space: pre-wrap; 
+}
+pre {
+border-radius: 3px;
+margin: 5px 0px 10px 0px;
+padding: 10px;
+}
+pre:not([class]) {
+background-color: #f7f7f7;
+}
+code {
+font-family: Consolas, Monaco, 'Courier New', monospace;
+font-size: 85%;
+}
+p > code, li > code {
+padding: 2px 0px;
+}
+div.figure {
+text-align: center;
+}
+img {
+background-color: #FFFFFF;
+padding: 2px;
+border: 1px solid #DDDDDD;
+border-radius: 3px;
+border: 1px solid #CCCCCC;
+margin: 0 5px;
+}
+h1 {
+margin-top: 0;
+font-size: 35px;
+line-height: 40px;
+}
+h2 {
+border-bottom: 4px solid #f7f7f7;
+padding-top: 10px;
+padding-bottom: 2px;
+font-size: 145%;
+}
+h3 {
+border-bottom: 2px solid #f7f7f7;
+padding-top: 10px;
+font-size: 120%;
+}
+h4 {
+border-bottom: 1px solid #f7f7f7;
+margin-left: 8px;
+font-size: 105%;
+}
+h5, h6 {
+border-bottom: 1px solid #ccc;
+font-size: 105%;
+}
+a {
+color: #0033dd;
+text-decoration: none;
+}
+a:hover {
+color: #6666ff; }
+a:visited {
+color: #800080; }
+a:visited:hover {
+color: #BB00BB; }
+a[href^="http:"] {
+text-decoration: underline; }
+a[href^="https:"] {
+text-decoration: underline; }
+</style>
+</head>
+
+<body>
+
+
+<header id="title-block-header">
+<h1 class="title">Post-selection inference for an identified survival subgroup</h1>
+<p class="subtitle">A worked GBSG analysis, end to end</p>
+<p class="author">Larry Leon</p>
+
+<p class="date">2026-10-09</p>
+</header>
+
+<nav id="TOC" role="doc-toc">
+    <h2 id="toc-title">Table of contents</h2>
+   
+  <ul>
+  <li><a href="#the-data-and-the-fit" id="toc-the-data-and-the-fit">The data and the fit</a></li>
+  <li><a href="#the-identified-subgroup" id="toc-the-identified-subgroup">The identified subgroup</a></li>
+  <li><a href="#the-reported-quantities" id="toc-the-reported-quantities">The reported quantities</a></li>
+  <li><a href="#how-to-read-a-bound-by-location" id="toc-how-to-read-a-bound-by-location">How to read a bound: by location</a></li>
+  <li><a href="#p-hat-as-a-diagnostic" id="toc-p-hat-as-a-diagnostic">p-hat as a diagnostic</a>
+  <ul>
+  <li><a href="#what-p-hat-alone-cannot-say" id="toc-what-p-hat-alone-cannot-say">What p-hat alone cannot say</a></li>
+  </ul></li>
+  <li><a href="#references" id="toc-references">References</a></li>
+  </ul>
+</nav>
+<div class="cell">
+<div class="sourceCode cell-code" id="cb1"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a>knitr<span class="sc">::</span>opts_chunk<span class="sc">$</span><span class="fu">set</span>(<span class="at">comment =</span> <span class="st">&quot;#&gt;&quot;</span>, <span class="at">fig.align =</span> <span class="st">&quot;center&quot;</span>)</span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(forestsearch)</span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a><span class="fu">library</span>(survival)</span></code></pre></div>
+</div>
+<p><code>forestsearch()</code> identifies a subgroup by searching over candidate subgroups, so a treatment effect estimated within the identified subgroup is affected by the selection: a confidence interval computed as if the subgroup had been prespecified tends to under-cover. With <code>mr_inference = TRUE</code>, <code>forestsearch()</code> reports selection-adjusted estimates and bounds for the identified subgroup and its complement, based on multiplier resampling of the candidate effects. The methodology, its assumptions and its simulation operating characteristics are described in León and Anderson (2026); this vignette shows how to obtain and read the reported quantities on a public dataset.</p>
+<h2 id="the-data-and-the-fit">The data and the fit</h2>
+<p>The GBSG node-positive breast-cancer trial shipped with <strong>survival</strong>: 686 patients, hormonal therapy against none, recurrence-free survival. The covariate set is the usual seven; <code>er</code> and <code>pgr</code> are forced in as candidate receptor cutpoints, and continuous covariates get 10 quantile cuts each.</p>
+<div class="cell" data-layout-align="center">
+<div class="sourceCode cell-code" id="cb2"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb2-1"><a href="#cb2-1" aria-hidden="true" tabindex="-1"></a>df.analysis <span class="ot">&lt;-</span> gbsg</span>
+<span id="cb2-2"><a href="#cb2-2" aria-hidden="true" tabindex="-1"></a>df.analysis <span class="ot">&lt;-</span> <span class="fu">within</span>(df.analysis, {</span>
+<span id="cb2-3"><a href="#cb2-3" aria-hidden="true" tabindex="-1"></a>  id          <span class="ot">&lt;-</span> <span class="fu">seq_len</span>(<span class="fu">nrow</span>(df.analysis))</span>
+<span id="cb2-4"><a href="#cb2-4" aria-hidden="true" tabindex="-1"></a>  time_months <span class="ot">&lt;-</span> rfstime <span class="sc">/</span> <span class="fl">30.4375</span></span>
+<span id="cb2-5"><a href="#cb2-5" aria-hidden="true" tabindex="-1"></a>  grade3      <span class="ot">&lt;-</span> <span class="fu">ifelse</span>(grade <span class="sc">==</span> <span class="st">&quot;3&quot;</span>, <span class="dv">1</span>, <span class="dv">0</span>)</span>
+<span id="cb2-6"><a href="#cb2-6" aria-hidden="true" tabindex="-1"></a>})</span>
+<span id="cb2-7"><a href="#cb2-7" aria-hidden="true" tabindex="-1"></a>confounders.name <span class="ot">&lt;-</span> <span class="fu">c</span>(<span class="st">&quot;age&quot;</span>, <span class="st">&quot;meno&quot;</span>, <span class="st">&quot;size&quot;</span>, <span class="st">&quot;grade3&quot;</span>, <span class="st">&quot;nodes&quot;</span>, <span class="st">&quot;pgr&quot;</span>, <span class="st">&quot;er&quot;</span>)</span>
+<span id="cb2-8"><a href="#cb2-8" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Sample size:&quot;</span>, <span class="fu">nrow</span>(df.analysis),</span>
+<span id="cb2-9"><a href="#cb2-9" aria-hidden="true" tabindex="-1"></a>    <span class="st">&quot;| events:&quot;</span>, <span class="fu">sum</span>(df.analysis<span class="sc">$</span>status),</span>
+<span id="cb2-10"><a href="#cb2-10" aria-hidden="true" tabindex="-1"></a>    <span class="fu">sprintf</span>(<span class="st">&quot;(%.1f%%)</span><span class="sc">\n</span><span class="st">&quot;</span>, <span class="dv">100</span> <span class="sc">*</span> <span class="fu">mean</span>(df.analysis<span class="sc">$</span>status)))</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; Sample size: 686 | events: 299 (43.6%)</code></pre>
+</div>
+</div>
+<p>The fit below uses the consistency search without a LASSO/GRF/DINA screen, <code>sg_focus = &quot;effMaxSG&quot;</code> (the largest subgroup within 20% of the strongest observed effect), 200 consistency splits and 500 multiplier draws. <code>mr_inference = TRUE</code> attaches the post-selection results to the fit as <code>fs$mr_inference</code>; <code>field_recovery = TRUE</code> adds the membership-agreement diagnostics used below. Bootstrap and cross-validation are not run here; see <code>vignette(&quot;forestsearch&quot;)</code>.</p>
+<div class="cell" data-layout-align="center">
+<div class="sourceCode cell-code" id="cb4"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb4-1"><a href="#cb4-1" aria-hidden="true" tabindex="-1"></a>t0 <span class="ot">&lt;-</span> <span class="fu">proc.time</span>()</span>
+<span id="cb4-2"><a href="#cb4-2" aria-hidden="true" tabindex="-1"></a>fs <span class="ot">&lt;-</span> <span class="fu">forestsearch</span>(</span>
+<span id="cb4-3"><a href="#cb4-3" aria-hidden="true" tabindex="-1"></a>  df.analysis,</span>
+<span id="cb4-4"><a href="#cb4-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">outcome.name =</span> <span class="st">&quot;time_months&quot;</span>, <span class="at">event.name =</span> <span class="st">&quot;status&quot;</span>,</span>
+<span id="cb4-5"><a href="#cb4-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">treat.name =</span> <span class="st">&quot;hormon&quot;</span>, <span class="at">id.name =</span> <span class="st">&quot;id&quot;</span>,</span>
+<span id="cb4-6"><a href="#cb4-6" aria-hidden="true" tabindex="-1"></a>  <span class="at">confounders.name =</span> confounders.name,</span>
+<span id="cb4-7"><a href="#cb4-7" aria-hidden="true" tabindex="-1"></a>  <span class="at">is.RCT =</span> <span class="cn">TRUE</span>, <span class="at">seedit =</span> <span class="dv">8316951</span>, <span class="at">est.scale =</span> <span class="st">&quot;hr&quot;</span>,</span>
+<span id="cb4-8"><a href="#cb4-8" aria-hidden="true" tabindex="-1"></a>  <span class="at">use_lasso =</span> <span class="cn">FALSE</span>, <span class="at">use_grf =</span> <span class="cn">FALSE</span>, <span class="at">use_dina =</span> <span class="cn">FALSE</span>,</span>
+<span id="cb4-9"><a href="#cb4-9" aria-hidden="true" tabindex="-1"></a>  <span class="at">conf.cont_jcuts =</span> <span class="fu">list</span>(<span class="at">er =</span> <span class="dv">10</span>, <span class="at">pgr =</span> <span class="dv">10</span>), <span class="at">collapse_cuts =</span> <span class="cn">TRUE</span>,</span>
+<span id="cb4-10"><a href="#cb4-10" aria-hidden="true" tabindex="-1"></a>  <span class="at">conf_force =</span> <span class="fu">c</span>(<span class="st">&quot;er &lt;= 0&quot;</span>, <span class="st">&quot;pgr &lt;= 0&quot;</span>),</span>
+<span id="cb4-11"><a href="#cb4-11" aria-hidden="true" tabindex="-1"></a>  <span class="at">subgroup_method =</span> <span class="st">&quot;consistency&quot;</span>, <span class="at">sg_focus =</span> <span class="st">&quot;effMaxSG&quot;</span>,</span>
+<span id="cb4-12"><a href="#cb4-12" aria-hidden="true" tabindex="-1"></a>  <span class="at">selection_rule =</span> <span class="st">&quot;neighborhood&quot;</span>, <span class="at">effect_neighborhood =</span> <span class="fl">0.20</span>,</span>
+<span id="cb4-13"><a href="#cb4-13" aria-hidden="true" tabindex="-1"></a>  <span class="at">mr_inference =</span> <span class="cn">TRUE</span>,</span>
+<span id="cb4-14"><a href="#cb4-14" aria-hidden="true" tabindex="-1"></a>  <span class="at">mr_inference_args =</span> <span class="fu">list</span>(<span class="at">draws =</span> <span class="dv">500</span>L, <span class="at">field_recovery =</span> <span class="cn">TRUE</span>),</span>
+<span id="cb4-15"><a href="#cb4-15" aria-hidden="true" tabindex="-1"></a>  <span class="at">n.min =</span> <span class="dv">60</span>, <span class="at">d0.min =</span> <span class="dv">10</span>, <span class="at">d1.min =</span> <span class="dv">10</span>, <span class="at">maxk =</span> <span class="dv">2</span>,</span>
+<span id="cb4-16"><a href="#cb4-16" aria-hidden="true" tabindex="-1"></a>  <span class="at">hr.threshold =</span> <span class="fl">1.0</span>, <span class="at">hr.consistency =</span> <span class="fl">1.0</span>, <span class="at">pconsistency.threshold =</span> <span class="fl">0.80</span>,</span>
+<span id="cb4-17"><a href="#cb4-17" aria-hidden="true" tabindex="-1"></a>  <span class="at">fs.splits =</span> <span class="dv">200</span>, <span class="at">max.minutes =</span> <span class="dv">3</span>,</span>
+<span id="cb4-18"><a href="#cb4-18" aria-hidden="true" tabindex="-1"></a>  <span class="at">details =</span> <span class="cn">FALSE</span>, <span class="at">quiet =</span> <span class="cn">TRUE</span>, <span class="at">plot.sg =</span> <span class="cn">FALSE</span>,</span>
+<span id="cb4-19"><a href="#cb4-19" aria-hidden="true" tabindex="-1"></a>  <span class="at">parallel_args =</span> <span class="fu">list</span>(<span class="at">plan =</span> <span class="st">&quot;sequential&quot;</span>))</span>
+<span id="cb4-20"><a href="#cb4-20" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;fit time: %.1f seconds</span><span class="sc">\n</span><span class="st">&quot;</span>, (<span class="fu">proc.time</span>() <span class="sc">-</span> t0)[[<span class="st">&quot;elapsed&quot;</span>]]))</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; fit time: 12.2 seconds</code></pre>
+</div>
+</div>
+<h2 id="the-identified-subgroup">The identified subgroup</h2>
+<div class="cell" data-layout-align="center">
+<div class="sourceCode cell-code" id="cb6"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb6-1"><a href="#cb6-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="st">&quot;Selected subgroup:&quot;</span>, <span class="fu">paste</span>(fs<span class="sc">$</span>sg.harm, <span class="at">collapse =</span> <span class="st">&quot; &amp; &quot;</span>), <span class="st">&quot;</span><span class="sc">\n</span><span class="st">&quot;</span>)</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; Selected subgroup: {er &lt;= 0} &amp; {pgr &lt;= 26}</code></pre>
+</div>
+</div>
+<p>The subgroup is a conjunction of at most <code>maxk = 2</code> binary cutpoints drawn from the candidate family. <code>family_status</code> records how the candidate family was built; <code>&quot;no-front-end&quot;</code> means the family was enumerated directly rather than proposed by a model fitted to the data.</p>
+<h2 id="the-reported-quantities">The reported quantities</h2>
+<p><code>print()</code> reports them; nothing extra needs to be called.</p>
+<div class="cell" data-layout-align="center">
+<div class="sourceCode cell-code" id="cb8"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb8-1"><a href="#cb8-1" aria-hidden="true" tabindex="-1"></a><span class="fu">print</span>(fs)</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; ForestSearch Results
+#&gt; ====================
+#&gt; 
+#&gt; Selected Subgroup:
+#&gt;   Definition: {er &lt;= 0} &amp; {pgr &lt;= 26} 
+#&gt;   sg_focus: hrMaxSG 
+#&gt;   N: 75 
+#&gt;   HR: 2.222 
+#&gt;   Pcons: 0.99 
+#&gt;   Algorithm: twostage 
+#&gt;   Candidate family: no-front-end 
+#&gt;   Admission set: effect floor 0; consistency floor 0 at p* = 0.8 
+#&gt;   Candidates evaluated: 120 
+#&gt;   Candidates passed: 16 
+#&gt; 
+#&gt; Post-selection inference (selection-adjusted; Leon &amp; Anderson 2026):
+#&gt;   Harm subgroup H:        one-sided 95% lower bound on HR   0.609
+#&gt;   Complement Hc:          one-sided 95% upper bound on HR   0.812   [field-s]
+#&gt;   Joint (Bonferroni):     H lower 0.500, Hc upper 0.848  (gamma 0.025 each side) [field-s]
+#&gt;   Two-sided (IJ, secondary): H (0.549, 2.900)
+#&gt;   Re-selection frequency  p-hat(H) = 0.006
+#&gt; 
+#&gt;   One-sided bounds are the primary products; the two-sided IJ interval is 
+#&gt;   secondary. p-hat(H) is a descriptive diagnostic. Read each bound by its 
+#&gt;   location relative to a clinically meaningful effect size. Methods and 
+#&gt;   simulation operating characteristics: Leon &amp; Anderson (2026), 
+#&gt;   arXiv:2609.38361. 
+#&gt; 
+#&gt; Computation time: 0.02 minutes</code></pre>
+</div>
+</div>
+<ul>
+<li><strong>Identified subgroup:</strong> the one-sided 95% lower bound on the hazard ratio (the <em>field</em> construction).</li>
+<li><strong>Complement:</strong> the one-sided 95% upper bound on the hazard ratio (<em>field-s</em>, the studentized complement field), relevant to a benefit claim.</li>
+<li><strong>Both together:</strong> the Bonferroni pair, each side at level 0.025.</li>
+<li><strong>Two-sided interval:</strong> the infinitesimal-jackknife (IJ) two-term interval, reported as a secondary summary.</li>
+<li><strong>p-hat(H):</strong> the re-selection frequency, a descriptive diagnostic (below).</li>
+</ul>
+<p>The field bounds require <code>ci_method = &quot;field&quot;</code> (the default); with <code>ci_method = &quot;ij&quot;</code> only the two-sided interval is reported. León and Anderson (2026) describe each construction and report its performance in simulation.</p>
+<p><code>summary()</code> adds the standard errors and the leading re-selection frequencies:</p>
+<div class="cell" data-layout-align="center">
+<div class="sourceCode cell-code" id="cb10"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb10-1"><a href="#cb10-1" aria-hidden="true" tabindex="-1"></a><span class="fu">summary</span>(fs)</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; ForestSearch Summary
+#&gt; ====================
+#&gt; 
+#&gt; Analysis Parameters:
+#&gt;   sg_focus: hrMaxSG
+#&gt;   hr.threshold: 1
+#&gt;   hr.consistency: 1
+#&gt;   pconsistency.threshold: 0.8
+#&gt;   n.min: 60
+#&gt;   fs.splits: 200
+#&gt;   maxk: 2
+#&gt;   use_twostage: TRUE
+#&gt;   use_lasso: FALSE
+#&gt;   use_grf: FALSE
+#&gt;   use_dina: FALSE
+#&gt;   candidate family: no-front-end
+#&gt;   admission set: effect floor 0; consistency floor 0 at p* = 0.8
+#&gt; 
+#&gt; Variable Selection:
+#&gt;   Candidate confounders: 33 
+#&gt;   Confounders evaluated: 33 
+#&gt; 
+#&gt; Search Space:
+#&gt;   Proportion of max combinations searched: 1 
+#&gt;   Maximum subgroup HR estimate: 2.537
+#&gt; 
+#&gt; Consistency Evaluation:
+#&gt;   Algorithm: twostage 
+#&gt;   Candidates evaluated: 120 
+#&gt;   Candidates passed: 16 
+#&gt;   Stage 1 screening splits: 
+#&gt;   Stage 2 batch size: 
+#&gt; 
+#&gt; Selected Subgroup:
+#&gt;   Definition: {er &lt;= 0} &amp; {pgr &lt;= 26} 
+#&gt;   Sample size: 75 
+#&gt;   Hazard ratio: 2.222 
+#&gt;   Consistency: 99 %
+#&gt;   Estimation data: n = 686 (harm = 75 , complement = 611 )
+#&gt; 
+#&gt; Post-selection inference (selection-adjusted; Leon &amp; Anderson 2026):
+#&gt;   Harm subgroup H:        one-sided 95% lower bound on HR   0.609
+#&gt;   Complement Hc:          one-sided 95% upper bound on HR   0.812   [field-s]
+#&gt;   Joint (Bonferroni):     H lower 0.500, Hc upper 0.848  (gamma 0.025 each side) [field-s]
+#&gt;   Two-sided (IJ, secondary): H (0.549, 2.900)
+#&gt; 
+#&gt;   Standard errors (log scale):
+#&gt;     field (H)                 se_field    0.411
+#&gt;     field-s (Hc)              se_field_s  0.135   (naive complement SE 0.134)
+#&gt;     IJ two-term (H)           se_ij       0.425
+#&gt;   Re-selection frequency  p-hat(H) = 0.006
+#&gt;     top-3 re-selection mass:  q1.1 &amp; q18.1 0.182 | q1.1 &amp; q27.1 0.156 | q10.0 &amp; q30.0 0.056
+#&gt;     p_hat_sum = 1.000 over a family of 1744 candidates
+#&gt;     membership recovery: sens_H = 0.559 (mean share of Hhat retained over 998 draws)
+#&gt; 
+#&gt;   One-sided bounds are the primary products; the two-sided IJ interval is 
+#&gt;   secondary. p-hat(H) is a descriptive diagnostic. Read each bound by its 
+#&gt;   location relative to a clinically meaningful effect size. Methods and 
+#&gt;   simulation operating characteristics: Leon &amp; Anderson (2026), 
+#&gt;   arXiv:2609.38361. 
+#&gt; 
+#&gt; Computation time: 0.02 minutes</code></pre>
+</div>
+</div>
+<h2 id="how-to-read-a-bound-by-location">How to read a bound: by location</h2>
+<p>These bounds are read <strong>by location against a clinically meaningful effect size</strong>, never as significance at the null.</p>
+<p>The harm-side question is <em>how much harm the data can rule out</em>. A one-sided lower bound in the high 0.8s or above, against a naive subgroup estimate well above 1, says the adjusted evidence does not establish clinically meaningful harm – the naive estimate was largely selection.</p>
+<p>The complement-side question is a benefit claim: <em>is the one-sided upper bound below a threshold that would matter?</em> Name the threshold you are reading against – for example 0.80 or 0.85 – and say whether the bound clears it. A threshold quoted this way is a reading aid, not a decision rule.</p>
+<div class="cell" data-layout-align="center">
+<div class="sourceCode cell-code" id="cb12"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb12-1"><a href="#cb12-1" aria-hidden="true" tabindex="-1"></a>g <span class="ot">&lt;-</span> fs<span class="sc">$</span>mr_inference</span>
+<span id="cb12-2"><a href="#cb12-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;naive HR on Hhat            %.3f</span><span class="sc">\n</span><span class="st">&quot;</span>, g<span class="sc">$</span>naive<span class="sc">$</span>est))</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; naive HR on Hhat            2.222</code></pre>
+</div>
+<div class="sourceCode cell-code" id="cb14"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb14-1"><a href="#cb14-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;de-biased HR on Hhat        %.3f</span><span class="sc">\n</span><span class="st">&quot;</span>, g<span class="sc">$</span>debiased<span class="sc">$</span>est))</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; de-biased HR on Hhat        1.262</code></pre>
+</div>
+<div class="sourceCode cell-code" id="cb16"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb16-1"><a href="#cb16-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;field one-sided lower       %.3f</span><span class="sc">\n</span><span class="st">&quot;</span>, g<span class="sc">$</span>field<span class="sc">$</span>lower_1s))</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; field one-sided lower       0.609</code></pre>
+</div>
+<div class="sourceCode cell-code" id="cb18"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb18-1"><a href="#cb18-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;field-s one-sided upper Hc  %.3f  (vs 0.80 / 0.85)</span><span class="sc">\n</span><span class="st">&quot;</span>,</span>
+<span id="cb18-2"><a href="#cb18-2" aria-hidden="true" tabindex="-1"></a>            g<span class="sc">$</span>field<span class="sc">$</span>complement<span class="sc">$</span>upper_1s_s))</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; field-s one-sided upper Hc  0.812  (vs 0.80 / 0.85)</code></pre>
+</div>
+</div>
+<p>The distance between the naive estimate and the de-biased one is what selection cost; the spread across the constructions is what the adjustments pay for it.</p>
+<h2 id="p-hat-as-a-diagnostic">p-hat as a diagnostic</h2>
+<p><code>p_hat(Hhat)</code> is the frequency with which the gate’s own re-selection map picks the same subgroup across the multiplier draws. It is a <strong>recorded diagnostic</strong>: it is computed after the bounds are formed, and <strong>no construction reads it</strong>. It is also estimated from the same draws that build the bound, so it is a flag, not an independent instrument – which is a reason not to let any interval depend on it.</p>
+<div class="cell" data-layout-align="center">
+<div class="sourceCode cell-code" id="cb20"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb20-1"><a href="#cb20-1" aria-hidden="true" tabindex="-1"></a>ph  <span class="ot">&lt;-</span> g<span class="sc">$</span>reselection<span class="sc">$</span>p_hat</span>
+<span id="cb20-2"><a href="#cb20-2" aria-hidden="true" tabindex="-1"></a>lab <span class="ot">&lt;-</span> g<span class="sc">$</span>selected_label</span>
+<span id="cb20-3"><a href="#cb20-3" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;p-hat(Hhat) = %.3f over a family of %d candidates</span><span class="sc">\n</span><span class="st">&quot;</span>,</span>
+<span id="cb20-4"><a href="#cb20-4" aria-hidden="true" tabindex="-1"></a>            <span class="fu">unname</span>(ph[[lab]]), g<span class="sc">$</span>n_family))</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; p-hat(Hhat) = 0.006 over a family of 1744 candidates</code></pre>
+</div>
+<div class="sourceCode cell-code" id="cb22"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb22-1"><a href="#cb22-1" aria-hidden="true" tabindex="-1"></a><span class="fu">print</span>(<span class="fu">round</span>(<span class="fu">sort</span>(ph, <span class="at">decreasing =</span> <span class="cn">TRUE</span>)[<span class="dv">1</span><span class="sc">:</span><span class="dv">5</span>], <span class="dv">3</span>))</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt;  q1.1 &amp; q18.1  q1.1 &amp; q27.1 q10.0 &amp; q30.0          q1.1 q30.1 &amp; q32.0 
+#&gt;         0.182         0.156         0.056         0.054         0.052</code></pre>
+</div>
+</div>
+<p>A small p-hat indicates that the exact boundary of the identified subgroup is not stable under perturbation; by itself it is neither evidence for nor against the bounds. León and Anderson (2026) discuss how the bias correction behaves across values of p-hat.</p>
+<h3 id="what-p-hat-alone-cannot-say">What p-hat alone cannot say</h3>
+<p>p-hat counts <strong>exact</strong> re-selections of <code>Hhat</code>. Over a large family in which most candidates differ from <code>Hhat</code> by a single cutpoint, a small exact-match rate is compatible with two very different situations: the draws re-selected near-twins of <code>Hhat</code>, or they re-selected unrelated regions. p-hat does not distinguish them. <strong>Membership agreement</strong> does, and it is computable from the same draws. Each draw’s re-selection is compared with <code>Hhat</code> as a set of patients, in the vocabulary of the cross-validation agreement metrics (<code>forestsearch_Kfold()</code>’s <code>sens_H</code> / <code>ppv_H</code>).</p>
+<div class="cell" data-layout-align="center">
+<div class="sourceCode cell-code" id="cb24"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb24-1"><a href="#cb24-1" aria-hidden="true" tabindex="-1"></a>rc <span class="ot">&lt;-</span> g<span class="sc">$</span>field<span class="sc">$</span>recovery</span>
+<span id="cb24-2"><a href="#cb24-2" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;sens_H  = %.3f   mean share of Hhat retained by a re-selection</span></span>
+<span id="cb24-3"><a href="#cb24-3" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span>, rc<span class="sc">$</span>sens_H))</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; sens_H  = 0.559   mean share of Hhat retained by a re-selection</code></pre>
+</div>
+<div class="sourceCode cell-code" id="cb26"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb26-1"><a href="#cb26-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;ppv_H   = %.3f   mean share of a re-selection that lies in Hhat</span></span>
+<span id="cb26-2"><a href="#cb26-2" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span>, rc<span class="sc">$</span>ppv_H))</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; ppv_H   = 0.563   mean share of a re-selection that lies in Hhat</code></pre>
+</div>
+<div class="sourceCode cell-code" id="cb28"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb28-1"><a href="#cb28-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;containment q10 / q50 / q90 = %.3f / %.3f / %.3f</span></span>
+<span id="cb28-2"><a href="#cb28-2" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span>, rc<span class="sc">$</span>q10, rc<span class="sc">$</span>q50, rc<span class="sc">$</span>q90))</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; containment q10 / q50 / q90 = 0.000 / 0.547 / 1.000</code></pre>
+</div>
+<div class="sourceCode cell-code" id="cb30"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb30-1"><a href="#cb30-1" aria-hidden="true" tabindex="-1"></a><span class="fu">cat</span>(<span class="fu">sprintf</span>(<span class="st">&quot;share of draws containing all of Hhat = %.3f  (over %d draws)</span></span>
+<span id="cb30-2"><a href="#cb30-2" aria-hidden="true" tabindex="-1"></a><span class="st">&quot;</span>,</span>
+<span id="cb30-3"><a href="#cb30-3" aria-hidden="true" tabindex="-1"></a>            rc<span class="sc">$</span>share_equal_1, rc<span class="sc">$</span>n_used))</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; share of draws containing all of Hhat = 0.244  (over 998 draws)</code></pre>
+</div>
+</div>
+<p>Read together, the two kinds of number say different things about the same draws: exact re-selection can be rare while the typical re-selection still retains much of the identified subgroup. That pattern points to an unstable boundary rather than an unstable region.</p>
+<p>One limit. These diagnostics measure re-selection <strong>within the fixed candidate family</strong>, under multiplier perturbation of the candidate effects. The bootstrap (<code>forestsearch_bootstrap_dofuture()</code>) and cross-validation (<code>forestsearch_Kfold()</code>) recovery rates measure something stronger: re-<strong>discovery</strong> of a subgroup from resampled data, with the search re-run and the family rebuilt each time. The two are related but neither substitutes for the other, and this one is free in every analysis while those cost a full re-run.</p>
+<h2 id="references">References</h2>
+<p>León, L. F. and Anderson, K. M. (2026). Inference for standard trial estimands after data-driven subgroup discovery. arXiv:2609.38361. <a href="https://arxiv.org/abs/2609.38361" class="uri">https://arxiv.org/abs/2609.38361</a></p>
+<p>León, L. F., Jemielita, T., Guo, Z., Marceau West, R. and Anderson, K. M. (2024). Exploratory subgroup identification in the heterogeneous Cox model: A relatively simple procedure. <em>Statistics in Medicine</em>. <a href="https://doi.org/10.1002/sim.10163" class="uri">https://doi.org/10.1002/sim.10163</a></p>
+<div class="cell" data-layout-align="center">
+<div class="sourceCode cell-code" id="cb32"><pre class="sourceCode r"><code class="sourceCode r"><span id="cb32-1"><a href="#cb32-1" aria-hidden="true" tabindex="-1"></a><span class="fu">sessionInfo</span>()</span></code></pre></div>
+<div class="cell-output cell-output-stdout">
+<pre><code>#&gt; R version 4.5.2 (2025-10-31)
+#&gt; Platform: aarch64-apple-darwin20
+#&gt; Running under: macOS 27.0.1
+#&gt; 
+#&gt; Matrix products: default
+#&gt; BLAS:   /System/Library/Frameworks/Accelerate.framework/Versions/A/Frameworks/vecLib.framework/Versions/A/libBLAS.dylib 
+#&gt; LAPACK: /Library/Frameworks/R.framework/Versions/4.5-arm64/Resources/lib/libRlapack.dylib;  LAPACK version 3.12.1
+#&gt; 
+#&gt; locale:
+#&gt; [1] C/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+#&gt; 
+#&gt; time zone: America/Los_Angeles
+#&gt; tzcode source: internal
+#&gt; 
+#&gt; attached base packages:
+#&gt; [1] stats     graphics  grDevices utils     datasets  methods   base     
+#&gt; 
+#&gt; other attached packages:
+#&gt; [1] future_1.75.0      survival_3.8-9     forestsearch_0.4.0
+#&gt; 
+#&gt; loaded via a namespace (and not attached):
+#&gt;  [1] gt_1.3.0             generics_0.1.4       xml2_1.6.0          
+#&gt;  [4] shape_1.4.6.1        lattice_0.23-1       listenv_1.0.0       
+#&gt;  [7] digest_0.6.39        magrittr_2.0.5       grf_2.6.1           
+#&gt; [10] evaluate_1.0.5       grid_4.5.2           RColorBrewer_1.1-3  
+#&gt; [13] iterators_1.0.14     policytree_1.2.5     mvtnorm_1.4-2       
+#&gt; [16] fastmap_1.2.0        foreach_1.5.2        jsonlite_2.0.0      
+#&gt; [19] Matrix_1.7-6         glmnet_5.0           scales_1.4.0        
+#&gt; [22] weightedsurv_0.1.0   codetools_0.2-20     cli_3.6.6           
+#&gt; [25] rlang_1.3.0          parallelly_1.48.0    future.apply_1.20.2 
+#&gt; [28] splines_4.5.2        yaml_2.3.12          otel_0.2.0          
+#&gt; [31] tools_4.5.2          parallel_4.5.2       doFuture_1.3.0      
+#&gt; [34] dplyr_1.2.1          ggplot2_4.0.3        globals_0.19.1      
+#&gt; [37] vctrs_0.7.3          R6_2.6.1             lifecycle_1.0.5     
+#&gt; [40] randomForest_4.7-1.2 fs_2.1.0             pkgconfig_2.0.3     
+#&gt; [43] progressr_1.0.0      pillar_1.11.1        gtable_0.3.6        
+#&gt; [46] data.table_1.18.4    glue_1.8.1           Rcpp_1.1.2          
+#&gt; [49] xfun_0.60            tibble_3.3.1         tidyselect_1.2.1    
+#&gt; [52] rstudioapi_0.19.0    knitr_1.51           farver_2.1.2        
+#&gt; [55] patchwork_1.3.2      htmltools_0.5.9      rmarkdown_2.31      
+#&gt; [58] compiler_4.5.2       S7_0.2.2</code></pre>
+</div>
+</div>
+
+
+
+
+
+</body></html>

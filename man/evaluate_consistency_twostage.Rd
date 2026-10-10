@@ -21,7 +21,12 @@ evaluate_consistency_twostage(
   n.splits.max = 400,
   batch.size = 20,
   conf.level = 0.95,
-  min.valid.screen = 10
+  min.valid.screen = 10,
+  estimator_fn = NULL,
+  consistency_threshold = NULL,
+  adjust_covariates = NULL,
+  consistency_method = "split",
+  glm_resample_spec = NULL
 )
 }
 \arguments{
@@ -35,11 +40,30 @@ evaluate_consistency_twostage(
 
 \item{found.hrs}{data.table. Subgroup hazard ratio results.}
 
-\item{hr.consistency}{Numeric. Minimum HR threshold for consistency.}
+\item{hr.consistency}{Numeric. \code{c2}, \strong{an effect threshold} -- the
+minimum effect required in \emph{each} half of a split for that split to
+count as consistent.  \strong{Not} a proportion and \strong{not} the
+consistency rate.  \code{forestsearch()} calls this
+\code{consistency.threshold} / \code{hr.consistency}.}
 
-\item{pconsistency.threshold}{Numeric. Final consistency threshold.}
+\item{pconsistency.threshold}{Numeric. \verb{p*}, \strong{a proportion} in
+\code{[0, 1]} -- the fraction of splits that must be consistent, where
+one split's consistency is decided by \code{hr.consistency} (\code{c2}).
+\code{c2} sets the bar; \verb{p*} counts how often it is met.}
 
-\item{pconsistency.digits}{Integer. Rounding digits for output.}
+\item{pconsistency.digits}{Integer. Number of decimal places to which the
+consistency proportion is rounded \strong{before} it is compared with
+\code{pconsistency.threshold}.  The rounded value decides admission and
+is the value the selection sort orders on, so this setting affects which
+subgroups are admitted, not only what is displayed.  At the default of 2,
+a threshold of \verb{p*} admits any candidate whose unrounded proportion is at
+or above the largest 0.01 grid point strictly below \verb{p*} plus half a step
+(0.005) -- so \verb{p* = 0.99} admits from about 0.985.  Raising the setting
+makes admission finer-grained and produces fewer exact ties for the
+selection rule to break.  Under \code{consistency_method = "resample"}
+the proportion is a continuous closed-form quantity, so the rounding is a
+deliberate coarsening rather than a formatting step.
+Default: 2}
 
 \item{maxk}{Integer. Maximum number of factors in a subgroup.}
 
@@ -59,6 +83,28 @@ evaluate_consistency_twostage(
 \item{conf.level}{Numeric. Confidence level for early stopping (default 0.95).}
 
 \item{min.valid.screen}{Integer. Minimum valid splits in Stage 1 (default 10).}
+
+\item{estimator_fn}{Closure or \code{NULL}. Effect-estimator closure from
+\code{\link{make_effect_estimator}} for GLM outcomes.  Default \code{NULL}
+(uses Cox model).}
+
+\item{consistency_threshold}{Numeric or \code{NULL}. Threshold for GLM
+consistency evaluation.  Default \code{NULL} (uses \code{hr.consistency}).}
+
+\item{adjust_covariates}{Character vector or \code{NULL}. Additional Cox
+model terms (e.g. \code{"strata(x1)"}) used when scoring survival
+subgroups.  Referenced columns must be present in \code{df}.  Ignored
+on the GLM path.  Default \code{NULL} (unadjusted).}
+
+\item{consistency_method}{Character. \code{"split"} (default) or
+\code{"resample"}; see \code{\link{subgroup.consistency}}.  When
+\code{"resample"} engages it bypasses the two-stage split screening (the
+rate is computed from a single fit); an unsupported/non-convergent GLM
+rate falls through to the Stage 1/2 splitting.}
+
+\item{glm_resample_spec}{List or \code{NULL}. GLM resampling specification
+threaded from \code{\link{forestsearch}}; see
+\code{\link{subgroup.consistency}}.  \code{NULL} on the survival path.}
 }
 \value{
 Named numeric vector with consistency results, or NULL if not met.
@@ -68,4 +114,13 @@ Evaluates a single subgroup for consistency using a two-stage approach:
 Stage 1 screens with fewer splits, Stage 2 uses sequential batched
 evaluation with early stopping for efficient evaluation.
 }
-\keyword{internal}
+\examples{
+\dontrun{
+# evaluate_consistency_twostage() is called internally by forestsearch()
+# when use_twostage = TRUE. Use forestsearch() as the entry point:
+fs <- forestsearch(gbsg,
+  confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+  outcome.name = "rfstime", treat.name = "hormon", event.name = "status",
+  use_twostage = TRUE)
+}
+}

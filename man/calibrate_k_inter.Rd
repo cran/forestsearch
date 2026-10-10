@@ -11,6 +11,7 @@ calibrate_k_inter(
   cens_type = "weibull",
   k_inter_range = c(-100, 100),
   tol = 1e-06,
+  tol_rel = 2.5,
   use_ahr = FALSE,
   verbose = FALSE,
   ...
@@ -29,6 +30,10 @@ calibrate_k_inter(
 Default: c(-100, 100)}
 
 \item{tol}{Numeric. Tolerance for root finding. Default: 1e-6}
+
+\item{tol_rel}{Numeric. Maximum tolerated relative error, in percent; the
+call stops if the achieved HR is not within \code{tol_rel} percent of the
+target. Default \code{2.5}.}
 
 \item{use_ahr}{Logical. If TRUE, calibrate to AHR instead of Cox-based HR.
 Default: FALSE}
@@ -49,18 +54,18 @@ This function uses \code{uniroot} to find the k_inter value such that
 the empirical HR (or AHR) in the harm subgroup equals target_hr_harm.
 }
 \examples{
-\donttest{
+\dontrun{
 # Find k_inter for HR = 1.5 in harm subgroup
 k <- calibrate_k_inter(target_hr_harm = 1.5, verbose = TRUE)
 
 # Verify
-dgm <- setup_gbsg_dgm(model = "alt", k_inter = k, verbose = FALSE)
-print(dgm)
+dgm <- create_gbsg_dgm(model = "alt", k_inter = k, verbose = TRUE)
+print(dgm$hr_H_true)  # Should be close to 1.5
 
 # Calibrate to AHR instead
 k_ahr <- calibrate_k_inter(target_hr_harm = 1.5, use_ahr = TRUE, verbose = TRUE)
-dgm_ahr <- setup_gbsg_dgm(model = "alt", k_inter = k_ahr, verbose = FALSE)
-print(dgm_ahr)
+dgm_ahr <- create_gbsg_dgm(model = "alt", k_inter = k_ahr, verbose = TRUE)
+print(dgm_ahr$AHR_H_true)  # Should be close to 1.5
 }
 
 }

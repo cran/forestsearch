@@ -3,8 +3,10 @@
 #' Formats a hazard ratio and confidence interval for display.
 #'
 #' @param hrest Numeric vector with HR, lower, and upper confidence limits.
-#' @keywords internal
 #' @return Character string formatted as \"HR (lower, upper)\".
+#' @examples
+#' hrCI_format(c(1.45, 0.98, 2.14))
+#' @export
 
 hrCI_format <- function(hrest) {
   # hrest: vector with HR, lower, upper
@@ -17,8 +19,10 @@ hrCI_format <- function(hrest) {
 #'
 #' @param x Vector of values.
 #' @param denom Denominator for percent calculation.
-#' @keywords internal
 #' @return Character string formatted as \"n (percent%)\".
+#' @examples
+#' n_pcnt(1:30, 100)
+#' @export
 
 n_pcnt <- function(x, denom) {
   n <- length(x)
@@ -33,8 +37,16 @@ n_pcnt <- function(x, denom) {
 #' @param SG_flag Character. Name of subgroup flag variable.
 #' @param est.scale Character. Effect scale ("hr" or "1/hr").
 #' @param treat.name Character. Name of treatment variable.
-#' @keywords internal
 #' @return List with subgroup data frames and treatment variable name.
+#' @examples
+#' df <- data.frame(
+#'   treat = c(0, 1, 0, 1, 0),
+#'   sg_flag = c(1, 1, 0, 0, 1)
+#' )
+#' result <- prepare_subgroup_data(df, SG_flag = "sg_flag",
+#'                                  est.scale = "hr", treat.name = "treat")
+#' nrow(result$df_1)
+#' @export
 
 prepare_subgroup_data <- function(df, SG_flag, est.scale, treat.name) {
   if (est.scale == "1/hr") {
@@ -130,6 +142,265 @@ format_results <- function(subgroup_name, n, n_treat, d, m1, m0, drmst, hr, hr_a
   res
 }
 
+
+# =========================================================================
+# GLM SUBGROUP SUMMARY FUNCTIONS
+# =========================================================================
+
+#' Analyze subgroup for GLM outcomes
+#'
+#' GLM counterpart to \code{\link{analyze_subgroup}}.  Computes per-arm outcome
+#' rates, sample sizes, and the treatment effect estimate (RD, OR, etc.)
+#' using the estimator closure.
+#'
+#' @param df_sub Data frame for the subgroup.
+#' @param outcome.name Character. Name of outcome variable.
+#' @param treat.name Character. Name of treatment variable.
+#' @param subgroup_name Character. Label for this subgroup.
+#' @param effect_a Character. Adjusted effect estimate string (optional).
+#' @param estimator_fn Closure from `make_effect_estimator()`, or NULL.
+#' @param effect_measure Character. Effect measure label (e.g., "RD", "OR").
+#' @param outcome_type Character. One of \code{"binary"}, \code{"continuous"},
+#'   or \code{"count"}.  Controls formatting: binary displays per-arm means
+#'   as percentages (\code{"Rate"}); continuous and count display raw means
+#'   (\code{"Mean"}).  Default \code{"binary"}.
+#' @param N Integer. Total sample size (for percentage calculation).
+#' @param digits Integer. Number of decimal places for arm-mean / Diff /
+#'   effect-estimate / CI numeric formatting.  Default 4 to provide
+#'   headroom for downstream display reformatting (e.g., via
+#'   \code{summarize_bootstrap_results(digits = ...)}, which can round
+#'   down but cannot recover precision lost at construction).  Note this
+#'   does not affect the count-with-percent-of-total formatting in the
+#'   \code{n} and \code{n1} columns, which remain at 1 decimal.
+#'
+#' @return One-row data frame of formatted subgroup results.  Column names
+#'   are placeholders (\code{Subgroup}, \code{n}, \code{n1}, \code{rate0},
+#'   \code{rate1}, \code{Diff}, \code{effect}, optionally \code{effect_a})
+#'   and are overwritten by the calling function
+#'   (\code{\link{SG_tab_estimates_glm}}) with the user-facing labels
+#'   (e.g., \code{"Rate(C)"} vs \code{"Mean(C)"}, the effect-measure
+#'   header).  Returning a data frame -- rather than a named character
+#'   vector via \code{c(...)} -- ensures type stability across the ITT
+#'   and subgroup call paths and prevents downstream rendering failures
+#'   in consumers that go through \code{as.data.frame()} (e.g., gt).
+#' @keywords internal
+analyze_subgroup_glm <- function(df_sub, outcome.name, treat.name,
+                                 subgroup_name, effect_a = NA,
+                                 estimator_fn = NULL,
+                                 effect_measure = "RD",
+                                 outcome_type = "binary", N,
+                                 digits = 4) {
+
+  Y     <- df_sub[[outcome.name]]
+  Treat <- df_sub[[treat.name]]
+  n_tot <- length(Y)
+
+  # Per-arm counts
+  n0 <- sum(Treat == 0)
+  n1 <- sum(Treat == 1)
+
+  # Per-arm outcome summaries
+  rate0 <- mean(Y[Treat == 0])
+  rate1 <- mean(Y[Treat == 1])
+
+  # Sprintf format strings parameterized by `digits`.  These produce a
+  # uniformly-precise base representation; downstream consumers (e.g.,
+  # summarize_bootstrap_results) can reformat to lower precision via
+  # parse-and-reformat.  Construction-time precision is the ceiling for
+  # what display-time can show — values rounded here cannot be recovered.
+  fmt_val <- paste0("%.", digits, "f")
+  fmt_signed <- paste0("%+.", digits, "f")
+  fmt_pct <- paste0("%.", digits, "f%%")
+  fmt_signed_pct <- paste0("%+.", digits, "f%%")
+  fmt_ci <- paste0(fmt_val, " (", fmt_val, ", ", fmt_val, ")")
+
+  # Effect estimate via closure (if provided)
+  if (!is.null(estimator_fn)) {
+    res_est <- tryCatch(estimator_fn(df_sub), error = function(e) NULL)
+    if (!is.null(res_est) && !is.na(res_est$estimate)) {
+      est   <- res_est$estimate
+      se    <- res_est$se
+      z     <- 1.96
+      lower <- est - z * se
+      upper <- est + z * se
+
+      # Format depends on scale
+      if (effect_measure %in% c("OR", "RR", "IRR")) {
+        # Log scale: exponentiate for display
+        effect_str <- sprintf(fmt_ci, exp(est), exp(lower), exp(upper))
+      } else {
+        # Identity scale (RD, IRD, MD)
+        effect_str <- sprintf(fmt_ci, est, lower, upper)
+      }
+    } else {
+      effect_str <- "NA"
+    }
+  } else {
+    effect_str <- "NA"
+  }
+
+  # Formatted counts
+  n_fmt   <- sprintf("%d (%.1f%%)", n_tot, 100 * n_tot / N)
+  n1_fmt  <- sprintf("%d (%.1f%%)", n1, 100 * n1 / n_tot)
+
+  # Per-arm summaries: percentage for binary, raw mean for continuous/count
+  is_proportion <- outcome_type %in% c("binary")
+  if (is_proportion) {
+    r0_fmt <- sprintf(fmt_pct, 100 * rate0)
+    r1_fmt <- sprintf(fmt_pct, 100 * rate1)
+    rd_fmt <- sprintf(fmt_signed_pct, 100 * (rate1 - rate0))
+  } else {
+    r0_fmt <- sprintf(fmt_val, rate0)
+    r1_fmt <- sprintf(fmt_val, rate1)
+    rd_fmt <- sprintf(fmt_signed, rate1 - rate0)
+  }
+
+  # Return a 1-row data frame for type stability across the ITT and
+  # subgroup call paths.  Using c(...) here would produce a named
+  # character vector whose colnames() is NULL, breaking downstream
+  # consumers that rely on column-name introspection (e.g.,
+  # forestsearch_KfoldOut) and producing 1-column "scattered text" when
+  # passed through as.data.frame() (e.g., cv_summary_tables -> gt::gt).
+  # Placeholder column names are overwritten by SG_tab_estimates_glm().
+  if (is.na(effect_a)) {
+    data.frame(
+      Subgroup = subgroup_name,
+      n        = n_fmt,
+      n1       = n1_fmt,
+      rate0    = r0_fmt,
+      rate1    = r1_fmt,
+      Diff     = rd_fmt,
+      effect   = effect_str,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    data.frame(
+      Subgroup = subgroup_name,
+      n        = n_fmt,
+      n1       = n1_fmt,
+      rate0    = r0_fmt,
+      rate1    = r1_fmt,
+      Diff     = rd_fmt,
+      effect   = effect_str,
+      effect_a = as.character(effect_a),
+      stringsAsFactors = FALSE
+    )
+  }
+}
+
+
+#' Subgroup Summary Table for GLM Outcomes
+#'
+#' GLM counterpart to \code{\link{SG_tab_estimates}}.  Produces a summary data frame
+#' with per-arm outcome rates and the GLM effect estimate for each subgroup.
+#'
+#' @param df Data frame with a `treat.recommend` column (or ITT).
+#' @param SG_flag Character. "ITT" for the full population, or the name of
+#'   the subgroup flag column (e.g., "treat.recommend").
+#' @param outcome.name Character. Name of outcome variable.
+#' @param treat.name Character. Name of treatment variable.
+#' @param estimator_fn Closure from `make_effect_estimator()`, or NULL.
+#' @param effect_measure Character. Effect measure label (e.g., "RD", "OR").
+#' @param outcome_type Character. One of \code{"binary"}, \code{"continuous"},
+#'   or \code{"count"}.  Controls column labels and formatting: binary uses
+#'   \code{"Rate(C)"}/\code{"Rate(T)"} with percentages; continuous and count
+#'   use \code{"Mean(C)"}/\code{"Mean(T)"} with raw values.
+#'   Default \code{"binary"}.
+#' @param effect_a_1 Character. Adjusted effect for subgroup 1 (optional).
+#' @param effect_a_0 Character. Adjusted effect for subgroup 0 (optional).
+#' @param sg1_name Character. Label for subgroup 1 (treat.recommend == 1).
+#' @param sg0_name Character. Label for subgroup 0 (treat.recommend == 0).
+#' @param est.scale Character. Effect scale ("hr" or "1/hr").
+#' @param digits Integer. Decimal places for numeric formatting; passed
+#'   through to \code{\link{analyze_subgroup_glm}}.  Default 4 to provide
+#'   round-down headroom for downstream display reformatting (e.g.,
+#'   \code{summarize_bootstrap_results(digits = ...)}).
+#'
+#' @return Data frame.  One row when \code{SG_flag = "ITT"}; two rows
+#'   (sg0 then sg1) when \code{SG_flag = "treat.recommend"}.  Columns:
+#'   \code{Subgroup}, \code{n}, \code{n1}, \code{Rate(C)} or
+#'   \code{Mean(C)} (binary vs continuous/count), \code{Rate(T)} or
+#'   \code{Mean(T)}, \code{Diff}, and the effect-measure header
+#'   \code{"\{effect_measure\} (95% CI)"}.  When \code{effect_a_*} is
+#'   supplied, an additional \code{"\{effect_measure\}*"} column carries
+#'   the bias-corrected estimate.
+#' @keywords internal
+SG_tab_estimates_glm <- function(df, SG_flag,
+                                 outcome.name, treat.name,
+                                 estimator_fn = NULL,
+                                 effect_measure = "RD",
+                                 outcome_type = "binary",
+                                 effect_a_1 = NA, effect_a_0 = NA,
+                                 sg1_name = "Recommend",
+                                 sg0_name = "Questionable",
+                                 est.scale = "hr",
+                                 digits = 4) {
+  N <- nrow(df)
+
+  # Effect label for column header
+  eff_label <- paste0(effect_measure, " (95% CI)")
+
+  # Column labels: Rate/% for binary, Mean for continuous/count
+  is_proportion <- outcome_type %in% c("binary")
+  c_label <- if (is_proportion) "Rate(C)" else "Mean(C)"
+  t_label <- if (is_proportion) "Rate(T)" else "Mean(T)"
+
+  if (SG_flag == "ITT") {
+    res <- analyze_subgroup_glm(
+      df, outcome.name, treat.name,
+      subgroup_name  = "ITT",
+      effect_a       = NA,
+      estimator_fn   = estimator_fn,
+      effect_measure = effect_measure,
+      outcome_type   = outcome_type,
+      N = N,
+      digits = digits
+    )
+    col_names <- c("Subgroup", "n", "n1", c_label, t_label, "Diff",
+                    eff_label)
+    names(res) <- col_names
+    return(res)
+  }
+
+  # Subgroup split
+  subgroups <- prepare_subgroup_data(df, SG_flag, est.scale, treat.name)
+  treat_name_use <- subgroups$treat.name
+
+  res_0 <- analyze_subgroup_glm(
+    subgroups$df_0, outcome.name, treat_name_use,
+    subgroup_name  = sg0_name,
+    effect_a       = effect_a_0,
+    estimator_fn   = estimator_fn,
+    effect_measure = effect_measure,
+    outcome_type   = outcome_type,
+    N = N,
+    digits = digits
+  )
+
+  res_1 <- analyze_subgroup_glm(
+    subgroups$df_1, outcome.name, treat_name_use,
+    subgroup_name  = sg1_name,
+    effect_a       = effect_a_1,
+    estimator_fn   = estimator_fn,
+    effect_measure = effect_measure,
+    outcome_type   = outcome_type,
+    N = N,
+    digits = digits
+  )
+
+  res <- rbind(res_0, res_1)
+
+  if (is.na(effect_a_1)) {
+    colnames(res) <- c("Subgroup", "n", "n1", c_label, t_label, "Diff",
+                        eff_label)
+  } else {
+    colnames(res) <- c("Subgroup", "n", "n1", c_label, t_label, "Diff",
+                        eff_label, paste0(effect_measure, "*"))
+  }
+  res
+}
+
+
 #' RMST calculation for subgroup
 #'
 #' Calculates restricted mean survival time (RMST) for a subgroup.
@@ -138,12 +409,23 @@ format_results <- function(subgroup_name, n, n_treat, d, m1, m0, drmst, hr, hr_a
 #' @param tte.name Character. Name of time-to-event variable.
 #' @param event.name Character. Name of event indicator variable.
 #' @param treat.name Character. Name of treatment variable.
-#' @keywords internal
 #' @return List with tau, RMST, RMST for treatment, RMST for control.
+#' @examples
+#' \dontrun{
+#' library(survival)
+#' df <- data.frame(
+#'   tte   = gbsg$rfstime / 30.4375,
+#'   event = gbsg$status,
+#'   treat = gbsg$hormon
+#' )
+#' rmst_calculation(df, tte.name = "tte", event.name = "event",
+#'                  treat.name = "treat")
+#' }
+#' @export
 
 rmst_calculation <- function(df,tte.name = "tte",event.name = "event",treat.name = "treat"){
   if (!requireNamespace("weightedsurv", quietly = TRUE)) {
-    stop("Package 'weightedsurv' needed for this function to work. Please install it install_github('larry-leon/weightedsurv').")
+    stop("Package 'weightedsurv' needed for this function to work. Please install it with install.packages(\"weightedsurv\").")
   }
   dfcount <- weightedsurv::df_counting(df, tte.name = tte.name, event.name = event.name, treat.name = treat.name, arms = c("treat","control"), by.risk = 1)
   taumax <- with(dfcount, max(at_points[ybar1 > 0 & ybar0 >0]))
@@ -187,8 +469,29 @@ rmst_calculation <- function(df,tte.name = "tte",event.name = "event",treat.name
 #' @param potentialOutcome.name Character. Name of potential outcome variable (optional).
 #' @param return_medians Logical. Use medians or RMST.
 #' @param N Integer. Total sample size.
-#' @keywords internal
 #' @return Character vector of results.
+#' @examples
+#' \dontrun{
+#' library(survival)
+#' df <- data.frame(
+#'   tte   = gbsg$rfstime / 30.4375,
+#'   event = gbsg$status,
+#'   treat = gbsg$hormon
+#' )
+#' analyze_subgroup(
+#'   df_sub        = df,
+#'   outcome.name  = "tte",
+#'   event.name    = "event",
+#'   treat.name    = "treat",
+#'   strata.name   = NULL,
+#'   subgroup_name = "All",
+#'   hr_a          = NA,
+#'   potentialOutcome.name = NULL,
+#'   return_medians = TRUE,
+#'   N             = nrow(df)
+#' )
+#' }
+#' @export
 
 analyze_subgroup <- function(df_sub, outcome.name, event.name, treat.name,
                              strata.name, subgroup_name, hr_a,
@@ -205,6 +508,17 @@ analyze_subgroup <- function(df_sub, outcome.name, event.name, treat.name,
     rep("All", length(Y))
   } else {
     df_sub[[strata.name]]
+  }
+
+  # Empty or all-missing subgroup arm: survfit()/coxph() would error with
+  # "data set has no non-missing observations".  This arises legitimately,
+  # e.g. summarizing an all-ITT CV prediction frame where the complementary
+  # subgroup arm has zero members.  Return a same-shape formatted row with
+  # zero counts and NA estimates instead of aborting the whole table.
+  if (length(Y) == 0L || all(is.na(Y))) {
+    zero_n <- n_pcnt(numeric(0), N)
+    return(format_results(subgroup_name, zero_n, zero_n, zero_n,
+                          NA, NA, NA, NA, hr_a, NA, return_medians))
   }
 
   # =========================================================================
@@ -270,8 +584,22 @@ analyze_subgroup <- function(df_sub, outcome.name, event.name, treat.name,
 #' @param details Logical. Print details.
 #' @param return_medians Logical. Use medians or RMST.
 #' @param est.scale Character. Effect scale ("hr" or "1/hr").
-#' @keywords internal
 #' @return Data frame of subgroup summary estimates.
+#' @examples
+#' \dontrun{
+#' library(survival)
+#' df <- data.frame(
+#'   tte          = gbsg$rfstime / 30.4375,
+#'   event        = gbsg$status,
+#'   treat        = gbsg$hormon,
+#'   treat.recommend = as.integer(gbsg$er > 0)
+#' )
+#' SG_tab_estimates(df, SG_flag = "ITT",
+#'                  outcome.name = "tte",
+#'                  event.name   = "event",
+#'                  treat.name   = "treat")
+#' }
+#' @export
 
 SG_tab_estimates <- function(df, SG_flag, outcome.name = "tte", event.name = "event", treat.name = "treat", strata.name = NULL,
                              hr_1a = NA, hr_0a = NA, potentialOutcome.name = NULL,
@@ -321,7 +649,6 @@ SG_tab_estimates <- function(df, SG_flag, outcome.name = "tte", event.name = "ev
 #' @param target_func Function whose formals define the filter criteria.
 #' @param override_args List of arguments to add or override (optional).
 #'
-#' @keywords internal
 #' @return List of filtered arguments ready for `do.call()`.
 #'
 #' @details
@@ -332,6 +659,22 @@ SG_tab_estimates <- function(df, SG_flag, outcome.name = "tte", event.name = "ev
 #'
 #' Reduces boilerplate and improves readability across the codebase.
 #'
+#' @examples
+#' \dontrun{
+#' # Instead of:
+#' args_FS <- names(formals(get_FSdata))
+#' args_FS_filtered <- args_call_all[names(args_call_all) %in% args_FS]
+#' args_FS_filtered$df.analysis <- df.analysis
+#' args_FS_filtered$grf_cuts <- grf_cuts
+#' FSdata <- do.call(get_FSdata, args_FS_filtered)
+#'
+#' # You now write:
+#' FSdata <- do.call(get_FSdata,
+#'   filter_call_args(args_call_all, get_FSdata,
+#'                    list(df.analysis = df.analysis, grf_cuts = grf_cuts)))
+#' }
+#'
+#' @export
 
 filter_call_args <- function(source_args, target_func, override_args = NULL) {
   target_params <- names(formals(target_func))
@@ -353,7 +696,10 @@ filter_call_args <- function(source_args, target_func, override_args = NULL) {
 #' tables: a treatment effect estimates table and an identified subgroups
 #' table, each with fully customizable titles and subtitles.
 #'
-#' @param fs ForestSearch results object.
+#' @param fs ForestSearch results object, or a \code{grf_glm_result} object
+#'   from \code{\link{grf.subg.harm.glm}}.  When a GRF object is supplied,
+#'   only Table 1 (treatment effect estimates) is produced; Table 2
+#'   (identified subgroups with consistency) returns \code{NULL}.
 #' @param which_df Character. Which data frame to use ("est" or "testing").
 #' @param est_title Character or NULL. Main title for the estimates table
 #'   (default: "Treatment Effect Estimates"). Rendered as bold markdown.
@@ -371,16 +717,42 @@ filter_call_args <- function(source_args, target_func, override_args = NULL) {
 #' @param hr_1a Character. Adjusted HR for subgroup 1 (optional).
 #' @param hr_0a Character. Adjusted HR for subgroup 0 (optional).
 #' @param ndecimals Integer. Number of decimals for formatted numbers
-#'   (default: 3).
+#'   (default: 3).  Controls precision in both \code{sg10_out}
+#'   (formatted via \code{gt::fmt_number}) and \code{tab_estimates}
+#'   (threaded as \code{digits} to \code{\link{SG_tab_estimates_glm}}
+#'   for arm summaries, Diff, effect-estimate CI, and bias-corrected
+#'   CI).  GLM and GRF-GLM paths only; the survival path uses its own
+#'   formatting in \code{\link{SG_tab_estimates}}.
 #' @param include_search_info Logical. Include search metadata table
 #'   (default: TRUE).
+#' @param subgroup_notation Character or \code{NULL}.  When set to
+#'   \code{"harm"} or \code{"benefit"}, overrides the default
+#'   "Recommend"/"Questionable" labels with the Unicode labels from
+#'   \code{\link{get_sg_labels}} (e.g., \eqn{\hat{H}}{H-hat} /
+#'   \eqn{\hat{H}^c}{H-hat^c}
+#'   for harm).  Default \code{NULL} (use "Recommend"/"Questionable").
 #' @param font_size Numeric. Font size in pixels for table text (default: 12).
 #'
 #' @return List with gt tables for estimates, subgroups, and optionally
 #'   search info.
 #'
-#' @importFrom gt gt fmt_number tab_header tab_spanner tab_source_note
-#'   tab_options md px
+#' @importFrom gt gt fmt_number tab_header tab_spanner tab_source_note tab_options md px
+#' @examples
+#' \dontrun{
+#' library(survival)
+#' fs <- forestsearch(
+#'   gbsg,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name     = "rfstime",
+#'   treat.name       = "hormon",
+#'   event.name       = "status",
+#'   fs.splits        = 50,
+#'   use_lasso        = FALSE,
+#'   use_grf          = FALSE
+#' )
+#' tabs <- sg_tables(fs)
+#' tabs$tab_estimates
+#' }
 #' @export
 sg_tables <- function(fs,
                       which_df = "est",
@@ -393,11 +765,170 @@ sg_tables <- function(fs,
                       hr_0a = NA,
                       ndecimals = 3,
                       include_search_info = TRUE,
+                      subgroup_notation = NULL,
                       font_size = 12) {
+
+  # -- Subgroup labels from notation ------------------------------------------
+  # Default: "Recommend" / "Questionable".  When subgroup_notation is set,
+  # use get_sg_labels() for consistent Unicode labeling across the package.
+  if (!is.null(subgroup_notation)) {
+    subgroup_notation <- match.arg(subgroup_notation, c("harm", "benefit"))
+    L <- get_sg_labels(subgroup_notation)
+    if (subgroup_notation == "harm") {
+      # treat.recommend == 0 IS the harm subgroup
+      sg0_label <- L$sg_hat     # Ĥ
+      sg1_label <- L$sg_hat_c   # Ĥᶜ
+    } else {
+      # treat.recommend == 1 IS the benefit subgroup
+      sg1_label <- L$sg_hat     # Ĝ
+      sg0_label <- L$sg_hat_c   # Ĝᶜ
+    }
+  } else {
+    sg0_label <- "Questionable"
+    sg1_label <- "Recommend"
+  }
+
+  # Footnote target row: the "identified" subgroup
+  # harm: sg0 (Ĥ);  benefit: sg1 (Ĝ);  default: sg0 (Questionable)
+  fn_target_label <- if (!is.null(subgroup_notation) &&
+                         subgroup_notation == "benefit") {
+    sg1_label
+  } else {
+    sg0_label
+  }
 
   if (!requireNamespace("gt", quietly = TRUE)) {
     stop("Package 'gt' required.")
   }
+
+  # =========================================================================
+  # GRF STANDALONE DISPATCH
+  # =========================================================================
+  # When fs is a grf_glm_result object (from grf.subg.harm.glm), produce
+
+  # Table 1 (ITT + subgroup estimates) only.  Table 2 (candidate
+  # enumeration with Pcons) is FS-specific and returns NULL.
+  if (inherits(fs, "grf_glm_result")) {
+    df <- fs$data
+
+    outcome.name   <- fs$outcome.name
+    treat.name_grf <- fs$treat.name
+    effect_measure <- fs$effect_measure %||% "OR"
+    outcome_type   <- fs$outcome_type %||% "binary"
+    offset.name    <- fs$offset.name
+
+    # GRF stores effect_measure on the link scale (e.g., "log_OR");
+    # SG_tab_estimates_glm and make_effect_estimator expect the display
+    # scale (e.g., "OR").  Convert:
+    em_map <- c(log_OR = "OR", log_RR = "RR", log_IRR = "IRR")
+    if (effect_measure %in% names(em_map)) {
+      effect_measure <- em_map[[effect_measure]]
+    }
+
+    # Build estimator closure
+    estimator_fn_grf <- tryCatch(
+      make_effect_estimator(
+        outcome_type      = outcome_type,
+        treat.name        = treat.name_grf,
+        outcome.name      = outcome.name,
+        offset.name       = offset.name,
+        effect_measure    = effect_measure,
+        adjust_covariates = fs$args_call_all$adjust_covariates
+      ),
+      error = function(e) NULL
+    )
+
+    # ITT row
+    aa_grf <- SG_tab_estimates_glm(
+      df, SG_flag = "ITT",
+      outcome.name   = outcome.name,
+      treat.name     = treat.name_grf,
+      estimator_fn   = estimator_fn_grf,
+      effect_measure = effect_measure,
+      outcome_type   = outcome_type,
+      est.scale      = "hr",
+      digits         = ndecimals
+    )
+
+    # Subgroup rows
+    bb_grf <- SG_tab_estimates_glm(
+      df, SG_flag = "treat.recommend",
+      outcome.name   = outcome.name,
+      treat.name     = treat.name_grf,
+      estimator_fn   = estimator_fn_grf,
+      effect_measure = effect_measure,
+      outcome_type   = outcome_type,
+      effect_a_1     = hr_1a,
+      effect_a_0     = hr_0a,
+      sg1_name       = sg1_label,
+      sg0_name       = sg0_label,
+      est.scale      = "hr",
+      digits         = ndecimals
+    )
+
+    tab_est_grf <- as.data.frame(rbind(aa_grf, bb_grf))
+
+    tab_estimates_grf <- gt::gt(tab_est_grf, auto_align = TRUE) |>
+      gt::tab_header(
+        title = if (!is.null(est_title)) {
+          gt::md(paste0("**", est_title, "**"))
+        } else {
+          est_caption
+        },
+        subtitle = if (!is.null(est_title)) est_caption
+      ) |>
+      gt::tab_options(
+        table.font.size = gt::px(font_size),
+        heading.title.font.size = gt::px(font_size + 2),
+        heading.subtitle.font.size = gt::px(font_size),
+        column_labels.font.size = gt::px(font_size)
+      )
+
+    # Subgroup definition footnote
+    sg_def_grf <- if (!is.null(fs$sg.harm.id) && length(fs$sg.harm.id) > 0) {
+      paste(fs$sg.harm.id, collapse = " & ")
+    } else {
+      NULL
+    }
+
+    if (!is.null(sg_def_grf) && nzchar(sg_def_grf)) {
+      fn_word <- if (!is.null(subgroup_notation)) {
+        paste0("Identified ", subgroup_notation, " subgroup (GRF)")
+      } else {
+        "Identified subgroup (GRF)"
+      }
+      tab_estimates_grf <- tab_estimates_grf |>
+        gt::tab_footnote(
+          footnote = gt::md(
+            paste0("**", fn_word, ":** ", sg_def_grf)
+          ),
+          locations = gt::cells_body(
+            columns = 1,
+            rows = tab_est_grf[[1]] == fn_target_label
+          )
+        )
+    }
+
+    # CATE footnote (GRF-specific context)
+    if (!is.null(fs$cate_sg)) {
+      tab_estimates_grf <- tab_estimates_grf |>
+        gt::tab_source_note(
+          source_note = gt::md(sprintf(
+            "**GRF CATE:** H&#x302; = %.4f, H&#x302;<sup>c</sup> = %.4f (risk-difference scale)",
+            fs$cate_sg, fs$cate_sgc
+          ))
+        )
+    }
+
+    return(list(
+      tab_estimates = tab_estimates_grf,
+      sg10_out      = NULL
+    ))
+  }
+
+  # =========================================================================
+  # FORESTSEARCH PATH (original code below)
+  # =========================================================================
 
   # Select appropriate dataframe
   if (which_df == "est") df <- fs$df.est
@@ -405,30 +936,109 @@ sg_tables <- function(fs,
 
   args_fs <- fs$args_call_all
 
-  # Prepare arguments for SG_tab_estimates
-  args_tab_filtered <- filter_call_args(
-    args_fs,
-    SG_tab_estimates,
-    list(
-      df = df,
-      sg0_name = "Questionable",
-      sg1_name = "Recommend",
-      hr_1a = hr_1a,
-      hr_0a = hr_0a
-    )
-  )
+  # -- No-subgroup / empty-data guard -----------------------------------------
+  # When forestsearch() identifies no harm subgroup, fs$sg.harm is NULL.  The
+  # CONSISTENCY path returns the selected data frame (fs$df.est / fs$df.test) as
+  # NULL, but the DINA and GRF selection paths
+  # (.forestsearch_dina_select / .forestsearch_grf_select) return df.est = df --
+  # a populated frame WITHOUT a treat.recommend column.  So keying the guard on
+  # is.null(df) alone catches the consistency case but lets a no-subgroup
+  # DINA/GRF fit fall through to Table 1's SG_tab_estimates(SG_flag =
+  # "treat.recommend"), which splits on the absent column and dies with the
+  # opaque "undefined columns selected" (prepare_subgroup_data: df[, SG_flag]).
+  # Key on sg.harm (the actual "no subgroup identified" contract) as well, so
+  # every no-subgroup fit returns empty tables regardless of subgroup_method.
+  # A subgroup-found fit has sg.harm non-NULL, so the condition reduces to
+  # is.null(df) -- byte-identical to the former behaviour.
+  # (Without the guard the survival path would instead pass a NULL data frame
+  # into SG_tab_estimates() -> analyze_subgroup() -> km_summary() ->
+  # survival::Surv(), failing with "Time variable is not numeric".)
+  if (is.null(fs$sg.harm) || is.null(df)) {
+    reason <- if (is.null(fs$sg.harm)) {
+      "no harm subgroup was identified (fs$sg.harm is NULL)"
+    } else {
+      sprintf("the requested data frame is NULL (which_df = \"%s\")", which_df)
+    }
+    warning(sprintf("sg_tables(): %s; returning empty tables.", reason),
+            call. = FALSE)
+    return(list(tab_estimates = NULL, sg10_out = NULL))
+  }
+
+  # Detect GLM outcome
+  outcome_type <- args_fs$outcome_type
+  if (is.null(outcome_type) || length(outcome_type) > 1L) outcome_type <- "survival"
+  is_glm <- outcome_type != "survival"
 
   # =========================================================================
   # TABLE 1: ITT AND SUBGROUP ESTIMATES
   # =========================================================================
 
-  # ITT estimates
-  args_tab_filtered$SG_flag <- "ITT"
-  aa <- do.call(SG_tab_estimates, args_tab_filtered)
+  if (is_glm) {
+    # GLM path: use SG_tab_estimates_glm
+    effect_measure <- args_fs$effect_measure
+    if (is.null(effect_measure)) effect_measure <- "RD"
 
-  # Subgroup estimates
-  args_tab_filtered$SG_flag <- "treat.recommend"
-  bb <- do.call(SG_tab_estimates, args_tab_filtered)
+    # Build estimator closure for the table
+    estimator_fn_tab <- tryCatch(
+      make_effect_estimator(
+        outcome_type      = outcome_type,
+        treat.name        = args_fs$treat.name,
+        outcome.name      = args_fs$outcome.name,
+        offset.name       = args_fs$offset.name,
+        effect_measure    = effect_measure,
+        adjust_covariates = args_fs$adjust_covariates
+      ),
+      error = function(e) NULL
+    )
+
+    # ITT estimates
+    aa <- SG_tab_estimates_glm(
+      df, SG_flag = "ITT",
+      outcome.name   = args_fs$outcome.name,
+      treat.name     = args_fs$treat.name,
+      estimator_fn   = estimator_fn_tab,
+      effect_measure = effect_measure,
+      outcome_type   = outcome_type,
+      est.scale      = args_fs$est.scale,
+      digits         = ndecimals
+    )
+
+    # Subgroup estimates
+    bb <- SG_tab_estimates_glm(
+      df, SG_flag = "treat.recommend",
+      outcome.name   = args_fs$outcome.name,
+      treat.name     = args_fs$treat.name,
+      estimator_fn   = estimator_fn_tab,
+      effect_measure = effect_measure,
+      outcome_type   = outcome_type,
+      effect_a_1     = hr_1a,
+      effect_a_0     = hr_0a,
+      sg1_name       = sg1_label,
+      sg0_name       = sg0_label,
+      est.scale      = args_fs$est.scale,
+      digits         = ndecimals
+    )
+
+  } else {
+    # Survival path: use SG_tab_estimates (unchanged)
+    args_tab_filtered <- filter_call_args(
+      args_fs,
+      SG_tab_estimates,
+      list(
+        df = df,
+        sg0_name = sg0_label,
+        sg1_name = sg1_label,
+        hr_1a = hr_1a,
+        hr_0a = hr_0a
+      )
+    )
+
+    args_tab_filtered$SG_flag <- "ITT"
+    aa <- do.call(SG_tab_estimates, args_tab_filtered)
+
+    args_tab_filtered$SG_flag <- "treat.recommend"
+    bb <- do.call(SG_tab_estimates, args_tab_filtered)
+  }
 
   tab_est <- as.data.frame(rbind(aa, bb))
 
@@ -461,12 +1071,17 @@ sg_tables <- function(fs,
 
   # Add footnote to specific row
   if (!is.null(sg_definition) && nzchar(sg_definition)) {
+    fn_word_fs <- if (!is.null(subgroup_notation)) {
+      paste0("Identified ", subgroup_notation, " subgroup")
+    } else {
+      "Identified subgroup"
+    }
     tab_estimates <- tab_estimates |>
       gt::tab_footnote(
-        footnote = gt::md(paste0("**Identified subgroup** : ", sg_definition)),
+        footnote = gt::md(paste0("**", fn_word_fs, ":** ", sg_definition)),
         locations = gt::cells_body(
-          columns = 1,  # First column (Subgroup name)
-          rows = grepl("Questionable|H$", tab_est[[1]])  # Row with "Questionable" or "H"
+          columns = 1,
+          rows = tab_est[[1]] == fn_target_label
         )
       )
   }
@@ -518,12 +1133,34 @@ sg_tables <- function(fs,
     )
   }
 
-  if (args_fs$maxk == 1) {
-    sg10 <- sg10[, c("M.1", "N", "E", "d1", "hr", "Pcons")]
+  # For GLM, transform the hr column for display and set appropriate labels
+  if (is_glm) {
+    effect_measure <- args_fs$effect_measure
+    if (is.null(effect_measure)) effect_measure <- "RD"
+
+    # For log-scale measures, exponentiate for display
+    if (effect_measure %in% c("OR", "RR", "IRR")) {
+      sg10$hr <- as.numeric(sg10$hr)
+      sg10$hr <- exp(sg10$hr)
+    }
+
+    # Column labels for GLM
+    hr_label  <- effect_measure
+    e_label   <- "n(C+T)"
+    d1_label  <- gt::md("n<sub>1</sub>")
+  } else {
+    # Survival column labels (unchanged)
+    hr_label  <- "HR"
+    e_label   <- "Events"
+    d1_label  <- gt::md("E<sub>1</sub>")
 
     if (args_fs$est.scale == "1/hr") {
-      sg10$hr <- 1 / sg10$hr
+      sg10$hr <- 1 / as.numeric(sg10$hr)
     }
+  }
+
+  if (args_fs$maxk == 1) {
+    sg10 <- sg10[, c("M.1", "N", "E", "d1", "hr", "Pcons")]
 
     sg10_out <- sg10 |>
       gt::gt() |>
@@ -538,11 +1175,11 @@ sg_tables <- function(fs,
         subtitle = if (!is.null(sg_title)) sg_subtitle
       ) |>
       gt::cols_label(
-        M.1 = "Factor",
+        M.1 = "Factor 1",
         N = "N",
-        E = "Events",
-        d1 = gt::md("E<sub>1</sub>"),
-        hr = "HR",
+        E = e_label,
+        d1 = d1_label,
+        hr = hr_label,
         Pcons = gt::md("P<sub>cons</sub>")
       ) |>
       gt::tab_options(
@@ -555,10 +1192,6 @@ sg_tables <- function(fs,
 
   } else if (args_fs$maxk == 2) {
     sg10 <- sg10[, c("M.1", "M.2", "N", "E", "d1", "hr", "Pcons")]
-
-    if (args_fs$est.scale == "1/hr") {
-      sg10$hr <- 1 / sg10$hr
-    }
 
     sg10_out <- sg10 |>
       gt::gt() |>
@@ -576,9 +1209,9 @@ sg_tables <- function(fs,
         M.1 = "Factor 1",
         M.2 = "Factor 2",
         N = "N",
-        E = "Events",
-        d1 = gt::md("E<sub>1</sub>"),
-        hr = "HR",
+        E = e_label,
+        d1 = d1_label,
+        hr = hr_label,
         Pcons = gt::md("P<sub>cons</sub>")
       ) |>
       gt::tab_options(
@@ -591,10 +1224,6 @@ sg_tables <- function(fs,
 
   } else if (args_fs$maxk == 3) {
     sg10 <- sg10[, c("M.1", "M.2", "M.3", "N", "E", "d1", "hr", "Pcons")]
-
-    if (args_fs$est.scale == "1/hr") {
-      sg10$hr <- 1 / sg10$hr
-    }
 
     sg10_out <- sg10 |>
       gt::gt() |>
@@ -613,9 +1242,9 @@ sg_tables <- function(fs,
         M.2 = "Factor 2",
         M.3 = "Factor 3",
         N = "N",
-        E = "Events",
-        d1 = gt::md("E<sub>1</sub>"),
-        hr = "HR",
+        E = e_label,
+        d1 = d1_label,
+        hr = hr_label,
         Pcons = gt::md("P<sub>cons</sub>")
       ) |>
       gt::tab_options(
@@ -639,6 +1268,21 @@ sg_tables <- function(fs,
     n_candidates <- nrow(fs$find.grps$out.found$hr.subgroups)
     max_sg_est <- fs$find.grps$max_sg_est
 
+    # Resolve display label for effect measure
+    effect_display <- if (is_glm) {
+      em <- args_fs$effect_measure
+      if (is.null(em)) "Effect" else em
+    } else {
+      "HR"
+    }
+    # For GLM ratio measures, max_sg_est is on log scale; exponentiate
+    max_display <- if (is_glm && !is.null(args_fs$effect_measure) &&
+                       args_fs$effect_measure %in% c("OR", "RR", "IRR")) {
+      round(exp(max_sg_est), 2)
+    } else {
+      round(max_sg_est, 2)
+    }
+
     # Add search metadata as source notes
     sg10_out <- sg10_out |>
       gt::tab_source_note(
@@ -656,7 +1300,7 @@ sg_tables <- function(fs,
           paste0(
             "**Search Results:** ",
             "Candidate subgroups found = ", n_candidates, "; ",
-            "Maximum HR estimate = ", round(max_sg_est, 2)
+            "Maximum ", effect_display, " estimate = ", max_display
           )
         )
       ) |>

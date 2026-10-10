@@ -5,10 +5,11 @@
 # Functions for computing the probability of detecting a true subgroup
 # using asymptotic normal approximations for the log hazard ratio estimator.
 #
-# Based on the variance approximation: Var(log(HR)) ~ 4/d for each treatment
-# arm, giving Var(log(HR)) ~ 8/d for the combined estimator, where d is the
-
-# number of events in the subgroup.
+# Based on the Leon et al. (2024, Section 2.1) variance approximation for the
+# subgroup log hazard ratio.  Let d = the TOTAL number of events in the
+# subgroup.  The full-subgroup log-HR has Var(log(HR)) ~ 4/d, so each 50/50
+# split-half (which holds d/2 events) has Var ~ 4/(d/2) = 8/d.  That 8/d is
+# the per-split variance the detection criterion below is built on.
 #
 # Reference: Leon et al. (2024) "Exploratory subgroup identification in the
 # heterogeneous Cox model"
@@ -48,9 +49,10 @@ NULL
 #'   \item Individual splits: x1 >= k_ind AND x2 >= k_ind
 #' }
 #'
-#' Under the asymptotic approximation, each split-half log(HR) estimator
-#' follows N(log(theta), 8/d) where d = n_sg * (1 - prop_cens) / 2 is the
-#' expected number of events per split.
+#' Under the Leon et al. (2024, Section 2.1) approximation, each 50/50
+#' split-half log(HR) estimator follows N(log(theta), 8/d) where
+#' d = n_sg * (1 - prop_cens) is the expected TOTAL number of events in the
+#' subgroup.  Each split holds d/2 events, so its variance is 4/(d/2) = 8/d.
 #'
 #' @keywords internal
 density_threshold_both <- function(x, theta, prop_cens = 0.3, n_sg, k_avg, k_ind) {
@@ -58,10 +60,11 @@ density_threshold_both <- function(x, theta, prop_cens = 0.3, n_sg, k_avg, k_ind
  # Events in subgroup (total)
   d_sg <- n_sg * (1 - prop_cens)
 
- # Variance for each split-half estimator
-  # Each split has d_sg/2 events, so Var = 8/(d_sg/2) = 16/d_sg
-  # But the original code uses 8/d_sg which assumes full sample variance
-  # for demonstration purposes
+ # Per-split log-HR variance (Leon et al. 2024, Section 2.1).  d_sg is the
+  # TOTAL number of subgroup events; the full-subgroup log-HR has Var ~ 4/d_sg,
+  # so a 50/50 split-half (d_sg/2 events) has Var = 4/(d_sg/2) = 8/d_sg.
+  # (Do NOT write 16/d_sg: that double-counts the split penalty by starting
+  # from an 8/events base instead of the correct 4/events.)
   sig2_split <- 8 / d_sg
   sig_split <- sqrt(sig2_split)
 
@@ -150,12 +153,13 @@ density_threshold_integrand <- function(x, theta, prop_cens, n_sg, k_avg, k_ind)
 #' The approximation assumes:
 #' \itemize{
 #'   \item Large sample sizes (CLT applies)
-#'   \item Var(log(HR)) ~ 4/d per treatment arm
+#'   \item Var(log(HR)) ~ 4/d for the full subgroup (d = total subgroup
+#'     events); each 50/50 split-half (d/2 events) has variance 8/d
 #'   \item Independence between split-halves (conditional on true effect)
 #' }
 #'
 #' @examples
-#' \donttest{
+#' \dontrun{
 #' # Single HR value
 #' prob <- compute_detection_probability(
 #'   theta = 1.5,
@@ -341,6 +345,19 @@ compute_detection_probability_single <- function(
 #'   \item{prop_cens}{Censoring proportion (repeated)}
 #'   \item{hr_threshold}{Detection threshold (repeated)}
 #'
+#' @examples
+#' \dontrun{
+#' # Generate detection curve
+#' curve_data <- generate_detection_curve(
+#'   n_sg = 60,
+#'   prop_cens = 0.2,
+#'   hr_threshold = 1.25
+#' )
+#'
+#' # Plot
+#' plot_detection_curve(curve_data)
+#' }
+#'
 #' @export
 generate_detection_curve <- function(
     theta_range = c(0.5, 3.0),
@@ -408,6 +425,12 @@ generate_detection_curve <- function(
 #' @param ... Additional arguments passed to plot()
 #'
 #' @return Invisibly returns the input data.
+#'
+#' @examples
+#' \dontrun{
+#' curve_data <- generate_detection_curve(n_sg = 60, prop_cens = 0.2)
+#' plot_detection_curve(curve_data)
+#' }
 #'
 #' @export
 plot_detection_curve <- function(
@@ -482,9 +505,24 @@ plot_detection_curve <- function(
 #' @param n_points Integer. Number of points per curve. Default: 40
 #' @param verbose Logical. Print progress. Default: TRUE
 #'
-#' @keywords internal
 #' @return A data.frame with all curves combined, including n_sg as a factor.
 #'
+#' @examples
+#' \dontrun{
+#' comparison <- compare_detection_curves(
+#'   n_sg_values = c(40, 60, 80, 100),
+#'   prop_cens = 0.2
+#' )
+#'
+#' # Plot with ggplot2
+#' library(ggplot2)
+#' ggplot(comparison, aes(x = theta, y = probability, color = factor(n_sg))) +
+#'   geom_line(linewidth = 1) +
+#'   labs(x = "True HR", y = "P(Detect)", color = "n_sg") +
+#'   theme_minimal()
+#' }
+#'
+#' @export
 compare_detection_curves <- function(
     n_sg_values,
     prop_cens = 0.3,
@@ -537,13 +575,24 @@ compare_detection_curves <- function(
 #' @param tol Numeric. Tolerance for bisection search. Default: 1
 #' @param verbose Logical. Print progress. Default: TRUE
 #'
-#' @keywords internal
 #' @return A list with:
 #'   \item{n_sg_required}{Minimum sample size (rounded up)}
 #'   \item{achieved_power}{Actual detection probability at n_sg_required}
 #'   \item{theta}{Input hazard ratio}
 #'   \item{target_power}{Input target power}
 #'
+#' @examples
+#' \dontrun{
+#' # Find sample size for 80% power to detect HR = 1.5
+#' result <- find_required_sample_size(
+#'   theta = 1.5,
+#'   target_power = 0.80,
+#'   prop_cens = 0.2
+#' )
+#' print(result)
+#' }
+#'
+#' @export
 find_required_sample_size <- function(
     theta,
     target_power = 0.80,
@@ -647,9 +696,19 @@ find_required_sample_size <- function(
 #' @param hr_threshold Numeric. HR threshold. Default: 1.25
 #' @param verbose Logical. Print progress. Default: TRUE
 #'
-#' @keywords internal
 #' @return A data.frame with columns: theta, prop_cens, n_required, achieved_power
 #'
+#' @examples
+#' \dontrun{
+#' ss_table <- create_sample_size_table(
+#'   theta_values = c(1.5, 1.75, 2.0, 2.5),
+#'   prop_cens_values = c(0.2, 0.3, 0.4),
+#'   target_power = 0.80
+#' )
+#' print(ss_table)
+#' }
+#'
+#' @keywords internal
 create_sample_size_table <- function(
     theta_values,
     prop_cens_values,
@@ -691,7 +750,7 @@ create_sample_size_table <- function(
 # Print Methods
 # =============================================================================
 
-#' @keywords internal
+#' @export
 print.detection_curve <- function(x, ...) {
   cat("Detection Probability Curve\n")
   cat("===========================\n")

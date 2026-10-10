@@ -2,19 +2,119 @@
 % Please edit documentation in R/subgroup_consistency_helpers.R
 \name{sort_subgroups}
 \alias{sort_subgroups}
-\title{Sort Subgroups by Focus}
+\title{Sort Subgroups by Focus (post-consistency)}
 \usage{
-sort_subgroups(result_new, sg_focus)
+sort_subgroups(
+  result_new,
+  sg_focus,
+  selection_rule = "neighborhood",
+  effect_neighborhood = 0.1,
+  effect_log_scale = FALSE
+)
 }
 \arguments{
-\item{result_new}{A data.table of subgroup results.}
+\item{result_new}{A data.table of subgroup results with columns
+\code{Pcons}, \code{hr}, \code{N}, \code{K}.}
 
-\item{sg_focus}{Sorting focus: "hr", "hrMaxSG", "maxSG", "hrMinSG", "minSG".}
+\item{sg_focus}{Character. Sorting focus.  One of \code{"hr"},
+\code{"maxSG"}, \code{"hrMaxSG"}, \code{"minSG"}, \code{"hrMinSG"}.}
+
+\item{selection_rule}{Character. Rule defining the candidate
+inclusion set for \code{"hrMaxSG"} / \code{"hrMinSG"}.  One of
+\code{"neighborhood"} (default; current behaviour),
+\code{"pareto"}, or \code{"both"}.  Must be \code{"neighborhood"}
+for other \code{sg_focus} values.}
+
+\item{effect_neighborhood}{Numeric in \code{[0, 1)}.  Relative
+tolerance defining the effect-size neighborhood for
+\code{"hrMaxSG"} and \code{"hrMinSG"}.  A candidate is in the
+neighborhood iff its (natural-scale) effect is at least
+\code{(1 - effect_neighborhood) * max(effect)}.  Default
+\code{0.10} (i.e., within 10\\% of the strongest effect).  Used by
+\code{selection_rule} \code{"neighborhood"} and \code{"both"};
+ignored by \code{"pareto"} (and rejected if non-default with
+\code{"pareto"}).}
+
+\item{effect_log_scale}{Logical.  If \code{TRUE}, the \code{hr}
+column stores log-scale values (log-OR, log-IRR) and is
+exponentiated before applying the inclusion test.  Default
+\code{FALSE} (Cox stores natural-scale HR).}
 }
 \value{
-A sorted data.table.
+A sorted data.table.  The top row is the selected subgroup
+under \code{sg_focus}; remaining rows are diagnostic.
 }
 \description{
 Sorts a data.table of subgroup results according to the specified focus.
+For \code{"hrMaxSG"} and \code{"hrMinSG"}, candidates are first
+partitioned into a \emph{candidate inclusion set} (the "band"), then
+ranked within the band by sample size.  The \code{selection_rule}
+argument controls how the band is defined:
+\itemize{
+\item \code{"neighborhood"} -- 1D effect-size band (default; legacy
+behaviour): a candidate is in-band iff its effect is within
+\code{effect_neighborhood} of the maximum.
+\item \code{"pareto"} -- 2D Pareto-non-dominated set in
+(effect, N) space: a candidate is in-band iff no other candidate
+has both a larger effect and a larger N.
+\item \code{"both"} -- intersection of the two: a candidate is
+in-band iff it satisfies the neighborhood test \emph{and} is
+Pareto-non-dominated.
 }
-\keyword{internal}
+See Details.
+}
+\details{
+\strong{Sort keys by \code{sg_focus}:}
+\describe{
+\item{\code{"hr"}}{\code{(-Pcons, -hr, K)} -- prefer high consistency
+and large effect.}
+\item{\code{"maxSG"}}{\code{(-N, -Pcons, K)} -- prefer large
+subgroups with high consistency.}
+\item{\code{"minSG"}}{\code{(N, -Pcons, K)} -- prefer small
+subgroups with high consistency.}
+\item{\code{"hrMaxSG"}}{\code{(-in_band, -N, -Pcons, -hr, K)} -- among
+candidates in the inclusion band defined by \code{selection_rule},
+prefer the largest sample size.}
+\item{\code{"hrMinSG"}}{\code{(-in_band, N, -Pcons, -hr, K)} -- among
+candidates in the inclusion band defined by \code{selection_rule},
+prefer the smallest sample size.}
+}
+
+\code{"hrMaxSG"} and \code{"hrMinSG"} use a \emph{lexicographic with
+candidate band} rule: effect size is primary, but a bounded set of
+candidates near (or trading off against) the maximum is accepted to
+optimize sample size.
+
+\strong{Selection rules:}
+\describe{
+\item{\code{"neighborhood"}}{1D \eqn{\varepsilon}-band on the effect
+scale: \code{in_band = (hr >= (1 - effect_neighborhood) * max(hr))}.
+Setting \code{effect_neighborhood = 0} reduces this to a strict
+max-effect filter.  This is the legacy behaviour.}
+\item{\code{"pareto"}}{2D Pareto-non-dominated set: a candidate is
+in-band iff no other candidate has both \code{hr_j >= hr_i} and
+\code{N_j >= N_i} with at least one strict inequality.  Reuses
+the same dominance computation as \code{compute_pareto_frontier()}.
+Removes the \code{effect_neighborhood} tuning parameter from the
+selection criterion.}
+\item{\code{"both"}}{Intersection: in-band iff in the
+\eqn{\varepsilon}-band \emph{and} Pareto-non-dominated.  Strictest
+of the three.}
+}
+}
+\examples{
+\donttest{
+library(data.table)
+dt <- data.table(Pcons = c(0.92, 0.95, 0.88, 0.90),
+                 hr    = c(2.5,  2.4,  2.3,  2.0),
+                 N     = c(70,   100,  150,  200),
+                 K     = c(1, 2, 1, 2))
+# hrMaxSG with 10\% neighborhood: HR 2.5, 2.4, 2.3 are in-band;
+# among those, N = 150 is largest -> top row is N=150, hr=2.3.
+sort_subgroups(dt, sg_focus = "hrMaxSG", effect_neighborhood = 0.10)
+
+# Same data with selection_rule = "pareto": the dominance set in
+# (hr, N) is used instead of the 1D effect band.
+sort_subgroups(dt, sg_focus = "hrMaxSG", selection_rule = "pareto")
+}
+}

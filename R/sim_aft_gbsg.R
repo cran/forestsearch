@@ -113,7 +113,6 @@ cut_size <- function(x, breaks = c(20, 50)) {
 #'   Default: 8316951
 #' @param verbose Logical. Print diagnostic information. Default: FALSE
 #'
-#' @keywords internal
 #' @return A list of class "gbsg_dgm" containing:
 #' \describe{
 #'   \item{df_super_rand}{Data frame with randomized super-population including
@@ -169,13 +168,34 @@ cut_size <- function(x, breaks = c(20, 50)) {
 #'   \item AHR metrics: exp(mean(loghr_po)) for overall and subgroups
 #' }
 #'
+#' @examples
+#' \dontrun{
+#' # Alternative hypothesis with default parameters
+#' dgm_alt <- create_gbsg_dgm(model = "alt", verbose = TRUE)
+#'
+#' # Null hypothesis
+#' dgm_null <- create_gbsg_dgm(model = "null", verbose = TRUE)
+#'
+#' # Custom subgroup HR via k_inter
+#' dgm_custom <- create_gbsg_dgm(
+#'   model = "alt",
+#'   k_treat = 1.2,
+#'   k_inter = 2.0,
+#'   verbose = TRUE
+#' )
+#'
+#' # Access AHR metrics (aligned with generate_aft_dgm_flex)
+#' dgm_alt$hazard_ratios$AHR_harm
+#' dgm_alt$hazard_ratios$AHR_no_harm
+#' }
+#'
 #' @seealso
 #' \code{\link{simulate_from_gbsg_dgm}} for generating data from the DGM
 #' \code{\link{calibrate_k_inter}} for finding k_inter to achieve target HR
 #'
-#' @keywords internal
 #' @importFrom survival survreg coxph Surv
 #' @importFrom stats coef quantile rexp
+#' @export
 create_gbsg_dgm <- function(
     model = c("alt", "null"),
     k_treat = 1,
@@ -744,7 +764,6 @@ create_gbsg_dgm <- function(
 #' @param draw_treatment Logical. If TRUE, randomly assigns treatment.
 #'   If FALSE, samples from existing treatment arms. Default: TRUE
 #'
-#' @keywords internal
 #' @return Data frame with simulated trial data including:
 #' \describe{
 #'   \item{id}{Subject identifier}
@@ -757,6 +776,16 @@ create_gbsg_dgm <- function(
 #'   \item{v1-v7}{Analysis factors}
 #' }
 #'
+#' @examples
+#' \dontrun{
+#' dgm <- create_gbsg_dgm(model = "alt", k_inter = 2.0)
+#' sim_data <- simulate_from_gbsg_dgm(dgm, n = 500, sim_id = 1)
+#'
+#' # Check AHR in simulated data
+#' exp(mean(sim_data$loghr_po))
+#' }
+#'
+#' @export
 simulate_from_gbsg_dgm <- function(
     dgm,
     n = NULL,
@@ -953,20 +982,23 @@ simulate_from_gbsg_dgm <- function(
 #' the empirical HR (or AHR) in the harm subgroup equals target_hr_harm.
 #'
 #' @examples
-#' \donttest{
+#' \dontrun{
 #' # Find k_inter for HR = 1.5 in harm subgroup
 #' k <- calibrate_k_inter(target_hr_harm = 1.5, verbose = TRUE)
 #'
 #' # Verify
-#' dgm <- setup_gbsg_dgm(model = "alt", k_inter = k, verbose = FALSE)
-#' print(dgm)
+#' dgm <- create_gbsg_dgm(model = "alt", k_inter = k, verbose = TRUE)
+#' print(dgm$hr_H_true)  # Should be close to 1.5
 #'
 #' # Calibrate to AHR instead
 #' k_ahr <- calibrate_k_inter(target_hr_harm = 1.5, use_ahr = TRUE, verbose = TRUE)
-#' dgm_ahr <- setup_gbsg_dgm(model = "alt", k_inter = k_ahr, verbose = FALSE)
-#' print(dgm_ahr)
+#' dgm_ahr <- create_gbsg_dgm(model = "alt", k_inter = k_ahr, verbose = TRUE)
+#' print(dgm_ahr$AHR_H_true)  # Should be close to 1.5
 #' }
 #'
+#' @param tol_rel Numeric. Maximum tolerated relative error, in percent; the
+#'   call stops if the achieved HR is not within \code{tol_rel} percent of the
+#'   target. Default \code{2.5}.
 #' @importFrom stats uniroot
 #' @export
 calibrate_k_inter <- function(
@@ -976,6 +1008,7 @@ calibrate_k_inter <- function(
     cens_type = "weibull",
     k_inter_range = c(-100, 100),
     tol = 1e-6,
+    tol_rel = 2.5,
     use_ahr = FALSE,
     verbose = FALSE,
     ...
@@ -986,75 +1019,29 @@ calibrate_k_inter <- function(
     "model must be 'alt' for calibration" = model == "alt"
   )
 
-  # Objective function
-  objective <- function(k_val) {
+  # Realised harm-subgroup HR (or AHR) at a given interaction shift.
+  eff_at <- function(k_val) {
     dgm <- .create_gbsg_dgm_(
-      model = model,
-      k_treat = k_treat,
-      k_inter = k_val,
-      cens_type = cens_type,
-      verbose = FALSE,
-      ...
+      model = model, k_treat = k_treat, k_inter = k_val,
+      cens_type = cens_type, verbose = FALSE, ...
     )
-    if (use_ahr) {
-      dgm$AHR_H_true - target_hr_harm
-    } else {
-      dgm$hr_H_true - target_hr_harm
-    }
+    if (use_ahr) dgm$AHR_H_true else dgm$hr_H_true
   }
 
   hr_type <- if (use_ahr) "AHR(H)" else "HR(H)"
 
   if (verbose) {
     message(sprintf("Calibrating k_inter to achieve %s = %.4f", hr_type, target_hr_harm))
-    message(sprintf("Search range: [%.1f, %.1f]", k_inter_range[1], k_inter_range[2]))
-
-    # Show HR at boundaries
-    dgm_lower <- .create_gbsg_dgm_(model = model, k_treat = k_treat,
-                                  k_inter = k_inter_range[1], verbose = FALSE, ...)
-    dgm_upper <- .create_gbsg_dgm_(model = model, k_treat = k_treat,
-                                  k_inter = k_inter_range[2], verbose = FALSE, ...)
-
-    if (use_ahr) {
-      message(sprintf("%s at k_inter = %.1f: %.4f", hr_type, k_inter_range[1], dgm_lower$AHR_H_true))
-      message(sprintf("%s at k_inter = %.1f: %.4f", hr_type, k_inter_range[2], dgm_upper$AHR_H_true))
-    } else {
-      message(sprintf("%s at k_inter = %.1f: %.4f", hr_type, k_inter_range[1], dgm_lower$hr_H_true))
-      message(sprintf("%s at k_inter = %.1f: %.4f", hr_type, k_inter_range[2], dgm_upper$hr_H_true))
-    }
+    message(sprintf("Search range: [%.1f, %.1f] (extendInt = \"yes\")",
+                    k_inter_range[1], k_inter_range[2]))
   }
 
-  result <- tryCatch({
-    stats::uniroot(objective, interval = k_inter_range, tol = tol)
-  }, error = function(e) {
-    warning("Root finding failed: ", e$message)
-    return(NULL)
-  })
-
-  if (is.null(result)) {
-    return(NA_real_)
-  }
-
-  k_inter <- result$root
-
-  if (verbose) {
-    dgm_verify <- .create_gbsg_dgm_(
-      model = model,
-      k_treat = k_treat,
-      k_inter = k_inter,
-      cens_type = cens_type,
-      verbose = FALSE,
-      ...
-    )
-    achieved <- if (use_ahr) dgm_verify$AHR_H_true else dgm_verify$hr_H_true
-    message(sprintf("\n=== Calibration Result ==="))
-    message(sprintf("Found k_inter = %.6f", k_inter))
-    message(sprintf("Achieved %s = %.4f (target: %.4f)", hr_type, achieved, target_hr_harm))
-    message(sprintf("Error: %.6f", abs(achieved - target_hr_harm)))
-    message(sprintf("Iterations: %d", result$iter))
-  }
-
-  k_inter
+  # Bracketed root-finding + hard tolerance gate (shared with the GLM path).
+  .calibrate_by_root(
+    effect_fun = eff_at, target = target_hr_harm, interval = k_inter_range,
+    tol = tol, tol_rel = tol_rel, label = hr_type, param = "k_inter",
+    verbose = verbose
+  )$root
 }
 
 
@@ -1158,11 +1145,12 @@ get_dgm_with_output <- function(
 #'
 #' @param x A gbsg_dgm object
 #' @param ... Additional arguments (unused)
-#' @return Invisibly returns \code{x}.
+#' @return `x`, invisibly. Called for its side effect of printing the
+#'   data-generating mechanism summary.
 #'
 #' @examples
-#' \donttest{
-#' dgm <- setup_gbsg_dgm(model = "alt", verbose = FALSE)
+#' \dontrun{
+#' dgm <- create_gbsg_dgm()
 #' print(dgm)
 #' }
 #' @export
@@ -1230,7 +1218,7 @@ print.gbsg_dgm <- function(x, ...) {
 #' @return Data frame with k_inter, hr_H, hr_Hc, AHR_H, AHR_Hc, and ratio columns
 #'
 #' @examples
-#' \donttest{
+#' \dontrun{
 #' # Test k_inter effect
 #' results <- validate_k_inter_effect()
 #'

@@ -21,6 +21,7 @@ run_simulation_analysis(
   run_fs = TRUE,
   run_fs_grf = TRUE,
   run_grf = TRUE,
+  methods = NULL,
   fs_params = list(),
   grf_params = list(),
   cox_formula = NULL,
@@ -29,14 +30,17 @@ run_simulation_analysis(
   seed_base = 8316951L,
   verbose = FALSE,
   verbose_n = NULL,
-  debug = FALSE
+  debug = FALSE,
+  keep = character(0),
+  keep_first_n = Inf
 )
 }
 \arguments{
 \item{sim_id}{Integer. Simulation replicate index (used as seed offset).}
 
 \item{dgm}{An \code{"aft_dgm_flex"} object from
-\code{\link{generate_aft_dgm_flex}} or \code{\link{setup_gbsg_dgm}}.}
+\code{\link{generate_aft_dgm_flex}} or \code{\link{setup_gbsg_dgm}},
+or a \code{"glm_dgm"} object from \code{\link{generate_glm_dgm}}.}
 
 \item{n_sample}{Integer. Per-replicate sample size.}
 
@@ -79,7 +83,35 @@ Default \code{"y_sim"}.}
 
 \item{run_grf}{Logical. Run standalone GRF. Default \code{TRUE}.}
 
-\item{fs_params}{Named list of ForestSearch parameter overrides.}
+\item{methods}{Optional specification of analysis arms that generalizes the
+\code{run_fs} / \code{run_fs_grf} / \code{run_grf} booleans.  When
+non-\code{NULL} the booleans are ignored and \strong{every} arm is run via
+\code{forestsearch()} (through \code{.run_fs_analysis_gen()}), so all arms
+--- including \code{dina-*} and \code{grf-*} --- inherit the bias-corrected
+post-selection inference.  Two forms are accepted:
+\itemize{
+\item A character vector of canonical \code{"<engine>-<focus>"} labels,
+e.g. \code{c("fs-effMaxSG", "dina-effMaxSG", "grf-tree")}, expanded
+internally to per-arm \code{forestsearch()} overrides.  Engines are
+\code{"fs"} (\code{subgroup_method = "consistency"}), \code{"dina"},
+and \code{"grf"} (\code{grf_selection = "frontier"}, or \code{"tree"}
+for the \code{grf-tree} label).  Defaults applied during expansion:
+\code{selection_rule = "neighborhood"}; for \code{fs-*} arms
+\code{use_grf = TRUE}, \code{use_dina = TRUE}, \code{use_lasso = FALSE},
+and \code{n.min = NULL} (the sample-size-adaptive rule).
+\item A named list of explicit \code{forestsearch()} argument-override
+lists, label = name, e.g.
+\code{list("fs-effMaxSG" = list(subgroup_method = "consistency", sg_focus = "effMaxSG", use_grf = TRUE, use_dina = TRUE, use_lasso = FALSE), "grf-tree" = list(subgroup_method = "grf", grf_selection = "tree"))}.
+}
+Each arm's overrides are merged on top of \code{default_sim_params()}
+overlaid with \code{fs_params}; per-arm overrides take precedence.  The
+merge preserves an explicit \code{n.min = NULL}.  Default \code{NULL}
+preserves the legacy boolean behavior.}
+
+\item{fs_params}{Named list of ForestSearch parameter overrides.  Any
+element of \code{default_sim_params()} can be overridden, including
+\code{parallel_args} (see \emph{Parallel Processing} section below).
+Passing \code{NULL} or an empty list uses defaults throughout.}
 
 \item{grf_params}{Named list of GRF parameter overrides.}
 
@@ -98,10 +130,74 @@ sim_id}. Default \code{8316951L}.}
 verbose_n}. Default \code{NULL}.}
 
 \item{debug}{Logical. Print detailed debug output. Default \code{FALSE}.}
+
+\item{keep}{Character vector. Optional names of heavy diagnostic
+objects to attach as a list in \code{attr(result, "diagnostics")}.
+Allowed values (any combination):
+\describe{
+\item{\code{"fs_full"}}{The full \code{forestsearch()} result
+object (minus the \code{df.est} analysis data frame, which is
+stripped to control memory).  Includes \code{sg.harm},
+\code{grp.consistency}, \code{confounders.candidate},
+\code{confounders.evaluated}, GRF cuts, and timing.}
+\item{\code{"df.est"}}{The analysis data frame with
+\code{treat.recommend} column attached.  Heavy; use sparingly.}
+\item{\code{"candidate_table"}}{The data table of candidate
+subgroups evaluated
+(\code{fs_full$grp.consistency$out_sg$result}).  Medium-weight;
+useful for diagnosing which candidates were near-threshold.}
+\item{\code{"grf_full"}}{The full
+\code{grf.subg.harm.*()} result object.}
+}
+Default \code{character(0)} (attach nothing; current behavior).}
+
+\item{keep_first_n}{Integer.  When \code{keep} is non-empty, attach
+the requested diagnostics only if \code{sim_id <= keep_first_n}.
+Default \code{Inf} (attach for all replicates).  Use this to
+capture full details for, e.g., the first 20 simulations without
+bloating the result object for long production runs.}
 }
 \value{
-A \code{data.table} with one row per analysis method, containing
-subgroup size, HR, AHR, CDE, and classification metrics.
+A \code{data.table} with one row per analysis method.
+Always-present scalar columns cover: true-subgroup size/effect
+from the DGM, per-method detection flag (\code{any.H}), estimated
+subgroup size (\code{size.H}, \code{size.Hc}), effect estimates
+(\code{hr.H.hat}, \code{hr.Hc.hat}, \code{hr.itt}, and their true
+counterparts), classification metrics against the DGM-stored
+subgroup (\code{sens}, \code{spec}, \code{ppv}, \code{npv}), and
+pairwise concordance between methods (\code{agree.*.*},
+\code{kappa.*.*}).  As of v0.2.0 the following ForestSearch
+diagnostic columns are also always populated (\code{NA} for GRF
+rows):
+\describe{
+\item{\code{sg.def}}{Character.  Cut-expression string of the
+identified subgroup, formed as
+\code{paste(fs_full$sg.harm, collapse = " & ")}.  Empty
+string when no subgroup was identified.  Read across all
+replicates to diagnose which cuts the method is selecting
+(e.g., \code{table(results$sg.def)}).}
+\item{\code{sg.n_factors}}{Integer.  Number of factors in the
+identified subgroup definition.}
+\item{\code{n_candidates_evaluated}}{Integer.  Number of
+candidate subgroups actually evaluated for consistency
+(before or at the early-stop candidate).}
+\item{\code{n_candidates_total}}{Integer.  Total number of
+candidate subgroups available.}
+\item{\code{n_passed}}{Integer.  Number of candidates meeting
+the consistency threshold.}
+\item{\code{consistency_algorithm}}{Character.  \code{"fixed"}
+or \code{"twostage"}.}
+\item{\code{early_stop_triggered}}{Logical.  Whether
+evaluation stopped early due to \code{stop_threshold}.}
+\item{\code{fs_minutes}}{Numeric.  Wall time for the FS run
+in minutes.}
+}
+The analogous GRF row carries \code{sg.def} (from
+\code{grf_result$sg.harm.id}) and \code{grf_selected_depth}.
+When \code{keep} is non-empty and \code{sim_id <= keep_first_n},
+the heavy objects are attached as
+\code{attr(result, "diagnostics")} — a named list with one
+element per keeper (\code{fs_full}, \code{grf_full}, etc.).
 }
 \description{
 General replacement for the legacy \code{run_simulation_analysis()} that
@@ -109,6 +205,55 @@ was coupled to \code{simulate_from_gbsg_dgm()} and GBSG-specific column
 names.  This version calls \code{\link{simulate_from_dgm}} and accepts
 explicit column-name parameters, making it applicable to any DGM built
 with \code{\link{generate_aft_dgm_flex}}.
+}
+\section{GLM Parameters}{
+
+GLM-specific parameters (\code{outcome_type}, \code{effect_measure},
+\code{offset.name}) must be passed inside \code{fs_params}, not as
+top-level arguments.  They route only to the estimation step
+(\code{.extract_fs_estimates_gen}, \code{.extract_grf_estimates_gen}),
+not to \code{forestsearch()} itself, which uses Cox PH for subgroup
+identification in v0.1.x.  Passing these as top-level arguments will
+result in them being silently ignored.
+}
+
+\section{Parallel Processing}{
+
+\code{run_simulation_analysis()} is designed to be called inside a
+\code{foreach() \%dofuture\%} loop (one replicate per worker).  In
+that idiom, \emph{outer} parallelism is provided by \code{\%dofuture\%}
+(one replicate per worker) and the \emph{inner} \code{forestsearch()}
+call should run sequentially within each worker.  Running both layers
+multisession produces nested parallelism: each outer worker tries to
+spawn its own pool of inner workers, which \code{parallelly} rejects
+with a 300\\%-load hard-limit error.
+
+To prevent this, \code{default_sim_params()} sets
+\code{parallel_args = list(plan = "sequential")} as the default for
+the inner \code{forestsearch()} call.  Users who call
+\code{run_simulation_analysis()} once at the top level (e.g., for
+interactive debugging) and want the inner pipeline to run in parallel
+can opt back in by passing
+\code{fs_params = list(parallel_args = list(plan = "multisession", workers = N))}.
+}
+
+\examples{
+\dontrun{
+dgm <- setup_gbsg_dgm(model = "null", verbose = FALSE)
+
+# Inner forestsearch() runs sequentially by default; safe for both
+# interactive use and embedding inside foreach() \%dofuture\% loops.
+result <- run_simulation_analysis(sim_id = 1, dgm = dgm, n_sample = 500)
+
+# Opt back into inner multisession for a one-off top-level call:
+result <- run_simulation_analysis(
+  sim_id    = 1,
+  dgm       = dgm,
+  n_sample  = 500,
+  fs_params = list(parallel_args = list(plan = "multisession",
+                                        workers = 4))
+)
+}
 }
 \seealso{
 \code{\link{simulate_from_dgm}},

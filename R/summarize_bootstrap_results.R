@@ -12,6 +12,18 @@
 #' @param boot_results List. Output from forestsearch_bootstrap_dofuture()
 #' @param create_plots Logical. Generate diagnostic plots (default: FALSE)
 #' @param est.scale Character. "hr" or "1/hr" for effect scale
+#' @param digits Integer or NULL. Decimal places for display formatting of
+#'   numeric columns in the rendered table (per-arm summaries, Diff,
+#'   effect estimate CI, bias-corrected CI).  Default 2.  When set, the
+#'   formatted strings in \code{boot_results$FSsg_tab} are parsed back to
+#'   numeric and re-formatted at the requested precision; this works
+#'   reliably as long as the construction-time precision (default 4
+#'   decimals; controlled by \code{digits} in
+#'   \code{forestsearch_bootstrap_dofuture}) is at least as high as
+#'   \code{digits} requested here.  Set \code{digits = NULL} to display
+#'   the construction-time strings unchanged.  The \code{n} and \code{n1}
+#'   columns are \strong{not} reformatted -- their count-with-percent
+#'   format is preserved as constructed.
 #'
 #' @return List with components:
 #'   \describe{
@@ -34,11 +46,24 @@
 #' \code{\link{sg_tables}} for analogous main analysis tables
 #' \code{\link{summarize_bootstrap_subgroups}} for subgroup stability analysis
 #'
+#' @examples
+#' \dontrun{
+#' library(survival)
+#' df <- survival::gbsg
+#' df$grade3 <- as.integer(df$grade == "3")
+#' fs <- forestsearch(df,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+#' fs_bc <- forestsearch_bootstrap_dofuture(fs, nb_boots = 100)
+#' summaries <- summarize_bootstrap_results(fs$sg.harm, fs_bc)
+#' summaries$table
+#' }
 #' @export
 summarize_bootstrap_results <- function(sgharm,
                                         boot_results,
                                         create_plots = FALSE,
-                                        est.scale = "hr") {
+                                        est.scale = "hr",
+                                        digits = 2) {
 
   # ===========================================================================
   # SECTION 1: EXTRACT COMPONENTS
@@ -48,6 +73,17 @@ summarize_bootstrap_results <- function(sgharm,
   results <- boot_results$results
   H_estimates <- boot_results$H_estimates
   Hc_estimates <- boot_results$Hc_estimates
+
+  # ---------------------------------------------------------------------------
+  # Display-time digit reformatting (Reading C of the Feb 2026 design).
+  # FSsg_tab arrives with construction-time precision baked in (typically
+  # 4 decimals).  We parse the formatted strings back to numerics and
+  # reformat at the requested `digits`, which must be <= construction
+  # precision to avoid spurious zero-padding.
+  # ---------------------------------------------------------------------------
+  if (!is.null(digits) && (is.data.frame(FSsg_tab) || is.matrix(FSsg_tab))) {
+    FSsg_tab <- .reformat_FSsg_tab_digits(FSsg_tab, digits = digits)
+  }
 
   # ===========================================================================
   # SECTION 2: CALCULATE BOOTSTRAP SUCCESS METRICS
@@ -115,12 +151,27 @@ summarize_bootstrap_results <- function(sgharm,
   # SECTION 4: CREATE FORMATTED TABLE WITH SUBGROUP FOOTNOTE
   # ===========================================================================
 
+  # Auto-detect effect measure from FSsg_tab column names
+  # GLM tables have "IRR (95% CI)" or "OR (95% CI)" etc.; survival has "HR (95% CI)"
+  effect_label <- "HR"
+  if (is.data.frame(FSsg_tab) || is.matrix(FSsg_tab)) {
+    tab_cols <- colnames(FSsg_tab)
+    eff_match <- regmatches(
+      tab_cols,
+      regexpr("^(IRR|OR|RR|RD|IRD|MD|HR)", tab_cols)
+    )
+    eff_match <- eff_match[nchar(eff_match) > 0]
+    if (length(eff_match) > 0 && eff_match[1] != "HR") {
+      effect_label <- eff_match[1]
+    }
+  }
+
   formatted_table <- format_bootstrap_table(
     FSsg_tab = FSsg_tab,
     nb_boots = nb_boots,
     est.scale = est.scale,
     boot_success_rate = boot_success_rate,
-    sg_definition = sg_definition  # NEW: pass subgroup definition
+    sg_definition = sg_definition
   )
 
   # ===========================================================================
@@ -234,7 +285,8 @@ summarize_bootstrap_results <- function(sgharm,
         nb_boots = nb_boots,
         results = results,
         H_estimates = H_estimates,
-        Hc_estimates = Hc_estimates
+        Hc_estimates = Hc_estimates,
+        effect_label = effect_label
       )
     }, error = function(e) {
       warning("Could not create gt diagnostics table: ", e$message)
@@ -253,7 +305,8 @@ summarize_bootstrap_results <- function(sgharm,
         results = results,
         H_estimates = H_estimates,
         Hc_estimates = Hc_estimates,
-        overall_timing = overall_timing
+        overall_timing = overall_timing,
+        effect_label = effect_label
       )
     }, error = function(e) {
       warning("Could not create diagnostic plots: ", e$message)
@@ -376,4 +429,138 @@ summarize_bootstrap_results <- function(sgharm,
   }
 
   invisible(output)
+}
+
+
+# =============================================================================
+# INTERNAL HELPERS
+# =============================================================================
+
+#' Re-format Numeric Cells in FSsg_tab at a Lower Precision
+#'
+#' Parses formatted-string cells in \code{FSsg_tab} back to numerics and
+#' re-formats at the requested \code{digits}.  Designed for display-time
+#' precision control in \code{\link{summarize_bootstrap_results}}.
+#'
+#' Cells are identified by column name pattern, not content sniffing.
+#' Three cell formats are recognized:
+#' \enumerate{
+#'   \item Single value with optional sign and percent suffix (Mean(C)/(T),
+#'     Rate(C)/(T), Diff): \code{"-56.4321"}, \code{"+12.5"}, \code{"42.1\%"}.
+#'   \item Three-value CI (effect-measure column,
+#'     \code{"\{measure\} (95\% CI)"}): \code{"82.7831 (14.8067, 150.7585)"}.
+#'   \item Three-value CI without space (bias-corrected
+#'     \code{"\{measure\}*"} column): \code{"72.4500 (-61.5400,206.4400)"}.
+#' }
+#'
+#' Columns NOT touched: \code{Subgroup} (text label), \code{n} and
+#' \code{n1} (count-with-percent format like \code{"87 (8.0\%)"} —
+#' different semantics).
+#'
+#' Robustness contract: cells that don't match any expected pattern are
+#' returned unchanged.  Construction-time precision must be at least
+#' \code{digits} for the reformat to be informative; if construction was
+#' at lower precision, this function will zero-pad to \code{digits} but
+#' cannot recover information.
+#'
+#' @param tab Data frame or matrix with formatted-string cells.
+#' @param digits Integer.  Decimal places.
+#' @return Reformatted \code{tab}, same shape.
+#' @keywords internal
+.reformat_FSsg_tab_digits <- function(tab, digits) {
+
+  if (is.matrix(tab)) tab <- as.data.frame(tab, stringsAsFactors = FALSE)
+
+  col_names <- colnames(tab)
+
+  # Column-name patterns — match on what should be reformatted.  Excludes
+  # Subgroup, n, n1.  Effect-measure columns are recognized by the
+  # measure mnemonic followed by either " (" (CI form) or "*" (bias-
+  # corrected form).
+  reformat_cols <- character(0)
+
+  # Single-value columns (arm summaries and Diff)
+  reformat_cols <- c(
+    reformat_cols,
+    grep("^Rate\\(C\\)$|^Rate\\(T\\)$|^Mean\\(C\\)$|^Mean\\(T\\)$|^Diff$",
+         col_names, value = TRUE)
+  )
+
+  # CI columns: HR (95% CI), MD (95% CI), etc.
+  reformat_cols <- c(
+    reformat_cols,
+    grep("^(HR|IRR|OR|RR|RD|IRD|MD)\\s*\\(.*CI\\)$", col_names, value = TRUE)
+  )
+
+  # Bias-corrected CI columns: HR*, MD*, etc.
+  reformat_cols <- c(
+    reformat_cols,
+    grep("^(HR|IRR|OR|RR|RD|IRD|MD)\\*$", col_names, value = TRUE)
+  )
+
+  reformat_cols <- unique(reformat_cols)
+
+  if (length(reformat_cols) == 0) return(tab)
+
+  # Format strings
+  fmt_val        <- paste0("%.", digits, "f")
+  fmt_signed     <- paste0("%+.", digits, "f")
+  fmt_pct        <- paste0("%.", digits, "f%%")
+  fmt_signed_pct <- paste0("%+.", digits, "f%%")
+  fmt_ci_space   <- paste0(fmt_val, " (", fmt_val, ", ", fmt_val, ")")
+  fmt_ci_nospace <- paste0(fmt_val, " (", fmt_val, ",", fmt_val, ")")
+
+  # Regex patterns — anchored, well-defined
+  re_single        <- "^([+-]?[0-9]+(?:\\.[0-9]+)?)$"
+  re_single_pct    <- "^([+-]?[0-9]+(?:\\.[0-9]+)?)%$"
+  re_ci            <- paste0("^([+-]?[0-9]+(?:\\.[0-9]+)?)\\s*\\(",
+                             "([+-]?[0-9]+(?:\\.[0-9]+)?)\\s*,\\s*",
+                             "([+-]?[0-9]+(?:\\.[0-9]+)?)\\)$")
+
+  reformat_one <- function(cell) {
+    if (is.na(cell) || !nzchar(cell)) return(cell)
+    s <- trimws(cell)
+
+    # CI pattern
+    m <- regmatches(s, regexec(re_ci, s))[[1]]
+    if (length(m) == 4) {
+      vals <- as.numeric(m[2:4])
+      if (all(is.finite(vals))) {
+        # Detect whether original had a space after comma (used to
+        # preserve construction style; falls back to space if ambiguous)
+        has_space <- grepl(",\\s+[-+0-9]", s)
+        fmt <- if (has_space) fmt_ci_space else fmt_ci_nospace
+        return(sprintf(fmt, vals[1], vals[2], vals[3]))
+      }
+    }
+
+    # Percent single value
+    m <- regmatches(s, regexec(re_single_pct, s))[[1]]
+    if (length(m) == 2) {
+      v <- as.numeric(m[2])
+      if (is.finite(v)) {
+        fmt <- if (substr(m[2], 1L, 1L) == "+") fmt_signed_pct else fmt_pct
+        return(sprintf(fmt, v))
+      }
+    }
+
+    # Plain single value
+    m <- regmatches(s, regexec(re_single, s))[[1]]
+    if (length(m) == 2) {
+      v <- as.numeric(m[2])
+      if (is.finite(v)) {
+        fmt <- if (substr(m[2], 1L, 1L) == "+") fmt_signed else fmt_val
+        return(sprintf(fmt, v))
+      }
+    }
+
+    # Unknown pattern — leave unchanged
+    cell
+  }
+
+  for (cn in reformat_cols) {
+    tab[[cn]] <- vapply(tab[[cn]], reformat_one, character(1L))
+  }
+
+  tab
 }

@@ -32,10 +32,23 @@
 #'   }
 #'   If \code{use_gt = FALSE}, returns equivalent data.frames.
 #'
+#' @examples
+#' \dontrun{
+#' # Run K-fold CV
+#' cv_results <- forestsearch_Kfold(fs.est = fs_result, Kfolds = 10)
+#'
+#' # Get detailed output
+#' kfold_out <- forestsearch_KfoldOut(cv_results, outall = TRUE)
+#'
+#' # Create summary tables
+#' cv_tables <- cv_summary_tables(kfold_out)
+#' cv_tables$combined_table
+#' cv_tables$metrics_table
+#' }
+#'
 #' @seealso \code{\link{cv_metrics_tables}} for formatting \code{forestsearch_tenfold()} results
 #'
-#' @importFrom gt gt tab_header tab_spanner cols_label fmt_number tab_style
-#'   cell_text cells_column_labels tab_footnote cells_body tab_options md px
+#' @importFrom gt gt tab_header tab_spanner cols_label fmt_number tab_style cell_text cells_column_labels tab_footnote cells_body tab_options md px
 #' @export
 cv_summary_tables <- function(
     kfold_out,
@@ -233,7 +246,7 @@ cv_summary_tables <- function(
         title = gt::md("**Cross-Validation Metrics**"),
         subtitle = "Agreement and subgroup finding rates (%)"
       ) |>
-      gt::fmt_number(columns = "Value", decimals = 1) |>
+      gt::fmt_number(columns = "Value", decimals = digits) |>
       gt::cols_label(
         Metric = "Metric",
         Value = "Value (%)"
@@ -298,10 +311,31 @@ cv_summary_tables <- function(
 #'   If \code{include_raw = TRUE}, also includes \code{sens_out} and \code{find_out}
 #'   matrices in the returned list.
 #'
+#' @examples
+#' \dontrun{
+#' # After running forestsearch_tenfold
+#' tenfold_results <- forestsearch_tenfold(
+#'   fs.est = fs_result,
+#'   sims = 100,
+#'   Kfolds = 10
+#' )
+#'
+#' # Create combined metrics table
+#' cv_tables <- cv_metrics_tables(tenfold_results)
+#' cv_tables
+#'
+#' # Create separate tables
+#' cv_tables <- cv_metrics_tables(tenfold_results, table_style = "separate")
+#' cv_tables$agreement_table
+#' cv_tables$finding_table
+#'
+#' # Minimal one-row summary
+#' cv_metrics_tables(tenfold_results, table_style = "minimal")
+#' }
+#'
 #' @seealso \code{\link{cv_summary_tables}} for formatting \code{forestsearch_KfoldOut(outall=TRUE)} results
 #'
-#' @importFrom gt gt tab_header tab_spanner cols_label fmt_number tab_style
-#'   cell_text cells_column_labels tab_footnote cells_body tab_options
+#' @importFrom gt gt tab_header tab_spanner cols_label fmt_number tab_style cell_text cells_column_labels tab_footnote cells_body tab_options
 #' @export
 cv_metrics_tables <- function(
     cv_result,
@@ -602,9 +636,15 @@ cv_metrics_tables <- function(
 #' @param include_finding Logical. Include subgroup finding rate. Default: TRUE.
 #' @param include_agreement Logical
 #'
-#' @keywords internal
 #' @return Character string with formatted CV metrics.
 #'
+#' @examples
+#' \dontrun{
+#' cv_text <- cv_summary_text(tenfold_results)
+#' # Returns: "CV found = 95%, Agree(+,-) = 88%, 92%"
+#' }
+#'
+#' @export
 cv_summary_text <- function(
     cv_result,
     est.scale = "hr",
@@ -657,9 +697,21 @@ cv_summary_text <- function(
 #' @param digits Integer. Decimal places. Default: 1.
 #' @param use_gt Logical. Return gt table if TRUE. Default: TRUE.
 #'
-#' @keywords internal
 #' @return A gt table or data.frame comparing CV results across configurations.
 #'
+#' @examples
+#' \dontrun{
+#' # Compare CV results from different configurations
+#' cv_comparison <- cv_compare_results(
+#'   cv_list = list(
+#'     "maxk=1" = cv_maxk1,
+#'     "maxk=2" = cv_maxk2,
+#'     "maxk=3" = cv_maxk3
+#'   )
+#' )
+#' }
+#'
+#' @export
 cv_compare_results <- function(
     cv_list,
     metrics = c("all", "finding", "agreement"),

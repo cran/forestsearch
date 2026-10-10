@@ -112,6 +112,55 @@
 #'   \item \code{fs.est$df.est$treat.recommend} - Subgroup membership indicator
 #' }
 #'
+#' @examples
+#' \dontrun{
+#' # Mode 1: Using ForestSearch result (auto-creates Qrecommend/Brecommend)
+#' # This will use labels "Qrecommend == 1" and "Brecommend == 1"
+#' plot_km_band_forestsearch(
+#'   df = df.analysis,
+#'   fs.est = fs_result,
+#'   outcome.name = "os_months",
+#'   event.name = "os_event",
+#'   treat.name = "treatment"
+#' )
+#'
+#' # Mode 1 with additional reference subgroups (auto-creates columns)
+#' ref_sgs <- list(
+#'   age_young = list(subset_expr = "age < 65", color = "brown"),
+#'   age_old = list(subset_expr = "age >= 65", color = "grey")
+#' )
+#'
+#' plot_km_band_forestsearch(
+#'   df = df.analysis,
+#'   fs.est = fs_result,
+#'   ref_subgroups = ref_sgs,
+#'   outcome.name = "os_months",
+#'   event.name = "os_event",
+#'   treat.name = "treatment",
+#'   tau_add = 60,
+#'   by_risk = 6
+#' )
+#'
+#' # Mode 2: Using pre-defined subgroup columns with expression labels
+#' # Note: sg_labels must be valid R expressions that evaluate against df
+#' df.analysis$age_lt65 <- ifelse(df.analysis$age < 65, 1, 0)
+#' df.analysis$age_ge65 <- ifelse(df.analysis$age >= 65, 1, 0)
+#' df.analysis$Qrecommend <- ifelse(df.analysis$er <= 0, 1, 0)
+#' df.analysis$Brecommend <- ifelse(df.analysis$er > 0, 1, 0)
+#'
+#' plot_km_band_forestsearch(
+#'   df = df.analysis,
+#'   sg_cols = c("age_lt65", "age_ge65", "Qrecommend", "Brecommend"),
+#'   sg_labels = c("age < 65", "age >= 65", "er <= 0", "er > 0"),
+#'   sg_colors = c("brown", "grey", "blue", "red"),
+#'   outcome.name = "os_months",
+#'   event.name = "os_event",
+#'   treat.name = "treatment",
+#'   tau_add = 60,
+#'   by_risk = 6
+#' )
+#' }
+#'
 #' @seealso
 #' \code{\link{forestsearch}} for running the subgroup analysis
 #' \code{\link{plot_sg_weighted_km}} for weighted KM plots
@@ -119,7 +168,7 @@
 #'
 #' @note
 #' This function requires the \pkg{weightedsurv} package, which can be
-#' installed from GitHub: \code{devtools::install_github("larry-leon/weightedsurv")}
+#' installed from CRAN: \code{install.packages("weightedsurv")}
 #'
 #' @importFrom graphics legend
 #' @export
@@ -290,7 +339,7 @@ plot_km_band_forestsearch <- function(
   # Check that weightedsurv is available
   if (!requireNamespace("weightedsurv", quietly = TRUE)) {
     stop("Package 'weightedsurv' is required. ",
-         "Install with: devtools::install_github('larry-leon/weightedsurv')")
+         "Install with: install.packages(\"weightedsurv\")")
   }
 
   # The function expects subgroup columns to exist in df with specific names
@@ -746,9 +795,22 @@ create_fs_subgroup_indicators <- function(df, fs.est,
 #' @param ... Additional arguments passed to \code{plot_km_band_forestsearch()},
 #'   such as \code{ref_subgroups}, \code{tau_add}, \code{by_risk}, etc.
 #'
-#' @keywords internal
 #' @return Invisibly returns the plot result.
+#' @export
 #'
+#' @examples
+#' \dontrun{
+#' # Quick plot with minimal configuration
+#' quick_km_band_plot(df_analysis, fs_result, "os_months", "os_event", "treat")
+#'
+#' # With reference subgroups
+#' ref_sgs <- list(
+#'   age_young = list(subset_expr = "age < 65", color = "brown"),
+#'   age_old = list(subset_expr = "age >= 65", color = "grey")
+#' )
+#' quick_km_band_plot(df_analysis, fs_result, "os_months", "os_event", "treat",
+#'                    ref_subgroups = ref_sgs, tau_add = 60)
+#' }
 quick_km_band_plot <- function(df, fs.est, outcome.name, event.name,
                                treat.name, ...) {
   plot_km_band_forestsearch(

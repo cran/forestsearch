@@ -20,3 +20,34 @@ Provides a detailed summary of a ForestSearch analysis including input
 parameters, variable selection results, consistency evaluation, and
 the selected subgroup with key metrics.
 }
+\section{Post-selection inference}{
+
+Carries the same block as \code{\link[=print.forestsearch]{print.forestsearch()}} (see there) and adds the
+log-scale standard errors (field, field-s with the naive complement SE
+beside it, and IJ two-term), the three largest re-selection frequencies
+with their labels, and \code{p_hat_sum} over the re-selection family.  Absent MR
+results, the output is unchanged.
+
+When the fit carries the membership-agreement diagnostics -- that is, under
+\code{mr_inference_args = list(field_recovery = TRUE)} -- one further line
+reports \code{sens_H}, the mean share of the identified subgroup that the field's
+re-selections retain, beside \eqn{\hat p}.  The pair separates two very
+different low-\eqn{\hat p} situations: \eqn{\hat p} counts \emph{exact}
+re-selections of \eqn{\hat H}, so a low \eqn{\hat p} with a high \code{sens_H}
+says the draws re-selected near-twins of \eqn{\hat H}, while a low
+\eqn{\hat p} with a low \code{sens_H} says they re-selected unrelated regions.
+Like \eqn{\hat p} it is descriptive and no construction reads it, and it
+answers a narrower question than a bootstrap or cross-validation recovery
+rate: re-selection within the fixed candidate family under perturbation, not
+re-discovery from resampled data.  The line is absent -- and the rest of the
+output byte-identical -- when the diagnostics were not requested.
+\code{\link[=print.forestsearch]{print.forestsearch()}} does not report it.
+}
+
+\examples{
+\dontrun{
+fs <- forestsearch(df.analysis = mydata, ...)
+summary(fs)
+}
+
+}

@@ -37,12 +37,39 @@
 #' @param cens_params Named list of user-supplied censoring parameters.
 #' @param df_super Super-population data frame; receives
 #'   \code{lin_pred_cens_0} and \code{lin_pred_cens_1} columns.
-#' @param select_censoring Logical. If \code{TRUE} (default), fits the
-#'   censoring distribution from observed data using AIC-based \code{survreg}
-#'   model comparison. If \code{FALSE}, uses \code{cens_params} directly with
-#'   no model fitting. See \code{\link{generate_aft_dgm_flex}} for the required
-#'   \code{cens_params} structure under each combination of
-#'   \code{select_censoring} and \code{cens_type}.
+#' @param select_censoring Logical. Selects among three censoring modes:
+#' \describe{
+#'   \item{AIC selection}{\code{select_censoring = TRUE} (default): fits
+#'     the censoring distribution from observed data via AIC comparison
+#'     among four \code{survreg} candidates -- Weibull and LogNormal,
+#'     each with covariates and intercept-only.}
+#'   \item{Analytical}{\code{select_censoring = FALSE} \emph{and}
+#'     \code{cens_params} supplies the required analytical parameters
+#'     (\code{mu}+\code{tau} for Weibull/LogNormal; \code{min}+\code{max}
+#'     for uniform with optional defaulting): no fitting; uses
+#'     \code{cens_params} directly; covariate contribution is zero.}
+#'   \item{Force-fit}{\code{select_censoring = FALSE} \emph{and}
+#'     \code{cens_params} does \strong{not} supply analytical parameters
+#'     (Weibull/LogNormal only): fits the chosen distribution with formula
+#'     determined by \code{cens_intercept_only} and the censoring covariate
+#'     vectors -- no AIC arbitration, no fallback to intercept-only.}
+#' }
+#' @param cens_intercept_only Logical. Only honored in force-fit mode
+#'   (\code{select_censoring = FALSE} with empty \code{cens_params}).
+#'   If \code{TRUE}, fits \code{Surv(y, 1 - event) ~ 1} (no treat, no
+#'   covariates).  If \code{FALSE} (default), formula is determined by
+#'   the censoring covariate vectors:
+#'   \itemize{
+#'     \item Both \code{*_cens = NULL} (default): inherit from outcome model;
+#'           formula is \code{~ treat + zcens_<outcome covariates>}.
+#'     \item Both \code{*_cens = character(0)}: treat-only; formula is
+#'           \code{~ treat}.
+#'     \item One or both \code{*_cens} non-empty: formula is
+#'           \code{~ treat + zcens_<supplied covariates>}.
+#'   }
+#'   Setting \code{cens_intercept_only = TRUE} with
+#'   \code{select_censoring = TRUE} or with analytical \code{cens_params}
+#'   raises an error.
 #' @param verbose Logical. If \code{TRUE} (default), prints the censoring
 #'   model comparison table and recommendation. Set to \code{FALSE} to
 #'   suppress all censoring model selection output.
@@ -62,24 +89,46 @@ prepare_censoring_model <- function(df_work,
                                     cens_type,
                                     cens_params,
                                     df_super,
-                                    select_censoring = TRUE,
-                                    verbose = TRUE) {
+                                    select_censoring    = TRUE,
+                                    cens_intercept_only = FALSE,
+                                    verbose             = TRUE) {
 
   cens_model <- NULL
 
+  # Validate cens_intercept_only combinations
+  if (cens_intercept_only && select_censoring) {
+    stop("cens_intercept_only = TRUE requires select_censoring = FALSE ",
+         "(force-fit mode). For an unconditional model in AIC mode, the ",
+         "comparison already includes Weibull0 / LogNormal0 candidates.",
+         call. = FALSE)
+  }
+
   # ===========================================================================
-  # PATH A: select_censoring = FALSE
-  # Use caller-supplied cens_params directly; no model fitting.
+  # !select_censoring : analytical or force-fit (3-way dispatch)
+  # ===========================================================================
+  # The old PATH A errored when cens_params lacked mu/tau.  The new dispatch:
+  #   uniform                     -> analytical (with optional defaulting)
+  #   weibull/lognormal + mu+tau  -> analytical (PATH A, unchanged)
+  #   weibull/lognormal + neither -> force-fit  (PATH C, NEW)
+  # Partial cens_params (one of mu/tau but not both) is treated as a user
+  # error and raises a clear message.
   # ===========================================================================
 
   if (!select_censoring) {
 
     if (cens_type == "uniform") {
       # -----------------------------------------------------------------------
-      # Uniform: use supplied min/max, defaulting to data range with a message.
-      # simulate_from_dgm() does not read lin_pred_cens for the uniform branch,
-      # but columns are added for structural consistency.
+      # PATH A (uniform): use supplied min/max, defaulting to data range with
+      # a message.  simulate_from_dgm() does not read lin_pred_cens for the
+      # uniform branch, but columns are added for structural consistency.
       # -----------------------------------------------------------------------
+      if (cens_intercept_only) {
+        stop("cens_intercept_only = TRUE is incompatible with cens_type = ",
+             "'uniform'. The uniform censoring distribution has no fitted ",
+             "covariates; intercept-only is implied by construction.",
+             call. = FALSE)
+      }
+
       if (is.null(cens_params$min)) {
         cens_params$min <- min(df_work$y, na.rm = TRUE) * 0.5
         message("select_censoring = FALSE: cens_params$min not supplied; ",
@@ -100,21 +149,29 @@ prepare_censoring_model <- function(df_work,
       df_super$lin_pred_cens_0 <- 0
       df_super$lin_pred_cens_1 <- 0
 
-    } else {
-      # -----------------------------------------------------------------------
-      # Weibull / lognormal: require mu + tau from cens_params.
+      return(list(cens_model = cens_model, df_super = df_super))
+    }
+
+    # -------------------------------------------------------------------------
+    # Weibull / lognormal: dispatch on cens_params completeness.
+    # -------------------------------------------------------------------------
+    has_mu  <- !is.null(cens_params$mu)
+    has_tau <- !is.null(cens_params$tau)
+
+    if (has_mu && has_tau) {
+      # =======================================================================
+      # PATH A (analytical, Weibull/LogNormal): use cens_params directly.
       # Intercept-only model => covariate contribution gamma'X = 0.
       # simulate_from_dgm() will compute:
       #   logC = mu_cens + cens_adjust + tau*epsilon + 0    (CORRECT)
       # Storing mu here instead of 0 would double-count mu_cens.
-      # -----------------------------------------------------------------------
-      if (is.null(cens_params$mu) || is.null(cens_params$tau)) {
-        stop(
-          "When select_censoring = FALSE and cens_type = '", cens_type, "', ",
-          "cens_params must supply both 'mu' (log-scale location) and ",
-          "'tau' (scale). Elements received: ",
-          paste(names(cens_params), collapse = ", ")
-        )
+      # =======================================================================
+      if (cens_intercept_only) {
+        stop("cens_intercept_only = TRUE is incompatible with analytical ",
+             "cens_params (mu, tau supplied).  Choose one: force-fit ",
+             "intercept-only (cens_params empty), or analytical with ",
+             "explicit mu/tau (cens_intercept_only = FALSE).",
+             call. = FALSE)
       }
 
       cens_dist <- if (!is.null(cens_params$type)) cens_params$type else "weibull"
@@ -131,6 +188,101 @@ prepare_censoring_model <- function(df_work,
       # separately, so lin_pred_cens must hold gamma'X only.
       df_super$lin_pred_cens_0 <- 0
       df_super$lin_pred_cens_1 <- 0
+
+      return(list(cens_model = cens_model, df_super = df_super))
+    }
+
+    if (has_mu || has_tau) {
+      stop("Partial cens_params: must supply BOTH 'mu' and 'tau' for ",
+           "analytical mode, or NEITHER for force-fit mode.  Received: ",
+           paste(names(cens_params), collapse = ", "),
+           call. = FALSE)
+    }
+
+    # =========================================================================
+    # PATH C (force-fit, NEW): fit a single Weibull or LogNormal censoring
+    # model with formula determined by cens_intercept_only and the *_cens
+    # covariate vectors.  No AIC arbitration; the chosen formula is fitted
+    # and used as-is.
+    # -------------------------------------------------------------------------
+    # Formula mapping (zcens_* columns are produced by prepare_working_dataset):
+    #   cens_intercept_only = TRUE        -> ~ 1
+    #   length(zcens_*) >= 1              -> ~ treat + zcens_*    (custom or inherited)
+    #   length(zcens_*) == 0              -> ~ treat              (treat-only)
+    # =========================================================================
+
+    if (cens_intercept_only) {
+      cens_formula  <- Surv(y, 1 - event) ~ 1
+      formula_descr <- "~ 1 (intercept-only)"
+    } else {
+      covariate_cols <- grep("^zcens_", names(df_work), value = TRUE)
+
+      if (length(covariate_cols) >= 1L) {
+        cens_covars   <- c("treat", covariate_cols)
+        cens_formula  <- reformulate(cens_covars,
+                                     response = "Surv(y, 1 - event)")
+        formula_descr <- sprintf("~ treat + %d covariate(s)",
+                                 length(covariate_cols))
+      } else {
+        cens_formula  <- Surv(y, 1 - event) ~ treat
+        formula_descr <- "~ treat (treat-only)"
+      }
+    }
+
+    if (verbose) {
+      message("select_censoring = FALSE, force-fit: fitting '", cens_type,
+              "' censoring model with formula ", formula_descr)
+    }
+
+    fit_cens <- survreg(cens_formula, data = df_work, dist = cens_type)
+
+    mu_cens    <- coef(fit_cens)[1]    # intercept on log-time scale
+    tau_cens   <- fit_cens$scale
+    gamma_cens <- coef(fit_cens)[-1]   # covariate coefficients (no intercept);
+                                       # length 0 when formula is ~ 1
+
+    cens_model <- list(
+      mu    = mu_cens,
+      tau   = tau_cens,
+      gamma = gamma_cens,
+      type  = cens_type
+    )
+
+    # -------------------------------------------------------------------------
+    # Counterfactual linear predictors (covariate-only, intercept excluded).
+    # See PATH B comment block for why mu_cens is subtracted from predict()
+    # output.  When cens_intercept_only = TRUE there are no covariates, so
+    # the contribution is identically zero.
+    # -------------------------------------------------------------------------
+    if (cens_intercept_only) {
+      df_super$lin_pred_cens_0 <- 0
+      df_super$lin_pred_cens_1 <- 0
+    } else {
+      newdata       <- df_super
+      newdata$treat <- 0
+      if (!all(newdata$treat == 0))
+        stop("Error in creating counterfactual: could not set treat := 0")
+      df_super$lin_pred_cens_0 <- predict(fit_cens, newdata = newdata,
+                                          type = "linear") - mu_cens
+
+      newdata       <- df_super
+      newdata$treat <- 1
+      if (!all(newdata$treat == 1))
+        stop("Error in creating counterfactual: could not set treat := 1")
+      df_super$lin_pred_cens_1 <- predict(fit_cens, newdata = newdata,
+                                          type = "linear") - mu_cens
+
+      n_expected <- nrow(df_super)
+      if (length(df_super$lin_pred_cens_0) != n_expected ||
+          length(df_super$lin_pred_cens_1) != n_expected) {
+        stop(sprintf(
+          paste("prepare_censoring_model (force-fit): lin_pred_cens has %d",
+                "elements but df_super has %d rows. predict() likely fell",
+                "back to the training data."),
+          length(df_super$lin_pred_cens_0), n_expected),
+          call. = FALSE
+        )
+      }
     }
 
     return(list(cens_model = cens_model, df_super = df_super))
@@ -145,16 +297,20 @@ prepare_censoring_model <- function(df_work,
 
     covariate_cols <- grep("^zcens_", names(df_work), value = TRUE)
 
-    if (length(covariate_cols) >= 1) {
-      X_cens <- as.matrix(df_work[, c("treat", covariate_cols)])
+    # Build formula from column names so predict() can resolve covariates
+    # in newdata (df_super).  Using ~ X_cens with a pre-built matrix causes
+    # predict.survreg() to silently fall back to the training data when
+    # newdata lacks the matrix variable, producing nrow(df_work) predictions
+    # instead of nrow(df_super).
+    cens_covars <- if (length(covariate_cols) >= 1) {
+      c("treat", covariate_cols)
     } else {
-      X_cens <- as.matrix(df_work[, c("treat")])
+      "treat"
     }
+    cens_formula <- reformulate(cens_covars, response = "Surv(y, 1 - event)")
 
-    fit_cens1 <- survreg(Surv(y, 1 - event) ~ X_cens,
-                         data = df_work, dist = "weibull")
-    fit_cens2 <- survreg(Surv(y, 1 - event) ~ X_cens,
-                         data = df_work, dist = "lognormal")
+    fit_cens1 <- survreg(cens_formula, data = df_work, dist = "weibull")
+    fit_cens2 <- survreg(cens_formula, data = df_work, dist = "lognormal")
     fit_cens3 <- survreg(Surv(y, 1 - event) ~ 1,
                          data = df_work, dist = "weibull")
     fit_cens4 <- survreg(Surv(y, 1 - event) ~ 1,
@@ -180,7 +336,7 @@ prepare_censoring_model <- function(df_work,
     )
 
     # -------------------------------------------------------------------------
-    # KEY FIX: store COVARIATE-ONLY contribution (gamma'X), intercept excluded.
+    # Store COVARIATE-ONLY contribution (gamma'X), intercept excluded.
     #
     # predict(survreg, type = "linear") returns the FULL linear predictor:
     #   mu_cens + gamma_cens' X
@@ -212,6 +368,20 @@ prepare_censoring_model <- function(df_work,
       stop("Error in creating counterfactual: could not set treat := 1")
     df_super$lin_pred_cens_1 <- predict(fit_cens, newdata = newdata,
                                         type = "linear") - mu_cens
+
+    # Defensive dimension check — catches predict() fallback to training data
+    n_expected <- nrow(df_super)
+    if (length(df_super$lin_pred_cens_0) != n_expected ||
+        length(df_super$lin_pred_cens_1) != n_expected) {
+      stop(sprintf(
+        paste("prepare_censoring_model: lin_pred_cens has %d elements",
+              "but df_super has %d rows. predict() likely fell back to",
+              "the training data. Ensure the censoring formula uses",
+              "column names, not a pre-built matrix."),
+        length(df_super$lin_pred_cens_0), n_expected),
+        call. = FALSE
+      )
+    }
 
   } else {
     # -------------------------------------------------------------------------
@@ -988,6 +1158,108 @@ calculate_hazard_ratios <- function(df_super, n_super, mu, tau, model,
   return(hr_results)
 }
 
+
+#' Prepare Censoring Model Parameters
+#' @keywords internal
+prepare_censoring_model_legacy <- function(df_work, cens_type, cens_params,
+                                    df_super) {
+
+  cens_model <- NULL
+
+  if(cens_type != "uniform"){
+    covariate_cols <- grep("^zcens_", names(df_work), value = TRUE)
+
+    # Use reformulate() instead of pre-built matrix to ensure predict()
+    # resolves covariates in newdata (df_super) correctly.
+    cens_covars <- if (length(covariate_cols) >= 1) {
+      c("treat", covariate_cols)
+    } else {
+      "treat"
+    }
+    cens_formula <- reformulate(cens_covars, response = "Surv(y, 1 - event)")
+
+    fit_cens1 <- survreg(cens_formula, data = df_work, dist = "weibull")
+
+    fit_cens2 <- survreg(cens_formula, data = df_work, dist = "lognormal")
+
+    fit_cens3 <- survreg(Surv(y, 1 - event) ~ 1,
+                         data = df_work, dist = "weibull")
+
+    fit_cens4 <- survreg(Surv(y, 1 - event) ~ 1,
+                         data = df_work, dist = "lognormal")
+
+
+    # Compare all 4 models
+    comparison <- compare_multiple_survreg(
+      fit_cens1, fit_cens2, fit_cens3, fit_cens4,
+      model_names = c("Weibull", "LogNormal", "Weibull0", "LogNormal0"),
+      verbose = TRUE
+    )
+
+    # Get the best model
+    fit_cens <- get_best_survreg(comparison)
+
+    mu_cens <- coef(fit_cens)[1]
+    tau_cens <- fit_cens$scale
+    gamma_cens <- coef(fit_cens)[-1]
+
+    # Store censoring parameters
+    cens_model <- list(
+      mu = mu_cens,
+      tau = tau_cens,
+      gamma = gamma_cens,
+      type = c(fit_cens$dist)
+    )
+
+    # Store covariate-only contribution (gamma'X), subtract intercept.
+    # predict(type = "linear") returns mu + gamma'X; we store gamma'X only
+    # because simulate_from_dgm() adds mu separately.
+    newdata <- df_super
+    newdata$treat <- 0
+    if(!all(newdata$treat == 0)) stop("Error in creating counterfactual setting treat := 0")
+    df_super$lin_pred_cens_0  <- predict(fit_cens, newdata = newdata,
+                                         type = "linear") - mu_cens
+
+    newdata <- df_super
+    newdata$treat <- 1
+    if(!all(newdata$treat == 1)) stop("Error in creating counterfactual setting treat := 1")
+    df_super$lin_pred_cens_1  <- predict(fit_cens, newdata = newdata,
+                                         type = "linear") - mu_cens
+
+    # Defensive dimension check
+    n_expected <- nrow(df_super)
+    if (length(df_super$lin_pred_cens_0) != n_expected) {
+      stop(sprintf(
+        paste("prepare_censoring_model_legacy: lin_pred_cens has %d elements",
+              "but df_super has %d rows."),
+        length(df_super$lin_pred_cens_0), n_expected),
+        call. = FALSE
+      )
+    }
+
+
+  } else if (cens_type == "uniform") {
+    # Use provided or default uniform censoring parameters
+    if (is.null(cens_params$min) || is.null(cens_params$max)) {
+      # Default: use range of observed times
+      cens_params$min <- min(df_work$y) * 0.5
+      cens_params$max <- max(df_work$y) * 1.5
+    }
+
+    cens_model <- list(
+      min = cens_params$min,
+      max = cens_params$max,
+      type = "uniform"
+    )
+  }
+
+  return(list(
+    cens_model = cens_model,
+    df_super = df_super
+  ))
+}
+
+
 #' Assemble Final Results Object
 #' @keywords internal
 assemble_results <- function(df_super,
@@ -1005,7 +1277,8 @@ assemble_results <- function(df_super,
                              model,
                              n_super,
                              seed,
-                             spline_info = NULL) {  # DEFAULT = NULL
+                             spline_info = NULL,   # DEFAULT = NULL
+                             df_source   = NULL) { # DEFAULT = NULL (fixed-baseline frame)
 
   # Model parameters
   model_params <- list(
@@ -1040,8 +1313,13 @@ assemble_results <- function(df_super,
   )
 
   # Return comprehensive results
+  # df_source (possibly NULL for objects built by older package versions) is
+  # the fixed-baseline frame: every source patient exactly once, with the same
+  # potential-outcome and censoring linear predictors as df_super.  Consumed
+  # by simulate_from_dgm(baseline = "fixed").
   results <- list(
     df_super = df_super,
+    df_source = df_source,
     model_params = model_params,
     subgroup_info = subgroup_info,
     hazard_ratios = hr_results,
@@ -1067,7 +1345,6 @@ assemble_results <- function(df_super,
 #' @param verbose Logical, whether to print detailed output (default: TRUE)
 #' @param criteria Character vector of criteria to use ("AIC", "BIC", or both)
 #'
-#' @keywords internal
 #' @return A list of class "multi_survreg_comparison" containing:
 #' \describe{
 #'   \item{models}{Named list of input models}
@@ -1079,6 +1356,14 @@ assemble_results <- function(df_super,
 #' }
 #'
 #' @importFrom stats vcov AIC BIC model.frame coef
+#' @export
+#' @examples
+#' \dontrun{
+#' fit1 <- survreg(Surv(time, status) ~ x, dist = "weibull")
+#' fit2 <- survreg(Surv(time, status) ~ x, dist = "lognormal")
+#' comparison <- compare_multiple_survreg(fit1, fit2)
+#' }
+#'
 compare_multiple_survreg <- function(...,
                                      model_names = NULL,
                                      verbose = TRUE,
@@ -1476,8 +1761,17 @@ get_best_survreg <- function(comparison_result) {
 #' @param x A survreg_comparison object
 #' @param ... Additional arguments (not used)
 #'
-#' @keywords internal
 #' @return Invisibly returns the input object
+#' @examples
+#' \dontrun{
+#' library(survival)
+#' df <- survival::gbsg
+#' res <- compare_multiple_survreg(df, outcome.name = "rfstime",
+#'                                  event.name = "status")
+#' print(res)
+#' }
+#' @exportS3Method
+#'
 print.multi_survreg_comparison <- function(x, ...) {
   cat("\nMultiple Survival Model Comparison (", x$n_models, " models)\n", sep = "")
   cat("Models compared: ", paste(x$model_names, collapse = ", "), "\n")

@@ -24,6 +24,7 @@ generate_aft_dgm_flex(
   select_censoring = TRUE,
   cens_type = "weibull",
   cens_params = list(),
+  cens_intercept_only = FALSE,
   seed = 8316951,
   verbose = TRUE,
   standardize = FALSE,
@@ -106,6 +107,23 @@ or treatment dependence): \code{lin_pred_cens_0 = lin_pred_cens_1 = mu}.}
 }
 Default \code{list()}.}
 
+\item{cens_intercept_only}{Logical. Honored only in force-fit mode
+(\code{select_censoring = FALSE} with empty \code{cens_params}).  If
+\code{TRUE}, fits \code{Surv(y, 1 - event) ~ 1} with no treat or
+covariate dependence.  If \code{FALSE} (default), the censoring
+formula is determined by the censoring covariate vectors:
+\itemize{
+\item Both \code{*_cens = NULL} (default): inherit from outcome
+model; formula is \code{~ treat + zcens_<outcome covariates>}.
+\item Both \code{*_cens = character(0)}: treat-only; formula is
+\code{~ treat}.
+\item One or both \code{*_cens} non-empty: formula is
+\code{~ treat + zcens_<supplied covariates>}.
+}
+Setting \code{cens_intercept_only = TRUE} with
+\code{select_censoring = TRUE} or with analytical \code{cens_params}
+(mu, tau supplied) raises an error.}
+
 \item{seed}{Integer random seed for reproducibility. Default is 8316951}
 
 \item{verbose}{Logical indicating whether to print diagnostic information during
@@ -119,14 +137,31 @@ Must include 'var' (variable name), 'knot', 'zeta', and 'log_hrs' (vector of
 length 3). Default NULL (no spline)}
 }
 \value{
-A named list of class \code{aft_dgm} containing:
-\item{data}{Simulated trial data frame with outcome, event, and treatment columns.}
-\item{model_params}{Model parameters used for data generation (coefficients,
-dispersion, spline info if applicable).}
-\item{subgroup_info}{Subgroup definition and membership indicators, if a
-heterogeneous treatment effect was specified.}
-\item{censoring_info}{Censoring model parameters and observed censoring rate.}
-\item{call_args}{Arguments used in the call, for reproducibility.}
+An object of class \code{"aft_dgm_flex"} (a list) with components:
+\describe{
+\item{\code{df_super}}{Data frame containing the super-population,
+including covariates, treatment, counterfactual linear predictors,
+and subgroup indicator \code{flag_harm}.}
+\item{\code{df_source}}{Data frame with every source patient exactly
+once (the prepared trial data), carrying the same counterfactual
+outcome and censoring linear predictors as \code{df_super}.
+Consumed by \code{simulate_from_dgm(baseline = "fixed")} to hold
+baseline covariates -- and hence subgroup composition -- fixed
+across simulated trials.}
+\item{\code{model_params}}{List with AFT parameters \code{mu},
+\code{tau}, \code{gamma}, \code{b0}, the fitted \code{censoring}
+model, and optional \code{spline_info}.}
+\item{\code{subgroup_info}}{List describing the true subgroup:
+\code{vars}, \code{cuts}, \code{definitions}, \code{size},
+\code{proportion}.}
+\item{\code{hazard_ratios}}{List of true HR/AHR/CDE values on the
+super-population (see \code{\link{compute_dgm_cde}}).}
+\item{\code{analysis_vars}}{Named list of column roles
+(continuous, factor, covariates, treatment, outcome, event).}
+\item{\code{model_type}}{\code{"null"} or \code{"alt"}.}
+\item{\code{n_super}}{Super-population size.}
+\item{\code{seed}}{Seed used for super-population generation.}
+}
 }
 \description{
 Creates a data generating mechanism (DGM) for survival data using an Accelerated
@@ -220,7 +255,7 @@ is not multiple separate interactions but one combined indicator.
 }
 }
 \examples{
-\donttest{
+\dontrun{
 df <- survival::gbsg
 dgm <- generate_aft_dgm_flex(
   data            = df,

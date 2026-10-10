@@ -19,7 +19,14 @@ subgroup.search(
   rmin = 5,
   details = FALSE,
   maxk = 2,
-  parallel_workers = parallel::detectCores()
+  parallel_workers = parallel::detectCores(),
+  estimator_fn = NULL,
+  df_analysis = NULL,
+  effect_threshold = NULL,
+  effect_measure = NULL,
+  outcome_type = NULL,
+  adjust_covariates = NULL,
+  disable_effect_floor = FALSE
 )
 }
 \arguments{
@@ -35,13 +42,39 @@ subgroup.search(
 
 \item{n.min}{Integer. Minimum subgroup size.}
 
-\item{d0.min}{Integer. Minimum number of events in control.}
+\item{d0.min}{Integer. Minimum per-arm filter.  For survival and binary
+outcomes: minimum number of \strong{events} in the control arm within the
+candidate subgroup.  Ignored for continuous outcomes (only
+\code{n.min} applies).}
 
-\item{d1.min}{Integer. Minimum number of events in treatment.}
+\item{d1.min}{Integer. Same as \code{d0.min} for the treatment arm.}
 
-\item{hr.threshold}{Numeric. Hazard ratio threshold for subgroup selection.}
+\item{hr.threshold}{Numeric. \code{c1}, the \strong{screening threshold on a
+candidate subgroup's own effect}: a candidate is retained only if its
+fitted effect exceeds this value.
+The scale is the one the caller compares on, and it differs by path.
+On the survival path \code{effect_threshold} is \code{NULL}, so this
+value reaches the comparison unchanged and is compared against the
+fitted hazard ratio on the \strong{natural} scale
+(\code{fit_cox_for_subgroup()} returns \code{exp(coef)}): 1.25 means
+HR >= 1.25, not log(1.25).  On the GLM paths the value arrives already
+on the comparison scale that \code{forestsearch()} resolved from the
+effect measure -- link scale for the ratio measures (OR, RR, IRR),
+identity for RD, IRD and MD -- and is compared against the estimator's
+estimate on that same scale.  This is \code{forestsearch()}'s
+\code{effect.threshold} / \code{hr.threshold}.  It is not the per-split
+threshold (\code{c2}, \code{hr.consistency}) and not the consistency rate
+(\verb{p*}, \code{pconsistency.threshold}); neither is applied here -- this
+function performs the screening stage only.}
 
-\item{max.minutes}{Numeric. Maximum minutes for search.}
+\item{max.minutes}{Numeric. \strong{Currently inert; scheduled for
+deprecation in v0.3.0.} Previously intended as a wall-clock budget for
+the combination search, it is threaded to
+\code{search_combinations_parallel()} and no path consults it, so it has
+no effect on behaviour. Search scope is governed by \code{maxk} and the
+candidate-factor controls. Retained because it is part of a public
+signature; this description now matches \code{\link{forestsearch}}'s,
+which has documented it as inert for some time.}
 
 \item{minp}{Numeric. Minimum prevalence rate for each factor.}
 
@@ -52,6 +85,38 @@ subgroup.search(
 \item{maxk}{Integer. Maximum number of factors in a subgroup.}
 
 \item{parallel_workers}{Integer. Number of parallel workers (default: all available cores).}
+
+\item{estimator_fn}{Closure or \code{NULL}. Effect-estimator closure from
+\code{\link{make_effect_estimator}} for GLM outcomes.  Default \code{NULL}
+(uses Cox model).}
+
+\item{df_analysis}{Data frame or \code{NULL}. Full analysis dataset, passed
+to the GLM estimator for within-subgroup evaluation.}
+
+\item{effect_threshold}{Numeric or \code{NULL}. GLM effect threshold for
+subgroup selection.  Default \code{NULL} (uses \code{hr.threshold}).}
+
+\item{effect_measure}{Character or \code{NULL}. Effect measure name
+(e.g., \code{"OR"}, \code{"HR"}, \code{"RD"}).  Used for display labels
+in the filtering summary.  Default \code{NULL}.}
+
+\item{outcome_type}{Character or \code{NULL}. One of \code{"survival"},
+\code{"binary"}, \code{"continuous"}, \code{"count"}.  Controls
+d0.min/d1.min interpretation: events per arm for binary/survival,
+ignored for continuous.  Default \code{NULL} (inferred from
+\code{estimator_fn} presence).}
+
+\item{adjust_covariates}{Character vector or \code{NULL}. Additional Cox
+model terms (e.g. \code{"strata(x1)"} or \code{"x2"}) used to adjust the
+candidate-search Cox scorer on the survival path.  Referenced columns are
+sourced from \code{df_analysis}.  Ignored on the GLM path.  Default
+\code{NULL} (treatment-only).}
+
+\item{disable_effect_floor}{Logical. When \code{TRUE}, the Status-6 effect
+threshold (\code{hr.threshold}) is not applied, so the full estimable
+candidate family is retained regardless of effect size.  Set by
+\code{\link{forestsearch}} when \code{sg_focus = "maxeff"} so the effect
+maximiser ranges over an unconditional family.  Default \code{FALSE}.}
 }
 \value{
 List with found subgroups, maximum HR, search time, configuration info,
@@ -62,4 +127,14 @@ Searches for subgroups with treatment effect heterogeneity using combinations
 of candidate factors. Evaluates subgroups for minimum prevalence, event counts,
 and hazard ratio threshold. Parallelizes the main search loop.
 }
-\keyword{internal}
+\examples{
+\dontrun{
+library(survival)
+df <- survival::gbsg
+df$grade3 <- as.integer(df$grade == "3")
+Z <- df[, c("age", "meno", "size", "grade3", "nodes", "pgr", "er")]
+res <- subgroup.search(Y = df$rfstime, Event = df$status,
+                       Treat = df$hormon, Z = Z,
+                       hr.threshold = 1.25)
+}
+}

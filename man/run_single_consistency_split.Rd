@@ -4,16 +4,40 @@
 \alias{run_single_consistency_split}
 \title{Run Single Consistency Split}
 \usage{
-run_single_consistency_split(df.x, N.x, hr.consistency, cox_init = 0)
+run_single_consistency_split(
+  df.x,
+  N.x,
+  hr.consistency,
+  cox_init = 0,
+  estimator_fn = NULL,
+  consistency_threshold = NULL,
+  adjust_covariates = NULL
+)
 }
 \arguments{
 \item{df.x}{data.table. Subgroup data with columns Y, Event, Treat.}
 
 \item{N.x}{Integer. Number of observations in subgroup.}
 
-\item{hr.consistency}{Numeric. Minimum HR threshold for consistency.}
+\item{hr.consistency}{Numeric. \code{c2}, \strong{an effect threshold} -- the
+minimum effect required in \emph{each} half of a split for that split to
+count as consistent.  \strong{Not} a proportion and \strong{not} the
+consistency rate.  \code{forestsearch()} calls this
+\code{consistency.threshold} / \code{hr.consistency}.}
 
 \item{cox_init}{Numeric. Initial value for Cox model (log HR).}
+
+\item{estimator_fn}{Closure or \code{NULL}. Effect-estimator closure from
+\code{\link{make_effect_estimator}} for GLM outcomes.  Default \code{NULL}
+(uses Cox model).}
+
+\item{consistency_threshold}{Numeric or \code{NULL}. Threshold for GLM
+consistency evaluation.  Default \code{NULL} (uses \code{hr.consistency}).}
+
+\item{adjust_covariates}{Character vector or \code{NULL}. Additional Cox
+model terms (e.g. \code{"strata(x1)"}) passed to
+\code{\link{get_split_hr_fast}} on the survival path.  Ignored on the
+GLM path.  Default \code{NULL} (unadjusted).}
 }
 \value{
 Numeric. 1 if both splits meet threshold, 0 if not, NA if error.
@@ -22,4 +46,15 @@ Numeric. 1 if both splits meet threshold, 0 if not, NA if error.
 Performs one random 50/50 split and evaluates whether both halves
 meet the HR consistency threshold.
 }
-\keyword{internal}
+\examples{
+\donttest{
+library(data.table)
+set.seed(1)
+df <- data.table(
+  Y     = rexp(100),
+  Event = rbinom(100, 1, 0.55),
+  Treat = rep(0:1, 50)
+)
+run_single_consistency_split(df, N.x = 100, hr.consistency = 1.0)
+}
+}

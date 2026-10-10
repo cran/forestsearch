@@ -26,7 +26,13 @@ plot_subgroup_results_forestplot(
   reference_colors = c("yellow", "powderblue"),
   ci_column_spaces = 20,
   conf.level = 0.95,
-  theme = NULL
+  theme = NULL,
+  outcome_type = NULL,
+  effect_measure = NULL,
+  offset.name = NULL,
+  adjust_covariates = NULL,
+  extreme_ci_cap = 1.5,
+  xlim_method = c("clinical", "data")
 )
 }
 \arguments{
@@ -104,6 +110,37 @@ Used to calculate the z-multiplier as qnorm(1 - (1 - conf.level)/2).}
 \item{theme}{An fs_forest_theme object from \code{create_forest_theme()}.
 Use this to control plot sizing (fonts, row height, CI appearance,
 CV annotation font size). Default: NULL (uses default theme).}
+
+\item{outcome_type}{Character or \code{NULL}. One of \code{"survival"}
+(default), \code{"binary"}, or \code{"continuous"}.  If \code{NULL},
+auto-detected from \code{fs_results$fs.est$outcome_type}.}
+
+\item{effect_measure}{Character or \code{NULL}. Effect measure for GLM
+outcomes (e.g., \code{"OR"}, \code{"RR"}, \code{"IRR"}, \code{"RD"},
+\code{"IRD"}, \code{"MD"}).  Auto-detected from
+\code{fs_results$fs.est$effect_measure} if \code{NULL}.}
+
+\item{offset.name}{Character or \code{NULL}. Follow-up time column for
+rate-based measures (IRR, IRD).}
+
+\item{adjust_covariates}{Character vector or \code{NULL}. Baseline
+covariates to adjust the GLM-row effect models for, matching the
+adjustment used during search/estimation.  When \code{NULL}, resolved
+from \code{fs_results$fs.est$args_call_all$adjust_covariates} so the
+forest-plot CIs share the fit's scale.  Applies to GLM rows only.}
+
+\item{extreme_ci_cap}{Numeric. Multiplier for outlier-resistant axis
+limits when \code{xlim_method = "data"}.  If the most extreme CI bound
+exceeds twice the second-most extreme, the axis limit is capped at
+\code{extreme_ci_cap} times the second-most extreme bound.
+Default 1.5.  Set to \code{Inf} to disable.}
+
+\item{xlim_method}{Character. Method for computing default axis limits
+for GLM measures when \code{xlim} is not user-supplied.
+\code{"clinical"} (default) uses fixed clinically meaningful ranges:
+HR/OR/RR/IRR = (0.25, 4.0), RD/IRD = (-0.50, 0.50), MD = data-driven.
+\code{"data"} computes limits from the actual estimates with
+outlier resistance controlled by \code{extreme_ci_cap}.}
 }
 \value{
 A list containing:
@@ -150,6 +187,59 @@ For \code{est.scale = "1/hr"} (searching for benefit):
 \item Roles are reversed: H becomes the benefit group
 }
 }
+}
+\examples{
+\dontrun{
+# Load ForestSearch results
+load("fs_analysis_results.Rdata")  # Contains fs.est, fs_bc, fs_kfold
+
+# Define subgroups to display
+subgroups <- list(
+  bm_gt1 = list(
+    subset_expr = "BM > 1",
+    name = "BM > 1",
+    type = "reference"
+  ),
+  bm_gt1_size_gt19 = list(
+    subset_expr = "BM > 1 & tmrsize > 19",
+    name = "BM > 1 & Tumor Size > 19",
+    type = "posthoc"
+  )
+)
+
+# Create the forest plot with default theme
+result <- plot_subgroup_results_forestplot(
+  fs_results = list(fs.est = fs.est, fs_bc = fs_bc, fs_kfold = fs_kfold),
+  df_analysis = df_itt,
+  subgroup_list = subgroups,
+  outcome.name = "os_time",
+  event.name = "os_event",
+  treat.name = "combo",
+  E.name = "Experimental+CT",
+  C.name = "CT"
+)
+
+# Create with custom theme for larger plot
+large_theme <- create_forest_theme(
+  base_size = 14,
+  row_padding = c(6, 4),
+  cv_fontsize = 11
+)
+
+result <- plot_subgroup_results_forestplot(
+  fs_results = list(fs.est = fs.est, fs_bc = fs_bc, fs_kfold = fs_kfold),
+  df_analysis = df_itt,
+  subgroup_list = subgroups,
+  outcome.name = "os_time",
+  event.name = "os_event",
+  treat.name = "combo",
+  theme = large_theme
+)
+
+# Display the plot
+render_forestplot(result)
+}
+
 }
 \seealso{
 \code{\link{forestsearch}} for running the subgroup analysis

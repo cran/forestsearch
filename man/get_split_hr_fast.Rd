@@ -4,18 +4,37 @@
 \alias{get_split_hr_fast}
 \title{Fast Cox Model HR Estimation}
 \usage{
-get_split_hr_fast(df, cox_init = 0)
+get_split_hr_fast(df, cox_init = 0, adjust_covariates = NULL)
 }
 \arguments{
 \item{df}{data.frame or data.table with Y, Event, Treat columns.}
 
-\item{cox_init}{Numeric. Initial value for coefficient (default 0).}
+\item{cox_init}{Numeric. Initial value for coefficient (default 0).
+Ignored when \code{adjust_covariates} is supplied (the default coxph
+starting values are used so the init length matches the number of
+model coefficients).}
+
+\item{adjust_covariates}{Character vector or \code{NULL}. Additional terms
+appended to the model right-hand side after \code{Treat}.  Terms are pasted
+verbatim, so \code{"strata(x1)"} produces a stratified Cox model.  The
+referenced columns must be present in \code{df}.  \code{NULL} (default) fits the
+unadjusted \code{Surv(Y, Event) ~ Treat} model.}
 }
 \value{
-Numeric. Estimated hazard ratio, or NA if model fails.
+Numeric. Estimated hazard ratio for \code{Treat}, or NA if model fails.
 }
 \description{
 Fits a minimal Cox model to estimate hazard ratio with reduced overhead.
 Disables robust variance, model matrix storage, and other extras for speed.
 }
-\keyword{internal}
+\examples{
+\donttest{
+set.seed(42)
+df <- data.frame(
+  Y     = rexp(80),
+  Event = rbinom(80, 1, 0.6),
+  Treat = rep(0:1, 40)
+)
+get_split_hr_fast(df)
+}
+}

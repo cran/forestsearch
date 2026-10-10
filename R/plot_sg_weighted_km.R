@@ -72,6 +72,23 @@
 #'
 #' @return Invisibly returns a list with subgroup data frames and counting data
 #'
+#' @examples
+#' \dontrun{
+#' # After running forestsearch - auto-extracts subgroup definition
+#' plot_sg_weighted_km(fs.est = fs)
+#'
+#' # With bootstrap bias-corrected estimates
+#' plot_sg_weighted_km(fs.est = fs, fs_bc = fs_bootstrap)
+#'
+#' # With custom column names
+#' plot_sg_weighted_km(
+#'   fs.est = fs,
+#'   outcome.name = "time_months",
+#'   event.name = "status",
+#'   treat.name = "hormon"
+#' )
+#' }
+#'
 #' @importFrom graphics par title mtext text
 #' @export
 plot_sg_weighted_km <- function(
@@ -230,6 +247,14 @@ plot_sg_weighted_km <- function(
     }
   }
 
+  # Display-only: round the thresholds shown in the title/console label.  The
+  # membership-defining sg.harm is unaffected -- tidy_cut_display() rounds only
+  # numbers that follow a comparison operator, leaving variable names, braces,
+  # and any non-cut label (e.g. "Questionable (H)") unchanged.
+  if (!is.null(sg0_name) && length(sg0_name) > 0L) {
+    sg0_name <- tidy_cut_display(sg0_name, digits = 3L)
+  }
+
   if (is.null(sg1_name)) {
     if (!is.null(sg_definition_label)) {
       sg1_name <- paste0("NOT ", sg_definition_label)
@@ -306,7 +331,7 @@ plot_sg_weighted_km <- function(
 
   if (!requireNamespace("weightedsurv", quietly = TRUE)) {
     stop("Package 'weightedsurv' is required. Install with: ",
-         "devtools::install_github('larry-leon/weightedsurv')")
+         "install.packages(\"weightedsurv\")")
   }
 
   # Use exact same variable names as plot_subgroup()
@@ -453,6 +478,12 @@ plot_sg_weighted_km <- function(
 #'
 #' @return Character string formatted as a figure note, or NULL if no content
 #'
+#' @examples
+#' \dontrun{
+#' km_result <- plot_sg_weighted_km(fs.est = fs)
+#' cat(figure_note(km_result))
+#' }
+#'
 #' @export
 figure_note <- function(x,
                         prefix = "*Note*: ",
@@ -496,9 +527,9 @@ figure_note <- function(x,
 #'
 #' @param x An fs_weighted_km object from plot_sg_weighted_km()
 #' @param ... Additional arguments (unused)
-#' @keywords internal
-#' @return Invisibly returns \code{x}.
+#' @return The input \code{x}, invisibly.
 #'
+#' @export
 print.fs_weighted_km <- function(x, ...) {
   cat("ForestSearch Weighted KM Plot Results\n")
   cat("======================================\n\n")

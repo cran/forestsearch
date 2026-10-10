@@ -1,0 +1,228 @@
+---
+title: "Post-selection inference for an identified survival subgroup"
+subtitle: "A worked GBSG analysis, end to end"
+author: "Larry Leon"
+date: today
+format:
+  html:
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: false
+vignette: >
+  %\VignetteIndexEntry{Post-selection inference for an identified survival subgroup}
+  %\VignetteEngine{quarto::html}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup}
+#| message: false
+#| warning: false
+knitr::opts_chunk$set(comment = "#>", fig.align = "center")
+library(forestsearch)
+library(survival)
+```
+
+`forestsearch()` identifies a subgroup by searching over candidate subgroups,
+so a treatment effect estimated within the identified subgroup is affected by
+the selection: a confidence interval computed as if the subgroup had been
+prespecified tends to under-cover. With `mr_inference = TRUE`,
+`forestsearch()` reports selection-adjusted estimates and bounds for the
+identified subgroup and its complement, based on multiplier resampling of the
+candidate effects. The methodology, its assumptions and its simulation
+operating characteristics are described in León and Anderson (2026); this
+vignette shows how to obtain and read the reported quantities on a public
+dataset.
+
+## The data and the fit
+
+The GBSG node-positive breast-cancer trial shipped with **survival**: 686
+patients, hormonal therapy against none, recurrence-free survival. The
+covariate set is the usual seven; `er` and `pgr` are forced in as candidate
+receptor cutpoints, and continuous covariates get 10 quantile cuts each.
+
+```{r data}
+df.analysis <- gbsg
+df.analysis <- within(df.analysis, {
+  id          <- seq_len(nrow(df.analysis))
+  time_months <- rfstime / 30.4375
+  grade3      <- ifelse(grade == "3", 1, 0)
+})
+confounders.name <- c("age", "meno", "size", "grade3", "nodes", "pgr", "er")
+cat("Sample size:", nrow(df.analysis),
+    "| events:", sum(df.analysis$status),
+    sprintf("(%.1f%%)\n", 100 * mean(df.analysis$status)))
+```
+
+The fit below uses the consistency search without a LASSO/GRF/DINA screen,
+`sg_focus = "effMaxSG"` (the largest subgroup within 20% of the strongest
+observed effect), 200 consistency splits and 500 multiplier draws.
+`mr_inference = TRUE` attaches the post-selection results to the fit as
+`fs$mr_inference`; `field_recovery = TRUE` adds the membership-agreement
+diagnostics used below. Bootstrap and cross-validation are not run here; see
+`vignette("forestsearch")`.
+
+```{r fit}
+t0 <- proc.time()
+fs <- forestsearch(
+  df.analysis,
+  outcome.name = "time_months", event.name = "status",
+  treat.name = "hormon", id.name = "id",
+  confounders.name = confounders.name,
+  is.RCT = TRUE, seedit = 8316951, est.scale = "hr",
+  use_lasso = FALSE, use_grf = FALSE, use_dina = FALSE,
+  conf.cont_jcuts = list(er = 10, pgr = 10), collapse_cuts = TRUE,
+  conf_force = c("er <= 0", "pgr <= 0"),
+  subgroup_method = "consistency", sg_focus = "effMaxSG",
+  selection_rule = "neighborhood", effect_neighborhood = 0.20,
+  mr_inference = TRUE,
+  mr_inference_args = list(draws = 500L, field_recovery = TRUE),
+  n.min = 60, d0.min = 10, d1.min = 10, maxk = 2,
+  hr.threshold = 1.0, hr.consistency = 1.0, pconsistency.threshold = 0.80,
+  fs.splits = 200, max.minutes = 3,
+  details = FALSE, quiet = TRUE, plot.sg = FALSE,
+  parallel_args = list(plan = "sequential"))
+cat(sprintf("fit time: %.1f seconds\n", (proc.time() - t0)[["elapsed"]]))
+```
+
+## The identified subgroup
+
+```{r subgroup}
+cat("Selected subgroup:", paste(fs$sg.harm, collapse = " & "), "\n")
+```
+
+The subgroup is a conjunction of at most `maxk = 2` binary cutpoints drawn from
+the candidate family. `family_status` records how the candidate family was built;
+`"no-front-end"` means the family was enumerated directly rather than proposed
+by a model fitted to the data.
+
+## The reported quantities
+
+`print()` reports them; nothing extra needs to be called.
+
+```{r print}
+print(fs)
+```
+
+- **Identified subgroup:** the one-sided 95% lower bound on the hazard ratio
+  (the *field* construction).
+- **Complement:** the one-sided 95% upper bound on the hazard ratio (*field-s*,
+  the studentized complement field), relevant to a benefit claim.
+- **Both together:** the Bonferroni pair, each side at level 0.025.
+- **Two-sided interval:** the infinitesimal-jackknife (IJ) two-term interval,
+  reported as a secondary summary.
+- **p-hat(H):** the re-selection frequency, a descriptive diagnostic (below).
+
+The field bounds require `ci_method = "field"` (the default); with
+`ci_method = "ij"` only the two-sided interval is reported. León and Anderson
+(2026) describe each construction and report its performance in simulation.
+
+`summary()` adds the standard errors and the leading re-selection frequencies:
+
+```{r summary}
+summary(fs)
+```
+
+## How to read a bound: by location
+
+These bounds are read **by location against a clinically meaningful effect
+size**, never as significance at the null.
+
+The harm-side question is *how much harm the data can rule out*. A one-sided
+lower bound in the high 0.8s or above, against a naive subgroup estimate well
+above 1, says the adjusted evidence does not establish clinically meaningful
+harm -- the naive estimate was largely selection.
+
+The complement-side question is a benefit claim: *is the one-sided upper bound
+below a threshold that would matter?* Name the threshold you are reading
+against -- for example 0.80 or 0.85 -- and say
+whether the bound clears it. A threshold quoted this way is a reading aid, not
+a decision rule.
+
+```{r locations}
+g <- fs$mr_inference
+cat(sprintf("naive HR on Hhat            %.3f\n", g$naive$est))
+cat(sprintf("de-biased HR on Hhat        %.3f\n", g$debiased$est))
+cat(sprintf("field one-sided lower       %.3f\n", g$field$lower_1s))
+cat(sprintf("field-s one-sided upper Hc  %.3f  (vs 0.80 / 0.85)\n",
+            g$field$complement$upper_1s_s))
+```
+
+The distance between the naive estimate and the de-biased one is what
+selection cost; the spread across the constructions is what the adjustments
+pay for it.
+
+## p-hat as a diagnostic
+
+`p_hat(Hhat)` is the frequency with which the gate's own re-selection map
+picks the same subgroup across the multiplier draws. It is a **recorded
+diagnostic**: it is computed after the bounds are formed, and **no construction
+reads it**. It is also estimated from the same draws that build the bound, so
+it is a flag, not an independent instrument -- which is a reason not to let any
+interval depend on it.
+
+```{r phat}
+ph  <- g$reselection$p_hat
+lab <- g$selected_label
+cat(sprintf("p-hat(Hhat) = %.3f over a family of %d candidates\n",
+            unname(ph[[lab]]), g$n_family))
+print(round(sort(ph, decreasing = TRUE)[1:5], 3))
+```
+
+A small p-hat indicates that the exact boundary of the identified subgroup is
+not stable under perturbation; by itself it is neither evidence for nor
+against the bounds. León and Anderson (2026) discuss how the bias correction
+behaves across values of p-hat.
+
+### What p-hat alone cannot say
+
+p-hat counts **exact** re-selections of `Hhat`. Over a large family in
+which most candidates differ from `Hhat` by a single cutpoint, a small
+exact-match rate is compatible with two very different situations: the draws
+re-selected near-twins of `Hhat`, or they re-selected unrelated regions. p-hat
+does not distinguish them. **Membership agreement** does, and it is computable
+from the same draws. Each draw's re-selection is compared with `Hhat` as a set
+of patients, in the vocabulary of the cross-validation agreement metrics
+(`forestsearch_Kfold()`'s `sens_H` / `ppv_H`).
+
+```{r recovery}
+rc <- g$field$recovery
+cat(sprintf("sens_H  = %.3f   mean share of Hhat retained by a re-selection
+", rc$sens_H))
+cat(sprintf("ppv_H   = %.3f   mean share of a re-selection that lies in Hhat
+", rc$ppv_H))
+cat(sprintf("containment q10 / q50 / q90 = %.3f / %.3f / %.3f
+", rc$q10, rc$q50, rc$q90))
+cat(sprintf("share of draws containing all of Hhat = %.3f  (over %d draws)
+",
+            rc$share_equal_1, rc$n_used))
+```
+
+Read together, the two kinds of number say different things about the same
+draws: exact re-selection can be rare while the typical re-selection still
+retains much of the identified subgroup. That pattern points to an unstable
+boundary rather than an unstable region.
+
+One limit. These diagnostics measure re-selection **within the
+fixed candidate family**, under multiplier perturbation of the candidate
+effects. The bootstrap (`forestsearch_bootstrap_dofuture()`) and
+cross-validation (`forestsearch_Kfold()`) recovery rates measure something
+stronger: re-**discovery** of a subgroup from resampled data, with the search
+re-run and the family rebuilt each time. The two are related but neither
+substitutes for the other, and this one is free in every analysis while those
+cost a full re-run.
+
+## References
+
+León, L. F. and Anderson, K. M. (2026). Inference for standard trial
+estimands after data-driven subgroup discovery. arXiv:2609.38361.
+<https://arxiv.org/abs/2609.38361>
+
+León, L. F., Jemielita, T., Guo, Z., Marceau West, R. and Anderson, K. M.
+(2024). Exploratory subgroup identification in the heterogeneous Cox model:
+A relatively simple procedure. *Statistics in Medicine*.
+<https://doi.org/10.1002/sim.10163>
+
+```{r session}
+sessionInfo()
+```

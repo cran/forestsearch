@@ -2,7 +2,9 @@
 % Please edit documentation in R/grf_main.R
 \name{grf.subg.eval}
 \alias{grf.subg.eval}
-\title{GRF Subgroup Evaluation and Performance Metrics}
+\title{Evaluates the performance of GRF-identified subgroups, including hazard ratios,
+bias, and predictive values. This function is typically used in simulation studies
+to assess the performance of the GRF subgroup identification method.}
 \usage{
 grf.subg.eval(
   df,
@@ -37,4 +39,9 @@ Evaluates the performance of GRF-identified subgroups, including hazard ratios,
 bias, and predictive values. This function is typically used in simulation studies
 to assess the performance of the GRF subgroup identification method.
 }
-\keyword{internal}
+\examples{
+\dontrun{
+# grf.subg.eval() is called internally to evaluate GRF subgroup quality.
+# See grf.subg.harm.survival() for the standard entry point.
+}
+}

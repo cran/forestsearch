@@ -58,6 +58,22 @@
 #'       or treatment dependence): \code{lin_pred_cens_0 = lin_pred_cens_1 = mu}.}
 #'   }
 #'   Default \code{list()}.
+#' @param cens_intercept_only Logical. Honored only in force-fit mode
+#'   (\code{select_censoring = FALSE} with empty \code{cens_params}).  If
+#'   \code{TRUE}, fits \code{Surv(y, 1 - event) ~ 1} with no treat or
+#'   covariate dependence.  If \code{FALSE} (default), the censoring
+#'   formula is determined by the censoring covariate vectors:
+#'   \itemize{
+#'     \item Both \code{*_cens = NULL} (default): inherit from outcome
+#'           model; formula is \code{~ treat + zcens_<outcome covariates>}.
+#'     \item Both \code{*_cens = character(0)}: treat-only; formula is
+#'           \code{~ treat}.
+#'     \item One or both \code{*_cens} non-empty: formula is
+#'           \code{~ treat + zcens_<supplied covariates>}.
+#'   }
+#'   Setting \code{cens_intercept_only = TRUE} with
+#'   \code{select_censoring = TRUE} or with analytical \code{cens_params}
+#'   (mu, tau supplied) raises an error.
 #' @param seed Integer random seed for reproducibility. Default is 8316951
 #' @param verbose Logical indicating whether to print diagnostic information during
 #'   execution. Default is TRUE
@@ -154,16 +170,8 @@
 #'   Failure Time Data (2nd ed.). Wiley.
 #'
 #' @author Your Name
-#' @return A named list of class \code{aft_dgm} containing:
-#'   \item{data}{Simulated trial data frame with outcome, event, and treatment columns.}
-#'   \item{model_params}{Model parameters used for data generation (coefficients,
-#'     dispersion, spline info if applicable).}
-#'   \item{subgroup_info}{Subgroup definition and membership indicators, if a
-#'     heterogeneous treatment effect was specified.}
-#'   \item{censoring_info}{Censoring model parameters and observed censoring rate.}
-#'   \item{call_args}{Arguments used in the call, for reproducibility.}
 #' @examples
-#' \donttest{
+#' \dontrun{
 #' df <- survival::gbsg
 #' dgm <- generate_aft_dgm_flex(
 #'   data            = df,
@@ -179,7 +187,33 @@
 #' }
 #' @export
 #' @importFrom survival survreg coxph Surv
-#' @importFrom stats quantile median uniroot rexp runif rnorm rbinom model.matrix coef
+#' @importFrom stats quantile median uniroot rexp runif rnorm rbinom model.matrix coef reformulate
+#'
+#' @return An object of class \code{"aft_dgm_flex"} (a list) with components:
+#'   \describe{
+#'     \item{\code{df_super}}{Data frame containing the super-population,
+#'       including covariates, treatment, counterfactual linear predictors,
+#'       and subgroup indicator \code{flag_harm}.}
+#'     \item{\code{df_source}}{Data frame with every source patient exactly
+#'       once (the prepared trial data), carrying the same counterfactual
+#'       outcome and censoring linear predictors as \code{df_super}.
+#'       Consumed by \code{simulate_from_dgm(baseline = "fixed")} to hold
+#'       baseline covariates -- and hence subgroup composition -- fixed
+#'       across simulated trials.}
+#'     \item{\code{model_params}}{List with AFT parameters \code{mu},
+#'       \code{tau}, \code{gamma}, \code{b0}, the fitted \code{censoring}
+#'       model, and optional \code{spline_info}.}
+#'     \item{\code{subgroup_info}}{List describing the true subgroup:
+#'       \code{vars}, \code{cuts}, \code{definitions}, \code{size},
+#'       \code{proportion}.}
+#'     \item{\code{hazard_ratios}}{List of true HR/AHR/CDE values on the
+#'       super-population (see \code{\link{compute_dgm_cde}}).}
+#'     \item{\code{analysis_vars}}{Named list of column roles
+#'       (continuous, factor, covariates, treatment, outcome, event).}
+#'     \item{\code{model_type}}{\code{"null"} or \code{"alt"}.}
+#'     \item{\code{n_super}}{Super-population size.}
+#'     \item{\code{seed}}{Seed used for super-population generation.}
+#'   }
 
 generate_aft_dgm_flex <- function(data,
                                   continuous_vars,
@@ -200,6 +234,7 @@ generate_aft_dgm_flex <- function(data,
                                   select_censoring = TRUE,
                                   cens_type = "weibull",
                                   cens_params = list(),
+                                  cens_intercept_only = FALSE,
                                   seed = 8316951,
                                   verbose = TRUE,
                                   standardize = FALSE,
@@ -214,9 +249,40 @@ generate_aft_dgm_flex <- function(data,
 
   # When the censoring model will be fitted from data, ensure censoring
   # covariate vectors default to the outcome model vectors if not supplied.
-  # Skipped when select_censoring = FALSE: no covariate processing is needed
-  # for a censoring distribution that will be specified analytically.
-  if (select_censoring) {
+  # The censoring model is fitted in two cases:
+  #   (i)  AIC selection                : select_censoring = TRUE
+  #   (ii) Force-fit                    : select_censoring = FALSE AND
+  #                                       cens_params lacks analytical specs
+  # The analytical path (FALSE + cens_params with mu/tau) does not fit
+  # anything; covariate processing is irrelevant there and is skipped.
+  #
+  # cens_intercept_only = TRUE forcibly clears any covariate vectors so
+  # the censoring formula reduces to ~ 1.  This must run *before* the
+  # inheritance step.
+  if (cens_intercept_only) {
+    if (select_censoring) {
+      stop("cens_intercept_only = TRUE requires select_censoring = FALSE ",
+           "(force-fit mode). For an unconditional model in AIC mode, the ",
+           "comparison already includes Weibull0 / LogNormal0 candidates.",
+           call. = FALSE)
+    }
+    if (!is.null(cens_params$mu) || !is.null(cens_params$tau)) {
+      stop("cens_intercept_only = TRUE is incompatible with analytical ",
+           "cens_params (mu/tau supplied).  Choose one: force-fit ",
+           "intercept-only (cens_params empty), or analytical with ",
+           "explicit mu/tau (cens_intercept_only = FALSE).",
+           call. = FALSE)
+    }
+    factor_vars_cens     <- character(0)
+    continuous_vars_cens <- character(0)
+  }
+
+  # Inheritance (default *_cens to outcome covariates) when fitting.
+  will_fit_cens <- select_censoring ||
+    (cens_type != "uniform" &&
+     is.null(cens_params$mu) && is.null(cens_params$tau))
+
+  if (will_fit_cens && !cens_intercept_only) {
     if (is.null(factor_vars_cens) && is.null(continuous_vars_cens))
       factor_vars_cens <- factor_vars
     if (is.null(continuous_vars_cens))
@@ -282,21 +348,58 @@ generate_aft_dgm_flex <- function(data,
   # ============================================================================
   # Step 7: Prepare Censoring Parameters
   # ============================================================================
-  # select_censoring = TRUE  : fits censoring distribution from observed data
-  #                            via AIC comparison across Weibull / lognormal
-  #                            models (with and without covariates)
-  # select_censoring = FALSE : uses caller-supplied cens_params directly;
-  #                            no model fitting is performed
+  # Three modes (see prepare_censoring_model docstring for details):
+  #   (1) AIC selection : select_censoring = TRUE
+  #   (2) Analytical    : select_censoring = FALSE; cens_params supplies
+  #                       mu+tau (Weibull/LogNormal) or min+max (uniform)
+  #   (3) Force-fit     : select_censoring = FALSE; cens_params empty;
+  #                       formula determined by cens_intercept_only and
+  #                       the *_cens vectors
   cens_result <- prepare_censoring_model(
-    df_work          = df_work,
-    cens_type        = cens_type,
-    cens_params      = cens_params,
-    df_super         = df_super,
-    select_censoring = select_censoring,
-    verbose          = verbose
+    df_work             = df_work,
+    cens_type           = cens_type,
+    cens_params         = cens_params,
+    df_super            = df_super,
+    select_censoring    = select_censoring,
+    cens_intercept_only = cens_intercept_only,
+    verbose             = verbose
   )
   cens_model <- cens_result$cens_model
   df_super   <- cens_result$df_super
+
+  # ============================================================================
+  # Step 7b: Fixed-Baseline Source Frame (df_source)
+  # ============================================================================
+  # df_work holds every source patient exactly once (post covariate prep,
+  # flag_harm, and any spline columns).  Attaching the same potential-outcome
+  # and censoring linear predictors used for df_super makes it directly
+  # consumable by simulate_from_dgm(baseline = "fixed"), which holds baseline
+  # covariates -- and hence subgroup memberships and sizes -- fixed at the
+  # observed trial composition while re-drawing outcomes each simulation.
+  #
+  # The outcome linear predictors are computed with the same
+  # calculate_linear_predictors() call used for df_super.  The censoring
+  # linear predictors are attached via a second prepare_censoring_model()
+  # call: the refit is deterministic on identical df_work (AIC selection
+  # included), so lin_pred_cens_* are exactly consistent with cens_model;
+  # its returned model object is discarded.  This trades one redundant
+  # survreg fit at DGM-build time for zero duplication of the per-mode
+  # (weibull / lognormal / uniform / analytical) branch logic.
+  df_source    <- df_work
+  df_source$id <- seq_len(nrow(df_source))
+  covariate_cols_src <- grep("^z_", names(df_source), value = TRUE)
+  df_source <- calculate_linear_predictors(df_source, covariate_cols_src,
+                                           gamma, b0, spline_info)
+  cens_result_src <- prepare_censoring_model(
+    df_work             = df_work,
+    cens_type           = cens_type,
+    cens_params         = cens_params,
+    df_super            = df_source,      # attaches lin_pred_cens_0/1
+    select_censoring    = select_censoring,
+    cens_intercept_only = cens_intercept_only,
+    verbose             = FALSE           # already reported for df_super
+  )
+  df_source <- cens_result_src$df_super
 
   # ============================================================================
   # Step 8: Assemble and Return Results
@@ -317,7 +420,8 @@ generate_aft_dgm_flex <- function(data,
     model                = model,
     n_super              = n_super,
     seed                 = seed,
-    spline_info          = spline_info
+    spline_info          = spline_info,
+    df_source            = df_source
   )
 
   return(results)

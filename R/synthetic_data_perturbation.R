@@ -12,9 +12,44 @@
 #' @param ordinal_vars Optional character vector of ordinal categorical variables
 #'                     (these will be perturbed to adjacent values rather than randomly flipped)
 #'
-#' @keywords internal
 #' @return A data frame with synthetic data
 #'
+#' @examples
+#' \donttest{
+#' # Example 1: Using with GBSG dataset
+#' synth_gbsg <- generate_bootstrap_synthetic(
+#'   data = survival::gbsg,
+#'   continuous_vars = c("age", "size", "nodes", "pgr", "er", "rfstime"),
+#'   cat_vars = c("meno", "hormon", "status"),
+#'   ordinal_vars = c("grade"),
+#'   id_var = "pid",
+#'   n = 1000,
+#'   seed = 123,
+#'   noise_level = 0.15
+#' )
+#'
+#' # Example 2: Using with any dataset
+#' my_data <- data.frame(
+#'   id = 1:100,
+#'   height = rnorm(100, 170, 10),
+#'   weight = rnorm(100, 70, 15),
+#'   age = sample(20:80, 100, replace = TRUE),
+#'   gender = sample(c("M", "F"), 100, replace = TRUE),
+#'   education = sample(1:5, 100, replace = TRUE),
+#'   smoker = sample(0:1, 100, replace = TRUE)
+#' )
+#'
+#' synth_data <- generate_bootstrap_synthetic(
+#'   data = my_data,
+#'   continuous_vars = c("height", "weight", "age"),
+#'   cat_vars = c("gender", "smoker"),
+#'   ordinal_vars = c("education"),
+#'   id_var = "id",
+#'   n = 150,
+#'   seed = 456
+#' )
+#' }
+#'@export
 generate_bootstrap_synthetic <- function(data,
                                          continuous_vars,
                                          cat_vars,
@@ -211,7 +246,6 @@ generate_bootstrap_synthetic <- function(data,
 #'   classification and the returned dataset (e.g., ID variables, timestamps).
 #'   Default is NULL.
 #'
-#' @keywords internal
 #' @return A list containing:
 #'   \item{continuous_vars}{Character vector of variable names classified as continuous}
 #'   \item{cat_vars}{Character vector of variable names classified as categorical}
@@ -229,6 +263,24 @@ generate_bootstrap_synthetic <- function(data,
 #'     and removed from the returned dataset
 #' }
 #'
+#' @examples
+#' \dontrun{
+#' example_data <- data.frame(
+#'   id = 1:100,
+#'   age = rnorm(100, 50, 10),
+#'   grade = sample(1:3, 100, replace = TRUE),
+#'   status = sample(c("Active", "Inactive"), 100, replace = TRUE),
+#'   score = runif(100, 0, 100)
+#' )
+#' result <- detect_variable_types(example_data,
+#'                                  max_unique_for_cat = 10,
+#'                                  exclude_vars = "id")
+#' result$continuous_vars  # c("age", "score")
+#' result$cat_vars         # c("grade", "status")
+#' names(result$data_subset)  # c("age", "grade", "status", "score")
+#' }
+#'
+#' @keywords internal
 
 detect_variable_types <- function(data, max_unique_for_cat = 10, exclude_vars = NULL) {
 
@@ -298,12 +350,20 @@ detect_variable_types <- function(data, max_unique_for_cat = 10, exclude_vars = 
 #' @param seed Random seed
 #' @param noise_level Noise level for perturbation
 #'
-#' @keywords internal
 #' @return Synthetic GBSG dataset
+#' @examples
+#' \dontrun{
+#' df_synth <- generate_gbsg_bootstrap_general(n = 200, seed = 42)
+#' dim(df_synth)
+#' names(df_synth)
+#' }
+#' @export
 
 generate_gbsg_bootstrap_general <- function(n = 686, seed = 123, noise_level = 0.1) {
 
-  gbsg <- survival::gbsg
+  # Load gbsg data into local environment
+  gbsg <- NULL  # Avoid R CMD check NOTE
+  data("gbsg", package = "survival", envir = environment())
 
   synthetic_data <- generate_bootstrap_synthetic(
     data = gbsg,
@@ -344,7 +404,6 @@ generate_gbsg_bootstrap_general <- function(n = 686, seed = 123, noise_level = 0
 #'   determine noise magnitude. For categorical variables, this is divided by 2
 #'   to determine the probability of value changes. Default is 0.1.
 #'
-#' @keywords internal
 #' @return A data frame with the same structure as the input data, containing
 #'   bootstrap sampled observations with added noise.
 #'
@@ -373,6 +432,34 @@ generate_gbsg_bootstrap_general <- function(n = 686, seed = 123, noise_level = 0
 #'   }
 #' }
 #'
+#' @examples
+#' \dontrun{
+#' # Load example dataset
+#' data(gbsg, package = "survival")
+#'
+#' # Basic usage with automatic variable detection
+#' synthetic_data <- generate_bootstrap_with_noise(
+#'   data = gbsg,
+#'   seed = 123
+#' )
+#'
+#' # Specify variables explicitly
+#' synthetic_data <- generate_bootstrap_with_noise(
+#'   data = gbsg,
+#'   n = 1000,
+#'   continuous_vars = c("age", "size", "nodes", "pgr", "er", "rfstime"),
+#'   cat_vars = c("meno", "grade", "hormon", "status"),
+#'   id_var = "pid",
+#'   seed = 456,
+#'   noise_level = 0.15
+#' )
+#'
+#' # Create multiple synthetic datasets
+#' synthetic_list <- lapply(1:10, function(i) {
+#'   generate_bootstrap_with_noise(data = gbsg, seed = i)
+#' })
+#' }
+#'
 #' @note
 #' \itemize{
 #'   \item The function assumes that categorical variables with numeric encoding
@@ -389,6 +476,7 @@ generate_gbsg_bootstrap_general <- function(n = 686, seed = 123, noise_level = 0
 #'
 #' @importFrom stats rnorm sd
 #' @keywords datagen bootstrap simulation
+#' @export
 
 generate_bootstrap_with_noise <- function(data,
                                           n = NULL,

@@ -12,9 +12,8 @@
 \item{...}{Additional arguments (unused)}
 }
 \value{
-Invisibly returns \code{x}.
+The input \code{x}, invisibly.
 }
 \description{
 Print Method for fs_weighted_km Objects
 }
-\keyword{internal}

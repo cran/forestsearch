@@ -12,7 +12,11 @@ bootstrap_results(
   show_three,
   H_obs,
   Hc_obs,
-  seed = 8316951L
+  seed = 8316951L,
+  estimator_fn = NULL,
+  effect_measure = NULL,
+  boot_index_mat = NULL,
+  mr_in_replicates = FALSE
 )
 }
 \arguments{
@@ -47,8 +51,43 @@ bias correction.}
 bias correction.}
 
 \item{seed}{Integer. Random seed for reproducibility. Default 8316951L.
-Must match the seed used in \code{\link{bootstrap_ystar}} to ensure
-bootstrap index alignment.}
+Only used when \code{boot_index_mat} is \code{NULL}; when an
+explicit index matrix is supplied, it is the source of bootstrap
+row selection and \code{seed} has no effect on bootstrap indices.}
+
+\item{estimator_fn}{Closure or \code{NULL}. Effect-estimator closure from
+\code{\link{make_effect_estimator}} for GLM outcomes.  When \code{NULL}
+(default), the Cox model via \code{cox.formula.boot} is used.}
+
+\item{effect_measure}{Character or \code{NULL}. Effect-measure label for
+GLM outcomes (e.g. "OR", "RR", "IRR", "MD", "RD", "IRD"), threaded from
+the bootstrap entry.  Controls the scale of the per-resample
+subgroup-effect diagnostic (\code{hr_sg}) for DINA-selected subgroups:
+ratio measures ("OR", "RR", "IRR") and survival report it on the ratio
+scale, while identity measures ("MD", "RD", "IRD") report it on the
+difference scale.  \code{NULL} (default) applies the ratio (survival)
+convention.}
+
+\item{boot_index_mat}{Integer matrix or \code{NULL}. Optional
+pre-generated \eqn{B \times N} matrix of bootstrap row indices. When
+supplied, row \eqn{b} is used as the resampling vector for iteration
+\eqn{b} (\code{df_boot_analysis[boot_index_mat[b, ], ]}); the
+per-iteration call to \code{sample.int()} is bypassed. This is the
+path taken by \code{\link{forestsearch_bootstrap_dofuture}}, which
+generates the matrix once on the main process so that the same
+indices drive both the worker's bootstrap data construction and the
+\code{Ystar_mat} count matrix. When \code{NULL} (default), each
+iteration draws its own indices via \code{sample.int()} - retained
+for backward compatibility with direct callers.}
+
+\item{mr_in_replicates}{Logical. Whether multiplier resampling runs inside
+each replicate. Default \code{FALSE}, which strips \code{mr_inference}
+from the reconstructed per-replicate call. When \code{TRUE} the flag
+propagates unchanged and each replicate's MR object is attached to the
+returned table as the \code{"mr_replicates"} attribute (a list of length
+\code{nb_boots}). See
+\code{\link{forestsearch_bootstrap_dofuture}} for the full contract,
+including why the retained objects are not aggregable.}
 }
 \value{
 Data.table with one row per bootstrap iteration and columns:
@@ -74,6 +113,12 @@ Data.table with one row per bootstrap iteration and columns:
 \item{tmins_search}{Numeric. Minutes spent on subgroup search in this iteration}
 \item{tmins_iteration}{Numeric. Total minutes for this bootstrap iteration}
 \item{Pcons}{Numeric. Consistency p-value for top subgroup}
+\item{any_found}{Integer 0/1. Identification flag; equivalent to
+\code{as.integer(!is.na(Pcons))}.  Added in v0.2.0 to mirror the
+\code{fold_summary$any_found} column produced by
+\code{\link{forestsearch_tenfold}}, so cross-API diagnostics
+(\code{sum(results$any_found == 1L)}) work identically for
+bootstrap and CV outputs.}
 \item{hr_sg}{Numeric. Hazard ratio for top subgroup}
 \item{N_sg}{Integer. Sample size of top subgroup}
 \item{E_sg}{Integer. Number of events in top subgroup}
@@ -87,6 +132,16 @@ Data.table with one row per bootstrap iteration and columns:
 \item{M.5}{Character. Fifth factor label}
 \item{M.6}{Character. Sixth factor label}
 \item{M.7}{Character. Seventh factor label}
+\item{grf_cuts_b}{Character. GRF policy-tree cut expressions
+returned on this bootstrap sample, collapsed with " | " when
+multiple cuts are produced.  \code{NA_character_} when GRF was
+not used, the bootstrap forestsearch call errored, or GRF
+returned no cuts.  Populated independently of whether a
+subgroup was identified: GRF may surface a candidate cut on
+bootstraps where the downstream consistency stage rejects all
+candidates.  Mirrors the \code{grf_cuts} column that
+\code{\link{forestsearch_tenfold}} captures in its
+\code{fold_summary} return slot.}
 }
 Rows where no valid subgroup was found will have \code{NA} for bias corrections.
 The returned object has a "timing" attribute with summary statistics.
@@ -144,7 +199,7 @@ variable selection, subgroup search, and consistency evaluation
 
 Each bootstrap iteration modifies ForestSearch arguments to:
 \itemize{
-\item \strong{Suppress output}: \code{details}, \code{showten_subgroups},
+\item \strong{Suppress output}: \code{details}, \code{show_candidate_summary},
 \code{plot.sg}, \code{plot.grf} all set to \code{FALSE}
 \item \strong{Force re-selection}: \code{grf_res} and \code{grf_cuts} set to \code{NULL}
 \item \strong{Prevent nested parallel}: \code{parallel_args$plan = "sequential"},
@@ -173,6 +228,49 @@ The function gracefully handles three failure modes:
 All three cases ensure the foreach loop can still combine results via \code{rbind}.
 }
 
+\examples{
+\dontrun{
+# Typically called via forestsearch_bootstrap_dofuture()
+# Manual usage for debugging:
+
+# 1. Fit initial ForestSearch model
+fs_result <- forestsearch(
+  df.analysis = mydata,
+  outcome.name = "time",
+  event.name = "status",
+  treat.name = "treatment",
+  confounders.name = c("age", "sex", "stage")
+)
+
+# 2. Build Cox formula
+cox_formula <- build_cox_formula("time", "status", "treatment")
+
+# 3. Get observed estimates
+cox_fits <- fit_cox_models(fs_result$df.est, cox_formula)
+
+# 4. Set up parallel backend
+library(doFuture)
+plan(multisession, workers = 6)
+
+# 5. Run bootstrap (note: this is already parallelized internally)
+boot_results <- bootstrap_results(
+  fs.est = fs_result,
+  df_boot_analysis = fs_result$df.est,
+  cox.formula.boot = cox_formula,
+  nb_boots = 100,
+  show_three = TRUE,
+  H_obs = cox_fits$H_obs,
+  Hc_obs = cox_fits$Hc_obs
+)
+
+# 6. Check results
+summary(boot_results)
+
+# Proportion of bootstraps that found a subgroup
+mean(!is.na(boot_results$H_biasadj_2))
+}
+
+}
 \seealso{
 \code{\link{forestsearch_bootstrap_dofuture}} for the wrapper function that
 sets up parallelization and calls this function
@@ -183,4 +281,3 @@ sets up parallelization and calls this function
 \code{\link{bootstrap_ystar}} for generating the Ystar matrix
 }
 \concept{bootstrap functions}
-\keyword{internal}

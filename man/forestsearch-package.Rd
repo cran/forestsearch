@@ -4,9 +4,9 @@
 \name{forestsearch-package}
 \alias{forestsearch-package}
 \alias{forestsearch-imports}
-\title{forestsearch: Exploratory Subgroup Identification in Clinical Trials with Survival Endpoints}
+\title{forestsearch: Exploratory Subgroup Identification in Survival and GLM Outcomes}
 \description{
-Implements statistical methods for exploratory subgroup identification in clinical trials with survival endpoints. Provides tools for identifying patient subgroups with differential treatment effects using machine learning approaches including Generalized Random Forests (GRF), LASSO regularization, and exhaustive combinatorial search algorithms. Features bootstrap bias correction using infinitesimal jackknife methods to address selection bias in post-hoc analyses. Designed for clinical researchers conducting exploratory subgroup analyses in randomized controlled trials, particularly for multi-regional clinical trials (MRCT) requiring regional consistency evaluation. Supports both accelerated failure time (AFT) and Cox proportional hazards models with comprehensive diagnostic and visualization tools. Methods are described in León et al. (2024) \doi{10.1002/sim.10163}.
+Implements statistical methods for exploratory subgroup identification in clinical trials. Provides tools for identifying patient subgroups with differential treatment effects using machine learning approaches including Generalized Random Forests (GRF), LASSO regularization, and exhaustive combinatorial search algorithms. Supports survival endpoints (Cox proportional hazards), binary outcomes (log odds ratio, log relative risk, risk difference), continuous outcomes (mean difference), and count / rate outcomes (log incidence rate ratio via Poisson, quasi-Poisson, or negative-binomial GLMs with optional person-time offset). Features bootstrap bias correction using infinitesimal jackknife methods to address selection bias in post-hoc analyses. Designed for clinical researchers conducting exploratory subgroup analyses in randomized controlled trials, particularly for multi-regional clinical trials (MRCT) requiring regional consistency evaluation. Methods are described in Leon et al. (2024) \doi{10.1002/sim.10163}. Post-selection inference for the identified subgroup follows León and Anderson (2026) \doi{10.48550/arXiv.2609.38361}.
 }
 \seealso{
 Useful links:
@@ -19,6 +19,11 @@ Useful links:
 }
 \author{
 \strong{Maintainer}: Larry Leon \email{larry.leon.05@post.harvard.edu}
+
+Authors:
+\itemize{
+  \item Larry Leon \email{larry.leon.05@post.harvard.edu}
+}
 
 }
 \keyword{internal}

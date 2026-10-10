@@ -10,7 +10,9 @@ forestsearch_tenfold(
   Kfolds = 10,
   details = TRUE,
   seed = 8316951L,
-  parallel_args = list(plan = "multisession", workers = 6, show_message = TRUE)
+  parallel_args = list(plan = "multisession", workers = 6, show_message = TRUE),
+  keep_resCV = FALSE,
+  mr_in_replicates = FALSE
 )
 }
 \arguments{
@@ -25,7 +27,54 @@ forestsearch_tenfold(
 \item{seed}{Integer. Base random seed for fold shuffling. Default 8316951L.
 Each simulation uses seed + 1000 * ksim for reproducibility.}
 
-\item{parallel_args}{List. Parallelization configuration.}
+\item{parallel_args}{List. Parallelization configuration (elements
+\code{plan} / \code{workers} / \code{show_message}; see \strong{Parallelization
+Strategy}).  Here \code{parallel_args} controls \strong{simulation-level}
+parallelism: the \code{sims} repetitions are distributed across workers,
+while each simulation runs its K-fold CV -- and every inner
+\code{\link{forestsearch}} refit -- sequentially (so workers are not
+oversubscribed by nested parallelism).  As in
+\code{\link{forestsearch_Kfold}}, the plan is taken from
+\code{parallel_args}, not from any ambient \code{future::plan()} set by the
+caller (which is saved and restored on exit).  For example, to run the
+simulations on four workers:
+\code{parallel_args = list(plan = "multisession", workers = 4)}.}
+
+\item{keep_resCV}{Logical. If \code{TRUE}, preserve the full per-subject
+cross-validation prediction data frame for every simulation in the
+returned \code{resCV_all} slot.  Useful for post-hoc metric computation,
+reproducibility debugging, or auditing which subjects landed in which
+fold.  Memory cost scales as \code{sims * nrow(df.est) * ~9 columns}
+(for a 686-subject trial with 200 sims, ~10 MB; for a 10,000-subject
+trial with 1,000 sims, ~1 GB).  Default: \code{FALSE}.  Regardless of
+this flag, a compact \code{fold_summary} (one row per sim x fold) is
+always returned; see Return.}
+
+\item{mr_in_replicates}{Logical.  Whether multiplier resampling (MR) runs
+\emph{inside} each CV fold.  \strong{Default \code{FALSE}}.
+
+\code{mr_inference} reaches each fold through the reconstructed call in
+\code{fs.est$args_call_all}, so an analysis fitted with
+\code{mr_inference = TRUE} would otherwise run MR in every fold of every
+simulation -- \code{sims * Kfolds} runs -- and nothing consumes the
+result.  Under the default the flag is stripped from the per-fold call, so
+that work is not done at all.  The top-level analysis on \code{fs.est} is
+unaffected.
+
+\code{TRUE} lets \code{mr_inference} propagate unchanged into each fold
+\emph{and} retains the results, returned as \code{$mr_replicates} -- a
+list with one element per successful simulation (named \code{sim<k>} after
+its \code{sim_id}, so a dropped simulation shows as a gap rather than a
+silent re-index), each itself a list of length \code{Kfolds} holding that
+fold's \code{mr_inference} object or \code{NULL}.  MR therefore runs in
+the folds only if the original analysis set \code{mr_inference = TRUE}.
+
+\strong{The retained objects are not aggregable into an estimate for the
+original analysis.}  Each fold re-runs the search on its training split,
+selects its own subgroup, and de-biases \emph{that} subgroup -- so the
+collection describes MR's behaviour across fold-specific selections, not a
+better estimate of the original quantity.  Averaging them, or pooling
+their intervals, is an error.}
 }
 \value{
 List with components:
@@ -34,9 +83,51 @@ List with components:
 \item{find_summary}{Named vector of median subgroup-finding metrics}
 \item{sens_out}{Matrix of sensitivity metrics (sims x metrics)}
 \item{find_out}{Matrix of finding metrics (sims x metrics)}
+\item{fold_summary}{Data frame with one row per (sim, fold) combination.
+Columns: \code{sim}, \code{fold}, \code{n_test}, \code{sg1}, \code{sg2},
+\code{grf_cuts}, \code{pconsistency}, \code{training_fs_hr},
+\code{n_candidates_evaluated}, \code{any_found}.  The
+\code{grf_cuts} column records the GRF policy-tree cut
+expressions returned for each training fold (collapsed with
+" | " when multiple cuts are returned; \code{NA} when GRF was
+not used, failed, or returned no cuts).  The \code{pconsistency}
+column records the consistency probability (\code{Pcons})
+achieved by the identified subgroup on each fold (\code{NA_real_}
+when no subgroup was identified or the training ForestSearch
+call errored).  The \code{training_fs_hr} column records the
+in-sample effect estimate for the identified subgroup on the
+training fold, on its NATURAL SCALE regardless of outcome type
+(hazard ratio for survival; odds ratio, rate ratio, or risk
+ratio for GLM ratio measures after internal exponentiation;
+mean/risk difference for GLM additive measures); optimistically
+biased relative to any independent estimate and surfaced for
+diagnostic comparison only, with \code{NA_real_} when no
+subgroup was identified.  The \code{n_candidates_evaluated}
+column records the integer count of candidate subgroups
+actually evaluated for consistency on this training fold
+(populated whenever the consistency stage ran, even if zero
+candidates met the threshold and thus no subgroup was
+identified; \code{NA_integer_} when the training call errored
+or consistency evaluation did not run).  Always returned
+(compact; cheap).  Lets you tabulate, for example, which
+subgroup was identified in each fold of each simulation, the
+empirical distribution of GRF cut choices across the full
+sim x fold grid, the relationship between GRF's cut and the
+final identified subgroup, or the near-miss consistency values
+among folds that did not surface a subgroup.}
+\item{resCV_all}{List of length \code{sims}; element \emph{i} is the
+per-subject \code{resCV} data frame from simulation \emph{i}.  Only
+populated when \code{keep_resCV = TRUE}; otherwise \code{NULL}.}
 \item{timing_minutes}{Total execution time}
 \item{sims}{Number of simulations run}
 \item{Kfolds}{Number of folds per simulation}
+\item{mr_replicates}{\code{NULL} under the default
+\code{mr_in_replicates = FALSE}.  Otherwise a nested list: one element
+per successful simulation (named \code{sim<k>}), each a list of length
+\code{Kfolds} holding that fold's \code{mr_inference} object (or
+\code{NULL}), computed against \emph{that fold's} candidate family and
+selected subgroup.  Not aggregable -- see the \code{mr_in_replicates}
+parameter.}
 }
 }
 \description{
@@ -60,6 +151,23 @@ function parallelizes across simulations for better efficiency when
 running many repetitions. Each simulation runs its K-fold CV sequentially.
 }
 
+\examples{
+\dontrun{
+# Run 100 repetitions of 10-fold CV
+tenfold_results <- forestsearch_tenfold(
+  fs.est = fs_result,
+  sims = 100,
+  Kfolds = 10,
+  parallel_args = list(plan = "multisession", workers = 6),
+  details = TRUE
+)
+
+# View summary
+print(tenfold_results$sens_summary)
+print(tenfold_results$find_summary)
+}
+
+}
 \seealso{
 \code{\link{forestsearch_Kfold}} for single K-fold CV
 \code{\link{forestsearch_KfoldOut}} for summarizing CV results

@@ -17,6 +17,7 @@ find_k_inter_for_target_hr(
   k_treat = 1,
   k_inter_range = c(-10, 10),
   tol = 0.001,
+  tol_rel = 2.5,
   n_super = 5000,
   verbose = TRUE
 )
@@ -54,6 +55,10 @@ for k_inter. Default is c(-10, 10).}
 \item{tol}{Numeric value specifying tolerance for root finding convergence.
 Default is 0.001.}
 
+\item{tol_rel}{Numeric. Maximum tolerated relative error, in percent; the
+call stops if the achieved HR is not within \code{tol_rel} percent of the
+target. Default \code{2.5}.}
+
 \item{n_super}{Integer specifying size of super population for hazard ratio
 calculation. Default is 5000.}
 
@@ -85,6 +90,33 @@ The algorithm typically converges within 5-10 iterations and achieves high
 precision (within the specified tolerance). If the root-finding fails, the
 function evaluates the boundaries and provides diagnostic information.
 }
+\examples{
+\dontrun{
+gbsg <- survival::gbsg
+
+# Find k_inter for target HR = 2.0 in harm subgroup
+result <- find_k_inter_for_target_hr(
+  target_hr_harm = 2.0,
+  data = gbsg,
+  continuous_vars = c("age", "er", "pgr"),
+  factor_vars = c("meno", "grade"),
+  outcome_var = "rfstime",
+  event_var = "status",
+  treatment_var = "hormon",
+  subgroup_vars = c("er", "meno"),
+  subgroup_cuts = list(
+    er = list(type = "quantile", value = 0.25),
+    meno = 0
+  ),
+  k_treat = 1.0,
+  verbose = TRUE
+)
+
+cat("Optimal k_inter:", result$k_inter, "\n")
+cat("Achieved HR:", result$achieved_hr_harm, "\n")
+}
+
+}
 \seealso{
 \code{\link{sensitivity_analysis_k_inter}} for sensitivity analysis
 \code{\link{generate_aft_dgm_flex}} for DGM generation
@@ -92,6 +124,5 @@ function evaluates the boundaries and provides diagnostic information.
 \keyword{AFT}
 \keyword{calibration}
 \keyword{interaction}
-\keyword{internal}
 \keyword{simulation}
 \keyword{survival}

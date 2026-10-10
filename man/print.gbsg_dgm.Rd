@@ -12,14 +12,15 @@
 \item{...}{Additional arguments (unused)}
 }
 \value{
-Invisibly returns \code{x}.
+\code{x}, invisibly. Called for its side effect of printing the
+data-generating mechanism summary.
 }
 \description{
 Print Method for gbsg_dgm Objects
 }
 \examples{
-\donttest{
-dgm <- setup_gbsg_dgm(model = "alt", verbose = FALSE)
+\dontrun{
+dgm <- create_gbsg_dgm()
 print(dgm)
 }
 }

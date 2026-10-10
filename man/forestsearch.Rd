@@ -13,20 +13,29 @@ forestsearch(
   potentialOutcome.name = NULL,
   flag_harm.name = NULL,
   confounders.name = NULL,
-  parallel_args = list(plan = "callr", workers = 6, show_message = TRUE),
+  parallel_args = list(plan = "multisession", workers = .default_parallel_workers(),
+    show_message = TRUE),
   df.predict = NULL,
   df.test = NULL,
   is.RCT = TRUE,
   seedit = 8316951,
   est.scale = "hr",
-  use_lasso = TRUE,
-  use_grf = TRUE,
+  use_lasso = FALSE,
+  use_grf = FALSE,
   grf_res = NULL,
   grf_cuts = NULL,
+  use_dina = FALSE,
+  dina_res = NULL,
+  dina_cuts = NULL,
+  dina_args = list(),
+  dina_select_statistic = c("effect", "dina"),
+  subgroup_method = c("consistency", "dina", "grf"),
   max_n_confounders = 1000,
   grf_depth = 2,
-  dmin.grf = 12,
-  frac.tau = 0.6,
+  grf_selection = c("frontier", "tree"),
+  grf_select_statistic = c("effect", "dr"),
+  dmin.grf = 0,
+  frac.tau = 0.8,
   return_selected_cuts_only = TRUE,
   conf_force = NULL,
   defaultcut_names = NULL,
@@ -36,28 +45,53 @@ forestsearch(
   cont.cutoff = 4,
   conf.cont_medians = NULL,
   conf.cont_medians_force = NULL,
+  conf.cont_jcuts = NULL,
+  collapse_cuts = TRUE,
+  collapse_cuts_args = list(),
   n.min = 60,
+  n.min.frac = 0.1,
+  effect.threshold = NULL,
+  consistency.threshold = NULL,
   hr.threshold = 1.25,
   hr.consistency = 1,
   sg_focus = "hr",
+  selection_rule = "neighborhood",
+  effect_neighborhood = 0.1,
   fs.splits = 1000,
   m1.threshold = Inf,
   pconsistency.threshold = 0.9,
-  stop_threshold = 0.95,
-  showten_subgroups = FALSE,
-  d0.min = 12,
-  d1.min = 12,
+  stop_threshold = pconsistency.threshold,
+  pconsistency.digits = 2,
+  show_candidate_summary = FALSE,
+  max_print = 10,
+  d0.min = 10,
+  d1.min = 10,
   max.minutes = 3,
   minp = 0.025,
   details = FALSE,
+  quiet = FALSE,
   maxk = 2,
   by.risk = 12,
   plot.sg = FALSE,
   plot.grf = FALSE,
-  max_subgroups_search = 10,
-  vi.grf.min = -0.2,
+  max_subgroups_search = Inf,
+  vi.grf.min = NULL,
   use_twostage = TRUE,
-  twostage_args = list()
+  twostage_args = list(),
+  consistency_method = c("resample", "split"),
+  outcome_type = c("survival", "binary", "continuous", "count"),
+  effect_measure = NULL,
+  offset.name = NULL,
+  adverse_outcome = NULL,
+  overdispersion = c("none", "quasi", "negbin"),
+  grf_count_transform = c("log", "identity"),
+  tune_grf = FALSE,
+  adjust_covariates = NULL,
+  ps_method = NULL,
+  ps_adjust_method = c("none", "iptw", "dr_gcomp"),
+  ps_hat = NULL,
+  mr_inference = FALSE,
+  mr_inference_args = list()
 )
 }
 \arguments{
@@ -79,10 +113,31 @@ forestsearch(
 
 \item{parallel_args}{List. Parallel processing configuration:
 \describe{
-\item{plan}{Character. One of "multisession", "multicore", "callr", "sequential"}
-\item{workers}{Integer. Number of parallel workers}
-\item{show_message}{Logical. Show parallel setup messages}
-}}
+\item{plan}{Character. One of \code{"multisession"} (default;
+cross-platform, reuses workers across calls), \code{"multicore"}
+(Linux/macOS only, fastest startup but fails in RStudio interactive
+sessions), \code{"callr"} (slower per-call, fully isolated R
+processes), or \code{"sequential"} (no parallelism).}
+\item{workers}{Integer. Number of parallel workers.  Default:
+\code{floor(0.80 * N)} where \code{N} is the number of physical
+(non-hyperthreaded) cores, capped to 2 when
+\code{_R_CHECK_LIMIT_CORES_} is set (e.g., during \code{R CMD
+    check}).  On a 4-core laptop the default is 3 workers; on a
+16-core workstation it is 12.}
+\item{show_message}{Logical. Show parallel setup messages.}
+\item{batch_size}{Integer. Number of \emph{candidate subgroups}
+dispatched to the workers per batch during consistency evaluation.
+Default: chosen from the worker count and pool size.
+\strong{This is a performance knob only -- it does not affect the
+selected subgroup.}  Smaller batches let an early stop take effect
+sooner (relevant only for \code{sg_focus = "maxeffCons"}, the one
+focus that early-stops); larger batches amortise dispatch overhead.
+Not to be confused with \code{twostage_args$batch.size}, which
+batches \emph{splits} within Stage 2 of the two-stage consistency
+algorithm -- a different quantity in different units.}
+}
+To disable parallelism entirely, pass
+\code{parallel_args = list(plan = "sequential")}.}
 
 \item{df.predict}{Data frame. Prediction dataset (optional).}
 
@@ -94,32 +149,222 @@ forestsearch(
 
 \item{est.scale}{Character. Estimation scale ("hr" or "rmst"). Default "hr".}
 
-\item{use_lasso}{Logical. Use LASSO for variable selection. Default TRUE.}
+\item{use_lasso}{Logical. Use LASSO for variable selection. Default FALSE.
+The default changed from \code{TRUE} in an earlier release: with
+\code{subgroup_method = "consistency"} a model-based front end makes the
+candidate family data-dependent, which multiplier resampling
+(\code{mr_inference = TRUE}) requires be fixed.  Set \code{TRUE} to
+restore the prognostic-lasso prefilter used in Leon et al. (2024).}
 
-\item{use_grf}{Logical. Use GRF for variable importance. Default TRUE.}
+\item{use_grf}{Logical.  Generate additional candidate cuts from a GRF
+fit: tree-derived cutpoints are extracted via
+\code{grf.subg.harm.survival()} / \code{grf.subg.harm.glm()} (or taken
+from \code{grf_res} / \code{grf_cuts} when supplied) and enter the
+candidate family through \code{\link{get_FSdata}} alongside the
+quartile (and any DINA) cuts.  This flag governs candidate-cut
+generation only: GRF variable-importance ordering of the cut columns
+is a separate step controlled solely by \code{vi.grf.min} and runs,
+or is skipped, regardless of \code{use_grf}.  Default FALSE.
+The default changed from \code{TRUE} in an earlier release, for the same
+fixed-candidate-family reason given under \code{use_lasso}.}
 
 \item{grf_res}{GRF results object (optional, for reuse).}
 
 \item{grf_cuts}{List. Custom GRF cut points (optional).}
 
-\item{max_n_confounders}{Integer. Maximum confounders to consider. Default 1000.}
+\item{use_dina}{Logical. Generate additional screening-stage candidate
+cuts from a DINA per-covariate Pareto frontier, fed into
+\code{\link{get_FSdata}} alongside the GRF cuts. Default FALSE
+(opt-in); existing behaviour is unchanged when FALSE.}
+
+\item{dina_res}{A fitted DINA object (optional, for reuse). When NULL
+and \code{use_dina = TRUE}, a DINA model is fit at the screening
+stage.}
+
+\item{dina_cuts}{Character vector of pre-supplied DINA cut expressions
+(optional). When supplied, the DINA fit / frontier step is skipped
+and these are used directly.}
+
+\item{dina_args}{Named list of DINA tuning options, all optional.
+Recognised keys: \code{family} (defaults to the mapping from
+\code{outcome_type}: survival -> cox, binary -> binomial,
+continuous -> gaussian, count -> poisson), \code{seed} (defaults to
+\code{seedit}), and the fit-only keys \code{n_folds},
+\code{cens_type}, \code{cens_params} (passed to \code{\link{dina}}
+only when set); plus the frontier keys forwarded to
+\code{\link{dina_frontier}}: \code{scope} (default \code{"wide"}),
+\code{m_diff}, \code{n_min} (defaults to the \code{n.min} of this
+call), \code{direction}, \code{max_per_covariate}, \code{max_subgroups},
+and \code{digits}; plus the screening-behavior keys \code{selected_only}
+(default \code{TRUE}, matching GRF's \code{return_selected_cuts_only}),
+\code{max_depth} (\code{2L} default -- aligning DINA with \code{maxk = 2}
+and \code{grf_depth = 2} so the selected cut may be an AND-conjunction of
+two covariates; set \code{1L} for single-covariate cuts only), and
+\code{grid_probs}
+(the per-covariate quantile grid for depth-2 pair thresholds; default
+interior deciles).  \code{max_depth} / \code{grid_probs} are forwarded
+to \code{\link{dina_subgroup}} and apply to both the selected-cut
+screening and \code{subgroup_method = "dina"}.  (The selector statistic
+formerly accepted here as \code{select_statistic} is now the top-level
+\code{dina_select_statistic} argument; a value supplied inside
+\code{dina_args} is deprecated and overridden with a warning.)
+When \code{selected_only = TRUE} (the default), \code{use_dina} screening
+contributes the cut(s) chosen by \code{\link{dina_subgroup}} -- using
+this call's \code{sg_focus} / \code{selection_rule} /
+\code{effect_neighborhood} / \code{n.min} / \code{hr.threshold}, i.e. the
+same cut \code{subgroup_method = "dina"} would select. Set \code{FALSE} to
+contribute the full frontier candidate set instead.
+
+\strong{\code{m_diff} is the candidacy floor, on the link scale, and is
+derived rather than taken from this list.}  It is the harm floor a
+candidate must clear to enter the qualifying family that \code{sg_focus}
+then ranks -- \code{log(HR)} for \code{cox}, \code{log(OR)} for
+\code{binomial}, \code{log(IRR)} for \code{poisson}, and the raw mean
+difference for \code{gaussian}.  Under \code{subgroup_method = "dina"}
+(and under \code{selected_only = TRUE} screening) it is computed as
+\code{log(hr.threshold)} -- identity for \code{gaussian} -- from the
+resolved \code{effect.threshold}, and an \code{m_diff} supplied here is
+\strong{ignored}.  Set the floor with \code{effect.threshold} /
+\code{hr.threshold}.  The key remains meaningful only where the raw
+\code{\link{dina_frontier}} candidate set is used directly.
+
+\strong{The same holds for every frontier key, not only
+\code{m_diff}.}  All seven -- \code{scope}, \code{m_diff},
+\code{n_min}, \code{direction}, \code{max_per_covariate},
+\code{max_subgroups} and \code{digits} -- are \strong{inert under}
+\code{subgroup_method = "dina"}, which selects with
+\code{\link{dina_subgroup}} and never consults a frontier table.  Under
+\code{use_dina = TRUE} screening with \code{selected_only = TRUE} (the
+default) a frontier is computed and then discarded in favour of the
+selected cut, so six of the seven change nothing; only \code{digits}
+still acts, rounding the threshold in the emitted cut expression.  The
+seven keys govern the candidate pool only under
+\code{selected_only = FALSE}, where
+\code{\link{dina_frontier}}'s \code{cut_expr} column \emph{is} the pool.
+Supplying any of the seven under \code{subgroup_method = "dina"} now
+raises a single \code{warning()} naming every offending key.
+
+Under \code{dina_select_statistic = "effect"} the floor still defines the
+qualifying family on the tau-hat scale while selection re-ranks that
+family on the refit inferential effect; because multiplier resampling
+de-biases over the realized selection event, \code{m_diff} fixes the
+family MR de-biases over.  See \code{\link{dina_subgroup}}.
+Unknown keys raise
+an error.}
+
+\item{dina_select_statistic}{Character, one of \code{"effect"} (default) or
+\code{"dina"}, used only when \code{subgroup_method = "dina"}.  The DINA
+analogue of \code{grf_select_statistic}.  \code{"dina"} ranks DINA's
+qualifying family on its native subgroup-mean tau-hat (unchanged legacy
+behaviour).  \code{"effect"} re-ranks the same family on the inferential
+effect measure (Cox HR for survival; the resolved GLM effect otherwise),
+scored with the same per-candidate estimator multiplier resampling (MR)
+uses, so the realized selection is the exact event MR de-biases (and
+MR's native-family restriction follows the effect rather than
+tau-hat).  \code{"effect"} is the default because only it ranks on the
+inferential coefficient; \code{"dina"} is rejected under
+\code{mr_inference = TRUE}.}
+
+\item{subgroup_method}{Character, one of \code{"consistency"} (default),
+\code{"dina"}, or \code{"grf"}. \code{"consistency"} is the standard
+ForestSearch pipeline (GRF/LASSO screening then the consistency search).
+\code{"dina"} delegates subgroup \emph{selection} to
+\code{\link{dina_subgroup}} and bypasses GRF, LASSO and the consistency
+search: a DINA model is fit, a single subgroup is selected using this
+call's \code{sg_focus} / \code{selection_rule} /
+\code{effect_neighborhood} / \code{n.min} / \code{hr.threshold}, and
+that subgroup is returned as \code{sg.harm}. \code{dina_args} supplies
+only the DINA \emph{fit} tuning in this mode (frontier keys are
+ignored). \code{"grf"} is the GRF analogue: it delegates selection to the
+GRF subgroup-identification routine
+(\code{\link{grf.subg.harm.survival}} for survival,
+\code{\link{grf.subg.harm.glm}} for GLM outcomes), again bypassing LASSO,
+DINA and the consistency search, and returns the policy-tree harm leaf as
+\code{sg.harm}. GRF-selection mode is configured from this call's existing
+GRF arguments (\code{frac.tau}, \code{dmin.grf}, \code{grf_depth},
+\code{is.RCT}, \code{seedit}, and the GLM extras) -- there is no separate
+argument list -- so it uses the same settings GRF screening would. For
+both \code{"dina"} and \code{"grf"}, the existing bootstrap de-biasing
+applies unchanged, re-fitting and re-selecting on each replicate. The
+selected subgroup may be a single covariate or, where the method's depth
+allows (DINA \code{max_depth = 2}; GRF \code{grf_depth >= 2}), an
+AND-conjunction.}
+
+\item{max_n_confounders}{Integer. Maximum number of candidate cut columns
+retained after GRF variable-importance screening, keeping the
+highest-importance columns.  Default 1000.  \strong{Applied only when
+\code{vi.grf.min} is numeric}: the truncation lives inside the
+variable-importance block, so with \code{vi.grf.min = NULL} (the
+default) this argument has no effect, and a finite value below the
+number of cut columns triggers a warning saying so.}
 
 \item{grf_depth}{Integer. GRF tree depth. Default 2.}
 
-\item{dmin.grf}{Integer. Minimum events for GRF. Default 12.}
+\item{grf_selection}{Character, one of \code{"frontier"} (default) or
+\code{"tree"}, used only when \code{subgroup_method = "grf"}.
+\code{"tree"} selects via the GRF policy tree. \code{"frontier"} selects
+from the Pareto frontier of the doubly-robust scores (see
+\code{\link{grf.subg.harm.survival}}); the frontier rule is taken from
+\code{sg_focus} -- \code{"eff"}, \code{"effMaxSG"}, \code{"effMinSG"},
+\code{"maxSG"} and \code{"minSG"} each map to the aligned frontier rule,
+as in \code{dina_subgroup()} -- and the relative band from
+\code{effect_neighborhood}.  \code{"maxeff"} and \code{"maxeffCons"} map
+\strong{explicitly} to the plain effect-argmax rule (\code{"eff"}), the
+same rule \code{"hr"} takes: GRF computes no \code{Pcons}, so the
+\code{Cons} qualifier has nothing to bind to.  The mapping is exhaustive
+over the canonical foci and raises an error rather than falling through,
+so no focus can silently select under a rule the caller did not request.
+(Earlier versions had no branch for these two and defaulted them to
+\code{"effMaxSG"} silently; pairing them with
+\code{grf_selection = "frontier"} is now well defined.)
+\code{"frontier"} is the default
+because it enumerates a family that can be ranked on the inferential
+effect; the policy tree exposes no such family, so \code{"tree"} is
+rejected under \code{mr_inference = TRUE}.}
 
-\item{frac.tau}{Numeric. Fraction of tau for RMST. Default 0.6.}
+\item{grf_select_statistic}{Character, one of \code{"effect"} (default) or
+\code{"dr"}, used only when \code{subgroup_method = "grf"} and
+\code{grf_selection = "frontier"}.  \code{"dr"} selects the frontier winner
+on GRF's native doubly-robust score (legacy behaviour).  \code{"effect"}
+re-ranks the same DR-candidate frontier on the inferential effect measure
+(Cox HR for survival; the resolved GLM effect otherwise), scored with the
+same per-candidate estimator multiplier resampling (MR) uses, so the realized
+selection is the exact event MR de-biases (and MR's
+native-family restriction follows the effect rather than the DR score).
+\code{"effect"} is the default because only it ranks on the inferential
+coefficient; \code{"dr"} is rejected under \code{mr_inference = TRUE}.
+Ignored for \code{grf_selection = "tree"} (the policy-tree leaf is the
+selection, with no enumerated family to rank).}
+
+\item{dmin.grf}{Numeric. Minimum events for GRF. Default 0.0.}
+
+\item{frac.tau}{Numeric in (0, 1]. Multiplier on the GRF time horizon
+passed to \code{grf::causal_survival_forest()}. The effective
+horizon is
+\code{frac.tau * min(max(Y[treated, event]), max(Y[control, event]))},
+i.e. \code{frac.tau} times the smaller of the two arm-specific
+maximum event times.  Values < 1 truncate the horizon inward of
+that maximum (the conservative choice when events are sparse near
+the tail).  Applies to both the GRF variable-importance
+pre-screen inside \code{forestsearch()} and the downstream call to
+\code{\link{grf.subg.harm.survival}}.  Used only when
+\code{outcome_type = "survival"}; ignored for GLM outcomes
+(binary, continuous, count).  Default 0.8.}
 
 \item{return_selected_cuts_only}{Logical. If TRUE (default), GRF returns only cuts from the
 tree depth that identified the selected subgroup meeting \code{dmin.grf}. If FALSE
 returns all cuts from all fitted trees (depths 1 through \code{grf_depth}).
 See \code{\link{grf.subg.harm.survival}} for details.}
 
-\item{conf_force}{Character vector. Variables to force include (optional).}
+\item{conf_force}{Character vector of forced cut expressions (optional),
+e.g. \code{c("er <= 0", "pgr <= 10")}. Literal cut locations: unlike the
+\verb{conf.cont_*} arguments these do not move with a resample.}
 
 \item{defaultcut_names}{Character vector. Default cut variable names (optional).}
 
-\item{cut_type}{Character. Cut type ("default" or "custom"). Default "default".}
+\item{cut_type}{Character. Cut strategy: \code{"default"} or \code{"median"}. Default
+\code{"default"}. These are the only permitted values -- \code{get_FSdata()}
+validates against them and errors otherwise.}
 
 \item{exclude_cuts}{Character vector. Variables to exclude from cutting (optional).}
 
@@ -127,52 +372,356 @@ See \code{\link{grf.subg.harm.survival}} for details.}
 
 \item{cont.cutoff}{Integer. Cutoff for continuous vs categorical. Default 4.}
 
-\item{conf.cont_medians}{Named numeric vector. Median values for continuous variables (optional).}
+\item{conf.cont_medians}{Character vector of continuous confounders to cut at
+their median (optional). \strong{Names, not values} -- the cut location is the
+median computed from the supplied data, so it is not fixed by this
+argument and moves with a resample. To pin a cut location, pass a literal
+cut expression via \code{conf_force}.}
 
-\item{conf.cont_medians_force}{Named numeric vector. Forced median values (optional).}
+\item{conf.cont_medians_force}{Character vector of additional continuous
+confounders to force a median cut on (optional). Names, not values, with
+the same consequence as \code{conf.cont_medians} above.}
 
-\item{n.min}{Integer. Minimum subgroup size. Default 60.}
+\item{conf.cont_jcuts}{Named integer list (each value >= 1). Per-variable
+J-quantile cut override for continuous covariates: for an entry
+\code{X = J}, the default cut set for X is replaced by \code{J}
+binary cut points at the (k/(J+1))-th quantiles of X
+(k = 1, ..., J), defining J+1 non-overlapping intervals.  Names
+must be in \code{confounders.name} and must not overlap with
+\code{defaultcut_names} or \code{conf.cont_medians_force}.  J-cut
+variables bypass LASSO filtering, matching \code{defaultcut_names}
+semantics.  Variables not listed retain default behaviour.
+Forwarded to \code{\link{get_FSdata}} via \code{filter_call_args()};
+see there for full semantics.}
 
-\item{hr.threshold}{Numeric. Minimum HR for candidate subgroups. Default 1.25.}
+\item{collapse_cuts}{Logical.  If TRUE, collapse near-redundant continuous
+candidate cuts before the search.  Continuous covariates can generate many
+thresholds that are practically redundant (e.g. \code{"age <= 35.7"} and
+\code{"age <= 35"}); when enabled, cuts on the same variable and operator
+within a per-variable standard-error band are merged to a single
+rounded-centroid threshold, subject to a membership safety check.
+Forwarded to \code{\link{get_FSdata}}; see \code{\link{collapse_redundant_cuts}}
+for the algorithm.  Default TRUE.  Pass \code{collapse_cuts = FALSE} to
+recover the un-coarsened candidate pool used by earlier package versions.}
 
-\item{hr.consistency}{Numeric. Minimum HR for consistency validation. Default 1.0.}
+\item{collapse_cuts_args}{List of overrides merged onto the defaults
+\code{list(c = 1.0, tol = 0.05, digits = 0L)}: band multiplier \code{c}
+(\code{band = c * sd(x)/sqrt(n)}), membership safety tolerance \code{tol}
+(fraction of n when < 1, absolute count when >= 1), and representative
+rounding \code{digits}.  Ignored when \code{collapse_cuts = FALSE}.}
 
-\item{sg_focus}{Character. Subgroup selection focus. One of "hr", "hrMaxSG", "maxSG",
-"hrMinSG", "minSG". Default "hr".}
+\item{n.min}{Integer or \code{NULL}. Minimum subgroup size. Default 60.
+Supplying a value (or omitting the argument) uses that fixed floor, as in
+prior versions. Passing \code{n.min = NULL} opts into a sample-size-adaptive
+floor \code{max(60, ceiling(n.min.frac * N))}, where \code{N} is the
+analysis sample size -- at least 60, and at least \code{n.min.frac} of
+\code{N}. Growing the minimum subgroup size with \code{N} curbs false
+discovery from very small subgroups in large samples. The resolved integer
+is used everywhere downstream (screening, DINA, GRF, the consistency
+search, and the bootstrap).}
+
+\item{n.min.frac}{Numeric in (0, 1). Fraction of the analysis sample size
+used for the adaptive \code{n.min} floor when \code{n.min = NULL}. Default
+0.10. Ignored when \code{n.min} is supplied.}
+
+\item{effect.threshold}{Numeric or NULL. \code{c1}, the \strong{screening
+threshold on a candidate subgroup's own effect}, estimated on the full
+sample.  A candidate must clear it to enter the consistency stage.  For
+ratio-scale measures (OR, RR, IRR, HR): on the ratio
+scale (e.g., 1.5 means OR >= 1.5).  For identity-scale measures
+(RD, IRD, MD): on the identity scale (e.g., 0.07 means RD >= 7 pct
+points).  If NULL (default), falls back to \code{hr.threshold}.
+Distinct from \code{consistency.threshold} (\code{c2}), which is applied
+within each split half, and from \code{pconsistency.threshold} (\verb{p*}),
+which is a proportion rather than an effect.  On the consistency path with
+a ratio estimand (survival HR, binary \code{"OR"}), supplying \code{c1} and
+\strong{not} \code{c2} derives \code{c2 = 0.80 * c1} on the ratio scale, with
+a message; see the \emph{Threshold vocabulary and resolved defaults}
+section for that rule and for the value this resolves to under each
+estimand.}
+
+\item{consistency.threshold}{Numeric or NULL. \code{c2}, \strong{an effect
+threshold} -- \strong{not} a proportion, and \strong{not} the
+consistency rate.  It is applied to the subgroup's effect estimated
+\emph{within each split half}; a split counts as consistent when both of
+its halves clear \code{c2}.  Same scale conventions as
+\code{effect.threshold}.
+If NULL (default), falls back to \code{hr.consistency}.
+Its companion is \code{pconsistency.threshold} (\verb{p*}), the
+\emph{fraction} of splits that must clear \code{c2}: this argument sets the
+bar, that one counts how often the bar is met.  Both names contain the
+word "consistency" and they are different quantities.  On the consistency
+path with a ratio estimand (survival HR, binary \code{"OR"}) \code{c2} must be
+\strong{less than or equal to} \code{c1}; \code{c2 > c1} is an error.  Left
+unsupplied there, it is derived as \code{0.80 * c1} rather than left at
+its default.  See the \emph{Threshold vocabulary and resolved defaults}
+section for both rules and for the value this resolves to under each
+estimand.}
+
+\item{hr.threshold}{Numeric. Legacy name for \code{effect.threshold} --
+\code{c1}, the screening threshold on a candidate subgroup's own effect.
+Retained for backward compatibility.  Default 1.25.  When
+\code{effect.threshold} is provided, \code{hr.threshold} is ignored;
+supplying both at disagreeing values is an error.  Carries the same
+\code{c2} derivation as \code{effect.threshold}.}
+
+\item{hr.consistency}{Numeric. Legacy name for
+\code{consistency.threshold} -- \code{c2}, the per-split \strong{effect}
+threshold, not a proportion and not the consistency rate.
+Retained for backward compatibility.  Default 1.0.  When
+\code{consistency.threshold} is provided, \code{hr.consistency} is
+ignored; supplying both at disagreeing values is an error.  Carries the
+same \code{c2 <= c1} requirement as \code{consistency.threshold}.}
+
+\item{sg_focus}{Character. Subgroup selection focus -- \emph{what} is
+selected, not merely how candidates are sorted. Except for
+\code{"maxeff"}, every focus selects among \strong{qualifiers}: candidates
+whose consistency rate reaches \code{pconsistency.threshold}. One of:
+\describe{
+\item{\code{"hr"} (or \code{"eff"}, \code{"maxcons"})}{Pick the
+qualifier with the highest consistency (\code{Pcons}); ties broken by
+largest effect.  \strong{This is consistency-primary with effect only
+as a tiebreak} -- despite the name, it does not maximise the effect.
+Use \code{"maxeffCons"} for that.  \code{"maxcons"} is the
+recommended spelling, since it says what the rule does.}
+\item{\code{"maxeffCons"}}{Pick the qualifier with the largest effect;
+ties broken by fewest cuts (\code{K}).  The effect maximiser
+\emph{subject to} the consistency floor -- as against \code{"maxeff"},
+which applies no floor.  This is the only focus for which early
+stopping is sound; see \code{stop_threshold}.}
+\item{\code{"maxSG"}}{Pick the qualifier with the largest sample
+size; ties broken by consistency.  Not a spelling of
+\code{"hrMaxSG"}: it applies no effect band.}
+\item{\code{"minSG"}}{Pick the qualifier with the smallest sample
+size; ties broken by consistency.  Not a spelling of
+\code{"hrMinSG"}.}
+\item{\code{"hrMaxSG"} (or \code{"effMaxSG"})}{Among candidates
+with effect size within \code{effect_neighborhood} of the
+maximum, pick the one with the \emph{largest} sample size.}
+\item{\code{"hrMinSG"} (or \code{"effMinSG"})}{Among candidates
+with effect size within \code{effect_neighborhood} of the
+maximum, pick the one with the \emph{smallest} sample size.}
+\item{\code{"maxeff"}}{The effect maximiser over the enumerated
+family, with no consistency threshold, effect threshold, early
+stopping, two-stage screening or candidate-pool truncation.
+Implements the argmax primitive of Guo and He (2021). Size/event
+minima (\code{n.min}, \code{d0.min}, \code{d1.min}) still apply as
+estimability constraints; prevalence and redundancy pruning are
+relaxed to their most permissive setting (\code{minp} -> 0,
+\code{rmin} -> 0) and duplicate removal collapses identical-membership
+candidates to their fewest-cut representative, so only degenerate or
+exactly-duplicated candidates are dropped and the argmax is invariant.
+Because consistency (\code{Pcons}) never enters the argmax, it is
+computed for the SELECTED subgroup only (reported alongside it) rather
+than for every candidate, avoiding the per-candidate consistency refits.
+Contrast \code{"maxeffCons"}, which applies the same argmax but only
+among candidates clearing \code{pconsistency.threshold}, and
+\code{"hr"}, which ranks by consistency first and uses effect only as
+a tiebreaker.}
+}
+\strong{The descriptions above are for \code{subgroup_method =
+  "consistency"}.}  There, \code{"maxeffCons"} retains \emph{both} the
+consistency floor (\code{pconsistency.threshold}) and the effect floor,
+while \code{"maxeff"} disables both -- the distinction the \code{Cons}
+suffix names.
+
+For \code{subgroup_method = "dina"} and \code{"grf"}, \code{"maxeff"} and
+\code{"maxeffCons"} are \strong{synonyms}, both selecting the effect
+maximiser over the identifier's qualifiers with the harm floor active.
+Neither engine has a consistency floor -- neither computes \code{Pcons},
+and no DINA or GRF sort key contains one -- so the \code{Cons} qualifier
+has nothing to bind to.  The two could in principle have been separated
+by the effect floor alone; they deliberately are not, because the
+manuscript keeps the harm threshold in a common form across all three
+identifiers, and \code{"maxeff"} exists for \code{"consistency"} as a
+comparison against the argmax primitive of Guo and He (2021), which has
+no DINA or GRF counterpart.  No floor is disabled by this on any path,
+and the collapse raises no condition: it is intended behaviour, and a
+warning would fire on every such run.
+
+\strong{Per-engine resolution.}  Every accepted spelling, and the rule
+that actually runs for it on each engine:
+
+\tabular{lll}{
+\strong{sg_focus} \tab \strong{consistency} \tab \strong{dina / grf} \cr
+\code{eff}, \code{hr}, \code{maxcons} \tab consistency argmax
+(\code{Pcons}-primary, effect breaks ties) \tab effect argmax,
+\code{order(-eff)} \cr
+\code{maxeff} \tab effect argmax, no floors \tab effect argmax,
+\code{order(-eff)} \cr
+\code{maxeffCons} \tab effect argmax with the consistency floor \tab
+effect argmax, \code{order(-eff)} \cr
+\code{effMaxSG}, \code{hrMaxSG} \tab largest N within the effect band,
+per \code{selection_rule} \tab as documented in
+\code{\link{dina_subgroup}} \cr
+\code{effMinSG}, \code{hrMinSG} \tab smallest N within the effect band,
+per \code{selection_rule} \tab as documented in
+\code{\link{dina_subgroup}} \cr
+\code{maxSG} \tab largest N among qualifiers \tab largest N \cr
+\code{minSG} \tab smallest N among qualifiers \tab smallest N \cr
+}
+
+The collapse sets, stated explicitly.  On \code{"consistency"},
+\{\code{eff}, \code{hr}, \code{maxcons}\} is one rule, and \code{maxeff}
+and \code{maxeffCons} are two further \emph{distinct} rules.  On
+\code{"dina"} and \code{"grf"}, \{\code{eff}, \code{hr}, \code{maxcons},
+\code{maxeff}, \code{maxeffCons}\} is \strong{one} rule -- five spellings,
+one \code{order(-eff)}.
+
+\code{forestsearch()} announces both collapses at run time: when the
+canonical rule differs from the spelling passed, it emits one
+\code{message()} (suppressed by \code{quiet}) naming the rule that will
+actually run.  \code{\link{fs_focus_tag}} returns the stem tag for each
+cell of the table above, and is the supported way to label output files by
+the rule that ran rather than by the spelling requested.
+
+Default \code{"hr"}.  The \code{"eff*"} forms are aliases for the
+\code{"hr*"} forms and read more naturally in GLM contexts
+(continuous MD, binary OR/RR/RD, count IRR) where there is no
+hazard ratio.  Both vocabularies produce identical results; pick
+whichever fits the outcome type.  See \code{\link{sort_subgroups}}
+for full sort keys and tiebreakers.
+
+\strong{Scope of the band arguments.}  \code{selection_rule} and
+\code{effect_neighborhood} configure the effect band, which only
+\code{"hrMaxSG"} / \code{"hrMinSG"} (equivalently \code{"effMaxSG"} /
+\code{"effMinSG"}) consult.  They are inert for every other focus, and
+supplying \code{selection_rule} other than \code{"neighborhood"} with a
+non-band focus is an error rather than a silent no-op.
+
+\strong{Choosing between the three effect-oriented rules.}
+\code{"maxeff"} answers "what is the most extreme subgroup in this
+family?"; \code{"maxeffCons"} answers "what is the most extreme subgroup
+that also replicates across splits?"; \code{"hr"}/\code{"maxcons"} answers
+"which subgroup replicates most reliably?".  They can and do select
+different subgroups on the same data.}
+
+\item{selection_rule}{Character. Rule defining the candidate
+inclusion set for \code{"hrMaxSG"} / \code{"hrMinSG"}.  One of
+\code{"neighborhood"} (default; current behaviour),
+\code{"pareto"} (2D Pareto-non-dominated set in (effect, N)),
+or \code{"both"} (intersection of the two).  Forwarded to
+\code{\link{sort_subgroups}} via \code{filter_call_args()};
+see there for full semantics.  Must be \code{"neighborhood"} for
+other \code{sg_focus} values.}
+
+\item{effect_neighborhood}{Numeric in \code{[0, 1)}.  Relative
+tolerance for \code{"hrMaxSG"} and \code{"hrMinSG"} selection.  A
+candidate is in the \emph{effect-size neighborhood} iff its
+(natural-scale) effect is at least
+\code{(1 - effect_neighborhood) * max(effect)}.  Default
+\code{0.10} (within 10\\% of the strongest effect).  Setting
+\code{effect_neighborhood = 0} reduces \code{"hrMaxSG"}/
+\code{"hrMinSG"} to a strict max-effect filter (only candidates
+tied at the maximum qualify).  For GLM ratio measures (OR, IRR),
+the neighborhood test is applied on the natural scale.  Ignored
+when \code{sg_focus} is \code{"hr"}, \code{"maxSG"}, or
+\code{"minSG"}.}
 
 \item{fs.splits}{Integer. Number of splits for consistency evaluation (or maximum
 splits when \code{use_twostage = TRUE}). Default 1000.}
 
 \item{m1.threshold}{Numeric. Maximum median survival threshold. Default Inf.}
 
-\item{pconsistency.threshold}{Numeric. Minimum consistency proportion. Default 0.90.}
+\item{pconsistency.threshold}{Numeric. \verb{p*}, a \strong{proportion} in
+\code{[0, 1]} -- the fraction of random splits that must be consistent, where a
+split is consistent when both of its halves clear
+\code{consistency.threshold} (\code{c2}).  It is a rate, not an effect
+threshold: it never enters an effect comparison, and unlike \code{c1} and \code{c2}
+it is \strong{not} remapped per estimand -- the same number means the
+same thing for every \code{outcome_type}.  Default 0.90.
+Overridden to \code{0} under \code{sg_focus = "maxeff"} (no consistency filter).}
 
 \item{stop_threshold}{Numeric in \code{[0, 1]} or \code{NULL}.
 Early stopping threshold for consistency evaluation. When a candidate
 subgroup's consistency probability (\code{Pcons}) meets or exceeds this
-threshold, evaluation stops early — remaining candidates are skipped.
+threshold, evaluation stops early -- remaining candidates are skipped.
 Set to \code{NULL} to disable early stopping and force evaluation of
-all candidates up to \code{max_subgroups_search}. Default \code{0.95}.
+all candidates up to \code{max_subgroups_search}. Defaults to
+\code{pconsistency.threshold}, so it tracks the consistency floor
+automatically if that is changed.
+
+\strong{Applies to \code{sg_focus = "maxeffCons"} only.} Early stopping
+halts the scan and then applies the focus's selection key to the resulting
+prefix, so it is sound only when that key is fully determined by the
+enumeration order.  \code{Pcons} is not -- it is unknown until a candidate
+is evaluated -- so any focus whose key contains a \code{Pcons} term can be
+beaten by a candidate the scan never reached.  \code{"maxeffCons"} is the
+only focus with no such term: its key \code{(-hr, K)} is exactly the
+enumeration order \code{(-HR, K)}, ties included, so the first qualifying
+candidate is provably the winner.
+
+For every other focus \code{stop_threshold} is reset to \code{NULL}, with a
+warning if it was supplied explicitly:
+\itemize{
+\item \code{"hr"} (\code{"eff"}, \code{"maxcons"}) selects on
+\code{Pcons} directly;
+\item \code{"maxSG"} / \code{"minSG"} use \code{Pcons} to break ties in
+subgroup size, which a truncated scan can miss;
+\item \code{"hrMaxSG"} / \code{"hrMinSG"} additionally need the whole
+pool to compute the effect neighborhood;
+\item \code{"maxeff"} evaluates only its winner, so early stopping has
+nothing to skip.
+}
 
 \strong{Note:} Values > 1.0 are not permitted. To disable early
-stopping, use \code{stop_threshold = NULL}, not a value above 1.
+stopping, use \code{stop_threshold = NULL}, not a value above 1.}
 
-Automatically reset to \code{NULL} (with a warning) when
-\code{sg_focus} is \code{"hrMaxSG"} or \code{"hrMinSG"}, as these
-compound criteria require comparing HR \emph{and} size across all
-candidates.}
+\item{pconsistency.digits}{Integer. Number of decimal places to which the
+consistency proportion is rounded \strong{before} it is compared with
+\code{pconsistency.threshold}.  The rounded value decides admission and
+is the value the selection sort orders on, so this setting affects which
+subgroups are admitted, not only what is displayed.  At the default of 2,
+a threshold of \verb{p*} admits any candidate whose unrounded proportion is at
+or above the largest 0.01 grid point strictly below \verb{p*} plus half a step
+(0.005) -- so \verb{p* = 0.99} admits from about 0.985.  Raising the setting
+makes admission finer-grained and produces fewer exact ties for the
+selection rule to break.  Under \code{consistency_method = "resample"}
+the proportion is a continuous closed-form quantity, so the rounding is a
+deliberate coarsening rather than a formatting step.
+Passed to \code{\link{subgroup.consistency}}.  Default 2.}
 
-\item{showten_subgroups}{Logical. Show top 10 subgroups. Default FALSE.}
+\item{show_candidate_summary}{Logical. If \code{TRUE}, prints a
+post-consistency summary table of all passing candidates with
+Frontier/InBand/Selected flags.  See
+\code{\link{subgroup.consistency}} for details.  Default
+\code{FALSE}.}
 
-\item{d0.min}{Integer. Minimum control arm events. Default 12.}
+\item{max_print}{Integer. Maximum number of candidate subgroups to print in
+the pre- and post-consistency candidate summaries when
+\code{show_candidate_summary = TRUE}.  Candidates are printed in sorted
+order with the selected subgroup first, so \code{max_print = 10} shows the
+selected subgroup and the next nine, followed by a "... N more not shown"
+line.  Only the per-candidate rows are capped; the banner, header, legend,
+and summary footer are always printed.  Default \code{10} (the selected
+subgroup and the next nine); use \code{Inf} to print all candidates.}
 
-\item{d1.min}{Integer. Minimum treatment arm events. Default 12.}
+\item{d0.min}{Integer. Minimum per-arm filter for candidate subgroups.
+For \code{"survival"} and \code{"binary"} outcomes, this is the minimum
+number of events in the control arm (for binary, events are Y = 1).
+Ignored for \code{"continuous"} outcomes (only \code{n.min} applies).
+Default 10.}
 
-\item{max.minutes}{Numeric. Maximum search time in minutes. Default 3.}
+\item{d1.min}{Integer. Same as \code{d0.min} for the treatment arm.
+Default 10.}
+
+\item{max.minutes}{Numeric. \strong{Currently inert; scheduled for
+deprecation in v0.3.0.} Previously intended as a wall-clock time
+budget for the combination search, this argument is no longer
+enforced in the parallelized search path and has no effect on
+behavior. Search scope is governed by \code{maxk}, the candidate-factor
+front ends (\code{use_grf}, \code{use_lasso}, \code{conf_force}),
+and the number of parallel workers. The default of 3 is retained
+only for signature compatibility.}
 
 \item{minp}{Numeric. Minimum prevalence threshold. Default 0.025.}
 
 \item{details}{Logical. Print progress details. Default FALSE.}
+
+\item{quiet}{Logical. If TRUE, suppress the configuration summary
+message printed at startup.  Useful when \code{forestsearch()} is
+called repeatedly inside bootstrap or cross-validation loops.
+Default FALSE.}
 
 \item{maxk}{Integer. Maximum number of factors per subgroup. Default 2.}
 
@@ -182,14 +731,47 @@ candidates.}
 
 \item{plot.grf}{Logical. Plot GRF results. Default FALSE.}
 
-\item{max_subgroups_search}{Integer. Maximum subgroups to evaluate. Default 10.}
+\item{max_subgroups_search}{Numeric. Maximum subgroups to evaluate.
+\strong{Default \code{Inf}} -- no truncation.  The cap has no counterpart
+in the method: the candidate family is every conjunction of at most two
+conditions, less empty intersections and size/event failures, and
+selection ranges over that family.  A finite value truncates the pool
+under a \emph{preview} ordering, so the subgroup that is optimal under
+the actual criterion can be discarded before it is ever evaluated -- most
+acutely for the size foci \code{"maxSG"} / \code{"minSG"}, where small
+high-effect subgroups sort last, and for the band foci
+\code{"effMaxSG"} / \code{"effMinSG"}.  When a finite value does truncate
+the pool a warning naming both counts is emitted.
 
-\item{vi.grf.min}{Numeric. Minimum GRF variable importance. Default -0.2.}
+Set a finite value only to bound runtime, knowing it can change which
+subgroup is selected.  The default was \code{200} in earlier versions.}
+
+\item{vi.grf.min}{Numeric or \code{NULL}.  GRF variable-importance
+screening of the candidate cut columns.  \code{NULL} (the default since
+0.3.0) skips the screening entirely: no causal forest is fitted and the
+cut columns are searched in the order \code{get_FSdata()} builds them.
+A numeric value fits a causal forest (\code{grf::causal_forest()} for
+GLM outcomes, \code{grf::causal_survival_forest()} for survival),
+\strong{orders} the cut columns by variable importance, and retains those
+with \code{vi_ratio > vi.grf.min}, where \code{vi_ratio} is each column's
+importance divided by the maximum.  At values \code{<= 0} nothing is
+filtered out -- \code{grf::variable_importance()} is non-negative and the
+block is guarded by \code{vi_max > 0} -- so the effect is ordering only.
+That ordering sets the candidate matrix's column order; it does
+\strong{not} reach candidate selection, because the candidate table is
+re-sorted by \code{(-HR, K)} before the consistency loop.  Measured effect
+on \code{n_candidates_evaluated} and \code{early_stop_candidate}: zero;
+the selected subgroup's subject membership is unchanged and only the
+clause order of \code{sg.harm} may differ.  Versions before 0.3.0
+defaulted to \code{-0.2}; pass \code{vi.grf.min = -0.2} explicitly to
+reproduce their output.  \code{max_n_confounders} is applied
+\strong{only when this screening runs} -- see that argument.}
 
 \item{use_twostage}{Logical. Use two-stage sequential consistency algorithm for
 improved performance. Default FALSE for backward compatibility. When TRUE,
 \code{fs.splits} becomes the maximum number of splits, and early stopping
-is enabled. See Details.}
+is enabled. See Details.  Overridden to \code{FALSE} under
+\code{sg_focus = "maxeff"} (no two-stage screening).}
 
 \item{twostage_args}{List. Parameters for two-stage algorithm (only used when
 \code{use_twostage = TRUE}):
@@ -201,6 +783,204 @@ is automatically calculated to provide ~2.5 SE margin.}
 \item{conf.level}{Numeric. Confidence level for early stopping. Default 0.95.}
 \item{min.valid.screen}{Integer. Minimum valid Stage 1 splits. Default 10.}
 }}
+
+\item{consistency_method}{Character. \code{"resample"} (default) uses the
+multiplier (influence-function / \code{dfbeta}) approximation
+(\code{\link{consistency_resample}}), returning the rate from a single
+subgroup fit; \code{"split"} is retained as the fallback and runs the
+literal repeated 50/50 split-and-refit calculation, which costs
+\code{fs.splits * 2} refits per candidate evaluation. Despite the name, \code{"resample"} performs no
+numerical resampling at evaluation time -- the rate is a closed-form
+expression. The name reflects the method's derivation: the repeated-split
+consistency rate admits an equivalent multiplier-resampling (MR)
+representation, and taking that representation to its analytic limit
+yields the closed form implemented here. The \code{"resample"} path applies to the Cox
+(survival) outcome and to GLM outcomes whose effect is a single model
+coefficient (OR, RR, RD, MD, IRR); configurations it cannot represent that
+way (IRD, propensity-adjusted effects, or a non-convergent fit on a given
+candidate) fall back to \code{"split"} automatically. When
+\code{use_twostage = TRUE}, \code{"resample"} bypasses the two-stage
+split screening entirely (the rate is computed directly).}
+
+\item{outcome_type}{Character. One of \code{"survival"} (default),
+\code{"binary"}, \code{"continuous"}, or \code{"count"}.}
+
+\item{effect_measure}{Character or \code{NULL}. Effect measure for GLM
+outcomes.  For binary: \code{"OR"} (default), \code{"RD"},
+\code{"RR"}, \code{"IRR"}, \code{"IRD"}.  For continuous:
+\code{"MD"} (default).  For count: \code{"IRR"} (default),
+\code{"IRD"}.  \code{NULL} resolves to the per-outcome default shown
+here; the resolved measure then fixes the scale on which
+\code{effect.threshold} and \code{consistency.threshold} are compared
+-- log for the ratio measures (\code{"OR"}, \code{"RR"},
+\code{"IRR"}), identity for \code{"RD"}, \code{"IRD"} and
+\code{"MD"} -- so an unset binary call screens on log(1.25) rather
+than 0.05.  See the \emph{Threshold vocabulary and resolved defaults}
+section.  Ignored for \code{outcome_type = "survival"}, which always
+uses the hazard ratio.}
+
+\item{offset.name}{Character or \code{NULL}. Name of the follow-up time
+column for rate-based measures (IRR, IRD).}
+
+\item{adverse_outcome}{Logical or \code{NULL}. If \code{TRUE}, higher
+outcome values indicate harm (default for binary and count).  If \code{FALSE},
+higher values indicate benefit (default for continuous).}
+
+\item{overdispersion}{Character. Overdispersion correction for
+\code{outcome_type = "count"}.  One of \code{"none"} (default,
+standard Poisson), \code{"quasi"} (quasi-Poisson), or \code{"negbin"}
+(negative binomial via \code{MASS::glm.nb}).  Ignored for other
+outcome types.}
+
+\item{grf_count_transform}{Character. Transformation applied to the
+count outcome before passing to \code{grf::causal_forest()} for
+factor screening.  \code{"log"} (default) applies
+\eqn{\log(Y + 0.5)}; \code{"identity"} passes raw counts.
+Ignored for non-count outcomes.}
+
+\item{tune_grf}{Logical. If \code{TRUE}, enables cross-validated
+hyperparameter tuning for GRF's \code{causal_forest()} via
+\code{tune.parameters = "all"}.  If \code{FALSE} (default), all
+GRF parameters remain at their defaults, preserving existing
+behavior.  Applies to both internal GRF pre-screening and
+standalone GRF analysis when passed through
+\code{run_simulation_analysis()}.}
+
+\item{adjust_covariates}{Character vector or \code{NULL}. Additional terms
+used to adjust the Cox model that scores survival subgroups during
+consistency evaluation.  Terms are appended verbatim to the model
+right-hand side after the treatment term, so survival modelling helpers
+may be used directly: \code{adjust_covariates = "strata(x1)"} fits a
+model stratified by \code{x1}, whereas \code{adjust_covariates = "x1"}
+includes \code{x1} as a linear covariate.  The referenced raw columns
+must be present in \code{df.analysis}; they are carried into the
+internal scoring frame automatically.  Applies to the survival (Cox)
+consistency path and to GLM outcomes (the effect-estimator closure
+adds the terms to the outcome model, e.g. logistic for binary/OR).
+The candidate-search ranking is adjusted on both paths.  Mutually
+exclusive with \code{ps_method != "none"}.  Default \code{NULL}
+(treatment-only, unadjusted -- the previous behaviour).}
+
+\item{ps_method}{Character or \code{NULL}. Propensity score estimation
+method: \code{"grf"}, \code{"lasso"}, \code{"logistic"}, or
+\code{"none"}.  Default: \code{"none"} for RCT, \code{"grf"} for
+observational.
+
+\strong{GLM outcome types only} (\code{"binary"}, \code{"continuous"},
+\code{"count"}). Propensity adjustment is \strong{not implemented for
+\code{outcome_type = "survival"}}: no Cox estimation path reads the
+resulting weights, so any value other than \code{"none"} is an error there
+rather than a silent no-op. For confounding control on a survival outcome
+use \code{adjust_covariates}. Note the default resolves to \code{"grf"}
+when \code{is.RCT = FALSE}, so an observational survival analysis must
+pass \code{ps_method = "none"} explicitly.}
+
+\item{ps_adjust_method}{Character. PS adjustment method: \code{"none"}
+(default), \code{"iptw"} (stabilized inverse probability of treatment
+weights), or \code{"dr_gcomp"} (IPS covariate).
+
+\strong{GLM outcome types only}, and consumed only when \code{ps_method} is not
+\code{"none"} -- it selects how the estimator closure is rebuilt, and that
+rebuild is GLM-gated. It has no effect on a survival outcome, which is
+refused at \code{ps_method}.}
+
+\item{ps_hat}{Numeric vector or \code{NULL}. User-supplied propensity
+scores.  Must have length equal to \code{nrow(df.analysis)}, and is
+applied \strong{positionally} to \code{df.analysis}.
+
+Not carried into bootstrap replicates or cross-validation folds: a
+resample has the same row count but different subjects, so a supplied
+score would be attached to the wrong people. Both re-estimate their own
+score per replicate/fold under \code{ps_method}.}
+
+\item{mr_inference}{Logical.  Whether to follow the search with multiplier
+resampling (MR): a refit-free de-biased estimate of the selected
+subgroup's treatment effect, an interval for it, and a harm-confirmation
+flag.  \strong{Default \code{FALSE}}, so by default this function performs
+\emph{identification only} -- no de-biasing, no harm confirmation, and
+\code{mr_inference} / \code{mr_harm_confirmed} come back \code{NULL} /
+\code{NA}.  Setting it \code{TRUE} adds a step that runs \emph{after} the
+subgroup has been chosen and cannot change that choice.  Supported on the
+GLM resample-consistency path (\code{consistency_method = "resample"} with
+a GLM effect) and on the survival/Cox path
+(\code{outcome_type = "survival"}), where it runs under the default
+split-consistency search.  MR approximates the full bootstrap
+(\code{\link{forestsearch_bootstrap_dofuture}}) to leading order and does
+not replace it.  See the vocabulary section.}
+
+\item{mr_inference_args}{List of optional MR controls; used only when
+\code{mr_inference = TRUE}.
+\describe{
+\item{\code{confirm_rule}}{Which harm-confirmation rule to apply to the
+de-biased estimate: \code{"point"} (default) compares the de-biased
+point estimate to \code{t_confirm}; \code{"ci"} compares the one-sided
+95\% selection-adjusted lower bound, and is therefore the stricter
+requirement.}
+\item{\code{t_confirm}}{The threshold \code{confirm_rule} compares
+against, on the \strong{effect} scale (not the working log scale).
+\code{NULL} (default) resolves to the null effect: \code{1} for ratio
+measures, \code{0} for differences.  Set near the null rather than at
+the screening threshold, because the correction over-shrinks true
+effects.}
+\item{\code{reselection}}{Which selection rule to replay on each
+perturbed draw when forming the bias term.  Defaults to the rule
+\code{sg_focus} implies, so it normally needs no setting.}
+\item{\code{draws}}{Number of multiplier draws.  Default \code{2000}.}
+\item{\code{multiplier}}{Multiplier distribution, default
+\code{"poisson"} (centred Poisson(1) weights, the multiplier-bootstrap
+analogue of nonparametric-bootstrap multiplicities); also
+\code{"gaussian"}, \code{"rademacher"}.}
+\item{\code{ci_method}}{\code{"field"} (default) additionally runs the
+field-calibrated block, whose one-sided bounds are the primary
+reported products; the de-biased element, its infinitesimal-jackknife SE and its
+IJ intervals are returned in every call regardless, so nothing is
+removed -- only a per-fit Monte Carlo cost is added.  \code{"ij"}
+restores the previous default: the de-biased interval from the
+infinitesimal-jackknife variance, the leading-order analogue of the
+full-bootstrap interval, with the field block omitted.
+\code{"wald"} uses the subgroup robust SE and also omits the field
+block.  The naive interval always uses the robust SE.}
+\item{\code{include_complement}}{Also de-bias the complement subgroup.
+Passed as \code{TRUE} by every internal caller.}
+\item{\code{seed}}{Seed for the multiplier draws; defaults to
+\code{seedit}.}
+\item{\code{return_reselection}}{Logical, default \code{FALSE}.  When
+\code{TRUE} the gate's return gains the \code{reselection} element
+(per-draw winners and the re-selection frequencies \code{p_hat});
+add-only pass-through, the default reproduces prior output exactly.}
+\item{\code{field_M_cap}}{Optional override of the uniform (kappa)
+sweep's mass-carrying cap; \code{NULL} (default) keeps
+\code{fs_mr_field_uniform()}'s default.  Consulted only when
+\code{field_uniform = TRUE}.}
+\item{\code{field_complement}}{Logical, default \code{FALSE}.  Under
+\code{ci_method = "field"} with \code{include_complement = TRUE},
+also evaluate the field block for the complement subgroup, attached
+as \code{field$complement} with the one-sided 95\\% \emph{upper}
+bound as its primary product (the benefit-claim orientation; see
+\code{\link{fs_mr_inference}}).  Add-only pass-through: the default
+reproduces prior output exactly.}
+\item{\code{ij_residual}}{\code{"two_term"} (default), \code{"winner"}
+or \code{"winner_floor"}: which infinitesimal-jackknife residual
+populates the reported de-biased SE and interval (both blocks); all
+three SEs are returned side by side regardless (see
+\code{\link{fs_mr_inference}}).  Add-only pass-through: the default
+reproduces prior output exactly.}
+\item{\code{keep_declaration_field}, \code{keep_field_matrix}}{Logical,
+both default \code{FALSE}.  Retain the standardized perturbation
+field that \code{\link{fs_declaration_calibration}} reads, as
+\code{mr_inference$declaration_field}; \code{keep_field_matrix}
+additionally keeps the full draws-by-candidates matrix (needed for
+\code{family = "reduced"}).  Add-only pass-through: unset, nothing is
+computed or stored and the default reproduces prior output exactly.}
+\item{\code{declaration_c0}}{\code{NULL} (default) or a numeric vector
+of pre-specified protected null levels \code{c0} on the natural scale
+of \code{hr.consistency} (\code{c0 <= c2}); consulted only with
+\code{keep_declaration_field = TRUE}.  The capture then also stores
+the shifted family maxima \code{Mstar_c0} that
+\code{fs_declaration_calibration(fit, c0 = )} reads (see
+\code{\link{fs_mr_inference}}).  Add-only pass-through: unset,
+nothing is computed or stored.}
+}}
 }
 \value{
 A list of class "forestsearch" containing:
@@ -210,6 +990,11 @@ A list of class "forestsearch" containing:
 \item out_sg: Selected subgroup based on sg_focus
 \item sg_focus: Focus criterion used
 \item df_flag: Treatment recommendations
+\item sg.harm: Subgroup definition labels (character vector
+of cut names) -- same as the top-level \code{sg.harm}
+\item sg.harm.id: per-subject 0/1 membership indicator
+(\emph{not} a character vector of cut expressions; see
+the \emph{Field naming collision} section below)
 \item algorithm: "twostage" or "fixed"
 \item n_candidates_evaluated: Number evaluated
 \item n_passed: Number passing threshold
@@ -223,18 +1008,90 @@ A list of class "forestsearch" containing:
 \item{minutes_all}{Total computation time}
 \item{grf_res}{GRF results object}
 \item{sg_focus}{Subgroup focus criterion used}
-\item{sg.harm}{Selected subgroup definition}
+\item{sg.harm}{Selected subgroup definition -- character vector
+of factor-level cut names.  \strong{Recommended accessor} for
+displaying the identified subgroup (e.g.,
+\code{paste(obj$sg.harm, collapse = " & ")}).  \code{NULL} if
+no subgroup was identified.}
 \item{grf_cuts}{GRF cut points used}
 \item{prop_maxk}{Proportion of max combinations searched}
 \item{max_sg_est}{Maximum subgroup HR estimate}
 \item{grf_plot}{GRF plot object (if plot.grf = TRUE)}
 \item{args_call_all}{All arguments for reproducibility}
+\item{threshold_config}{The resolved threshold configuration:
+\code{outcome_type}, \code{effect_measure}, \code{screening},
+\code{consistency}, \code{screening_natural},
+\code{consistency_natural}, \code{scale}, \code{pconsistency} and
+two description strings.  \strong{Read \code{$scale} before reading
+\code{$screening}.}  The phrase "the screening threshold" names two
+different numbers depending on which object is inspected:
+\itemize{
+\item On the \strong{survival} path \code{$screening} is
+\code{log(hr.threshold)} -- the scale the admission set and
+multiplier resampling work on -- while the candidate search
+itself compares the fitted hazard ratio against
+\code{hr.threshold} on the \strong{natural} scale.  The two
+are the same threshold on two scales, and
+\code{$screening_natural} holds the search's value.
+\item On the \strong{GLM} paths \code{$screening} is the value
+the search compares against directly: the link scale for ratio
+measures (\code{log} of the supplied ratio) and the identity
+scale for \code{RD}, \code{IRD} and \code{MD}.
+}
+\code{$consistency} follows the same convention, and
+\code{$pconsistency} is the rate \code{pconsistency.threshold},
+which has no scale.}
+\item{family_status}{Character scalar recording whether the candidate
+family the identifier ranked over is fixed -- the condition
+multiplier resampling requires (see \code{mr_inference}).
+\code{"no-front-end"}: \code{subgroup_method = "consistency"} with
+\code{use_lasso}, \code{use_grf} and \code{use_dina} all
+\code{FALSE}.  Named for what it checks: no fitted model shapes the
+family on the observed data.  This is weaker than the manuscript's
+Section 2.1 fixed family, which additionally requires resample-
+invariant cut locations -- quantile-derived cuts are not.  \code{"conditional-removable"}: the same method with
+at least one front end on -- data-dependent, but fixed by turning
+those off.  \code{"conditional-inherent"}: \code{subgroup_method} of
+\code{"dina"} or \code{"grf"}, where the family is generated by
+fitting a model to the same data and cannot be made fixed.
+Descriptive only; it never raises a condition.}
+\item{mr_inference}{Multiplier-resampling (MR) result, or \code{NULL}
+when MR did not run.  See \code{\link{fs_mr_inference}} for fields
+(\code{naive}, \code{debiased}, \code{selection_bias},
+\code{settings}, \code{harm_flag}, \code{timing_seconds}).  MR
+approximates the full bootstrap (FB) to leading order; its interval is
+the infinitesimal-jackknife analogue of the FB interval under the
+default \code{ci_method = "field"} and under \code{"ij"}, and the
+subgroup robust-SE interval under \code{"wald"}.  Under the default
+the return also carries the \code{field} element.}
+\item{mr_harm_confirmed}{Logical, three-valued.  \code{TRUE} when MR ran
+and the de-biased estimate still indicates harm under
+\code{confirm_rule}; \code{FALSE} when MR ran and it does not;
+\code{NA} when MR did \strong{not} run or could not be computed.
+\code{NA} is therefore \emph{absence of evidence, not evidence
+against harm} -- test it with \code{is.na()} before
+\code{isTRUE()}, which collapses \code{NA} to \code{FALSE} and so
+reports "harm not confirmed" for an analysis that never ran.  See
+the vocabulary section.}
 }
 }
 \description{
-Identifies subgroups with differential treatment effects in clinical trials
-using a combination of Generalized Random Forests (GRF), LASSO variable
-selection, and exhaustive combinatorial search with split-sample validation.
+Implements advanced statistical methods for exploratory subgroup
+identification in clinical trials.  Provides tools for identifying
+patient subgroups with differential treatment effects using machine
+learning approaches including Generalized Random Forests ('GRF'),
+LASSO regularization, and exhaustive combinatorial search algorithms.
+Supports survival endpoints (Cox proportional hazards), binary
+outcomes (log odds ratio, log relative risk, risk difference),
+continuous outcomes (mean difference), and count / rate outcomes
+(log incidence rate ratio via Poisson, quasi-Poisson, or
+negative-binomial GLMs with optional person-time offset).  Features
+bootstrap bias correction using infinitesimal jackknife methods to
+address selection bias in post-hoc analyses.  Designed for clinical
+researchers conducting exploratory subgroup analyses in randomized
+controlled trials, particularly for multi-regional clinical trials
+('MRCT') requiring regional consistency evaluation.  Methods are
+described in Leon et al. (2024) \doi{10.1002/sim.10163}.
 }
 \details{
 \strong{Algorithm Overview:}
@@ -268,6 +1125,228 @@ The two-stage algorithm is recommended for:
 For final regulatory submissions, \code{use_twostage = FALSE} may be preferred
 for exact reproducibility.
 }
+\section{Threshold vocabulary and resolved defaults}{
+
+Three arguments carry thresholds, and two of them have the word
+"consistency" in the name.  They are different quantities:
+
+\describe{
+\item{\code{c1} -- \code{effect.threshold} (legacy \code{hr.threshold})}{The
+\strong{screening} threshold on a candidate subgroup's own effect,
+estimated on the full sample.  A candidate must clear it to enter the
+consistency stage.}
+\item{\code{c2} -- \code{consistency.threshold} (legacy
+\code{hr.consistency})}{An \strong{effect} threshold, applied to the
+subgroup's effect estimated within each split half.  \strong{Not} a
+proportion, and \strong{not} the consistency rate.}
+\item{\verb{p*} -- \code{pconsistency.threshold}}{A \strong{proportion} in
+\code{[0, 1]}: the fraction of splits that must clear \code{c2}.
+\strong{Not} an effect threshold.}
+}
+
+In one line: \code{c2} sets the bar a split half must clear, and \verb{p*} counts how
+often that bar is met.
+
+\strong{Resolved defaults, per estimand.}  Reading
+\code{hr.consistency}'s default as "1.0" is misleading on the GLM paths:
+when neither threshold is supplied, the value a run actually uses is
+resolved from the estimand.  The resolved pairs are:
+
+\tabular{lll}{
+\strong{resolved estimand} \tab \strong{c1} \tab \strong{c2} \cr
+\code{HR} (survival) \tab 1.25, compared by the search on the natural HR scale \tab 1.0 \cr
+\code{OR}, \code{RR}, \code{IRR} \tab log(1.25) \tab log(1.0), i.e. 0 \cr
+\code{RD} \tab 0.05 \tab 0.0 \cr
+\code{IRD} \tab 0.01 \tab 0.0 \cr
+\code{MD} \tab 0.0 \tab 0.0
+}
+
+Supplying \code{effect.threshold} or \code{consistency.threshold} (or the
+legacy names) suppresses the corresponding remap and the supplied value is
+used on the scale shown above.
+
+\strong{The pair rule, on the consistency path with a ratio estimand.}  For
+\code{subgroup_method = "consistency"} with survival (HR) or binary
+\code{effect_measure = "OR"} -- the two estimands whose \code{c1} and \code{c2} sit on
+one comparable ratio scale -- the two thresholds are treated as a pair:
+
+\itemize{
+\item \code{c2 > c1} is an \strong{error}.  It is degenerate: the
+consistency-stage entry condition re-screens the admitted family on \code{c2},
+so candidates the screen let through are discarded at the stage boundary,
+and when none survives the consistency stage does not run at all and the
+fit reads as a finding of no subgroup.  \code{c2 = c1} is allowed.
+\item \code{c1} supplied \strong{without} \code{c2} derives
+\code{c2 = 0.80 * c1} on the \strong{ratio} scale (on the log scale an
+additive shift of \code{log(0.80)}, never \code{0.80 * log(c1)}):
+1.25 -> 1.00, 1.00 -> 0.80, 0.90 -> 0.72.  Announced with a message, and
+carried into every bootstrap replicate and CV fold.  The default pair
+(1.25, 1.0) is the rule's fixed point, so a call that sets neither
+threshold is unaffected.  An explicitly supplied \code{c2}, in either
+spelling, is never overridden.
+\item Supplying both spellings of one threshold at disagreeing values is
+an error naming both.
+}
+
+Neither rule applies under \code{subgroup_method = "dina"} or
+\code{"grf"} (which return before the consistency stage and never consult
+\code{c2}), nor to the identity-scale estimands \code{RD}, \code{IRD},
+\code{MD}, nor to \code{IRR}.
+
+\code{pconsistency.threshold} is \strong{not} remapped.  It is a rate, and
+it is identical for every \code{outcome_type} and every estimand.
+}
+
+\section{Field naming collision with GRF results}{
+
+The top-level \code{sg.harm} on this object and the
+\code{grp.consistency$sg.harm} nested field both hold a character
+vector of cut expressions.  The nested \code{grp.consistency$sg.harm.id}
+field holds a \emph{per-subject 0/1 membership indicator}, not a cut
+vector -- unlike \code{sg.harm.id} on GRF result objects, which
+\emph{does} hold cut expressions.  See
+\code{\link{subgroup.consistency}} and \code{\link{grf.subg.harm.glm}}
+for the full discussion of this naming collision.  Code that must
+handle both object types should prefer the top-level \code{sg.harm}
+accessor on forestsearch results.
+}
+
+\section{Vocabulary FB MR and harm confirmation}{
+
+Four different things in this package used to share the word "gate".  They
+are distinct, they happen at different stages, and only the last one is a
+pass/fail decision:
+
+\describe{
+\item{Admissibility criteria}{Which candidate subgroups are even eligible
+to be considered: \code{hr.threshold}, \code{pconsistency.threshold},
+\code{n.min}, \code{d0.min}, \code{d1.min}, \code{maxk}.  Applied during
+the search.}
+\item{Selection rule}{Which admissible candidate is chosen as the
+estimated subgroup: \code{sg_focus}.  Applied during the search.}
+\item{Post-selection inference}{Correcting the chosen subgroup's treatment
+effect for the optimism of having chosen it, and putting an interval
+around the corrected value.  This is FB and MR below.  Applied
+\emph{after} the search.}
+\item{Harm confirmation}{The one pass/fail: does the corrected estimate
+still indicate harm?  This is \code{confirm_rule} against
+\code{t_confirm}, reported as \code{mr_harm_confirmed}.}
+}
+
+\strong{Full bootstrap (FB)} --- \code{\link{forestsearch_bootstrap_dofuture}}.
+Resamples \emph{subjects}, and re-runs the entire subgroup search inside
+every replicate, so the replicate may select a different subgroup than the
+original analysis did.  That is what lets it correct the selection-induced
+bias in the reported treatment effect, and supply an
+infinitesimal-jackknife interval.  It is the reference method, and it is
+expensive: cost scales with \code{nb_boots} times the cost of one search.
+
+\strong{Multiplier resampling (MR)} --- \code{\link{fs_mr_inference}}, turned
+on by \code{mr_inference = TRUE}.  Resamples nothing; it perturbs the
+per-subject influence contributions (\code{dfbeta}) of a \emph{single} set of
+fits with random mean-zero multipliers, and re-applies the selection rule on
+each perturbed draw.  It corrects the same selection bias FB corrects and
+produces the same kind of interval, to leading order, at a small fraction of
+the cost --- no refits.  MR is \strong{post-selection inference on a
+completed analysis}: it runs after the subgroup has been chosen and
+\strong{cannot change which subgroup is identified}.  Running with
+\code{mr_inference = TRUE} and \code{FALSE} gives identical
+\code{sg.harm}, \code{df.est} and \code{max_sg_est}.  MR approximates FB;
+it does not replace it.
+
+\strong{Harm confirmation.}  Once MR has produced a de-biased estimate,
+\code{mr_inference_args$confirm_rule} decides whether that estimate still
+indicates harm:
+\describe{
+\item{\code{"point"} (default)}{Compares the de-biased \emph{point
+estimate} to \code{t_confirm}.}
+\item{\code{"ci"}}{Compares the one-sided 95\% selection-adjusted
+\emph{lower bound} to \code{t_confirm}.  Strictly the stronger
+requirement, so anything it confirms \code{"point"} also confirms.}
+}
+
+\strong{\code{t_confirm}} is the threshold those rules compare against, on
+the \strong{effect} scale (HR, OR, RR, IRR; or RD, MD for differences) ---
+not the working log scale used internally.  Left \code{NULL} it resolves to
+the null effect: \code{1} for ratio measures, \code{0} for differences.  It
+is deliberately set near the null rather than at \code{hr.threshold},
+because the de-biasing correction over-shrinks genuine effects, so
+re-applying the screening threshold to a corrected estimate would discard
+true findings.
+
+\strong{\code{mr_harm_confirmed}} carries the answer, and is three-valued:
+\code{TRUE} = MR ran and harm is confirmed; \code{FALSE} = MR ran and harm
+is not confirmed; \code{NA} = MR did not run, or could not be computed.
+\strong{\code{NA} is not evidence against harm.}  It arises when
+\code{mr_inference = FALSE} (the default), when no subgroup was identified,
+or when the MR step was skipped or failed for the outcome/consistency
+combination in use.  Because \code{isTRUE(NA)} is \code{FALSE}, code that
+reads this field with \code{isTRUE()} alone silently reports "harm not
+confirmed" for an analysis that was never performed; branch on
+\code{is.na()} first.
+}
+
+\examples{
+\dontrun{
+# Example 1: Standard analysis (backward compatible)
+result <- forestsearch(
+  df.analysis = trial_data,
+  sg_focus = "hr",
+  hr.threshold = 1.25,
+  pconsistency.threshold = 0.90,
+  fs.splits = 400,
+  details = TRUE
+)
+
+# Example 2: Fast exploratory analysis with two-stage
+result_fast <- forestsearch(
+  df.analysis = trial_data,
+  sg_focus = "maxSG",
+  hr.threshold = 1.15,
+  pconsistency.threshold = 0.85,
+  fs.splits = 500,
+  use_twostage = TRUE,
+  details = TRUE
+)
+
+# Example 3: Two-stage with custom parameters
+result_custom <- forestsearch(
+  df.analysis = trial_data,
+  sg_focus = "hr",
+  hr.threshold = 1.3,
+  pconsistency.threshold = 0.95,
+  fs.splits = 600,
+  use_twostage = TRUE,
+  twostage_args = list(
+    n.splits.screen = 50,
+    batch.size = 25,
+    conf.level = 0.99
+  ),
+  parallel_args = list(plan = "multisession", workers = 4),
+  details = TRUE
+)
+
+# Example 4: Binary outcome with OR thresholds
+result_binary <- forestsearch(
+  df.analysis = trial_data,
+  outcome_type = "binary",
+  effect_measure = "OR",
+  effect.threshold = 1.5,
+  consistency.threshold = 1.3,
+  pconsistency.threshold = 0.90
+)
+
+# Example 5: Binary outcome with RD thresholds
+result_rd <- forestsearch(
+  df.analysis = trial_data,
+  outcome_type = "binary",
+  effect_measure = "RD",
+  effect.threshold = 0.07,       # 7 pct-point harm
+  consistency.threshold = 0.03   # 3 pct-point per split
+)
+}
+
+}
 \references{
 \itemize{
 \item FDA Guidance for Industry: Enrichment Strategies for Clinical Trials
@@ -279,7 +1358,12 @@ treatment effects using random forests. JASA.
 }
 \seealso{
 \code{\link{subgroup.consistency}} for consistency evaluation details
-\code{\link{forestsearch_bootstrap_dofuture}} for bootstrap inference
+\code{\link{forestsearch_bootstrap_dofuture}} for the full bootstrap (FB)
+\code{\link{fs_mr_inference}} for multiplier resampling (MR), the
+\code{mr_inference = TRUE} step
+\code{\link{mr_estimates_table}} to render the MR estimates
+\code{\link{fs_fdr_report}} to sweep harm-confirmation thresholds
+(\code{c_confirm}) and measure what confirmation buys
 \code{\link{forestsearch_Kfold}} for cross-validation
 
 Package website: \url{https://larry-leon.github.io/forestsearch/}

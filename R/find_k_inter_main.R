@@ -29,7 +29,9 @@
 #' @param verbose Logical indicating whether to print progress information.
 #'   Default is TRUE.
 #'
-#' @keywords internal
+#' @param tol_rel Numeric. Maximum tolerated relative error, in percent; the
+#'   call stops if the achieved HR is not within \code{tol_rel} percent of the
+#'   target. Default \code{2.5}.
 #' @return A list of class "k_inter_result" containing:
 #' \describe{
 #'   \item{k_inter}{Numeric value of optimal k_inter parameter}
@@ -53,8 +55,35 @@
 #' \code{\link{sensitivity_analysis_k_inter}} for sensitivity analysis
 #' \code{\link{generate_aft_dgm_flex}} for DGM generation
 #'
+#' @examples
+#' \dontrun{
+#' gbsg <- survival::gbsg
+#'
+#' # Find k_inter for target HR = 2.0 in harm subgroup
+#' result <- find_k_inter_for_target_hr(
+#'   target_hr_harm = 2.0,
+#'   data = gbsg,
+#'   continuous_vars = c("age", "er", "pgr"),
+#'   factor_vars = c("meno", "grade"),
+#'   outcome_var = "rfstime",
+#'   event_var = "status",
+#'   treatment_var = "hormon",
+#'   subgroup_vars = c("er", "meno"),
+#'   subgroup_cuts = list(
+#'     er = list(type = "quantile", value = 0.25),
+#'     meno = 0
+#'   ),
+#'   k_treat = 1.0,
+#'   verbose = TRUE
+#' )
+#'
+#' cat("Optimal k_inter:", result$k_inter, "\n")
+#' cat("Achieved HR:", result$achieved_hr_harm, "\n")
+#' }
+#'
 #' @keywords survival simulation AFT interaction calibration
 #' @importFrom stats uniroot optim quantile
+#' @export
 
 find_k_inter_for_target_hr <- function(target_hr_harm,
                                        data,
@@ -68,14 +97,13 @@ find_k_inter_for_target_hr <- function(target_hr_harm,
                                        k_treat = 1,
                                        k_inter_range = c(-10, 10),
                                        tol = 0.001,
+                                       tol_rel = 2.5,
                                        n_super = 5000,
                                        verbose = TRUE) {
 
-  # Objective function: returns difference between achieved and target HR
-  objective_function <- function(k_inter_val) {
-
-    # Generate DGM with current k_inter
-    dgm_temp <- generate_aft_dgm_flex(
+  # Realised harm-subgroup HR at a given interaction shift.
+  eff_at <- function(k_inter_val) {
+    generate_aft_dgm_flex(
       data = data,
       continuous_vars = continuous_vars,
       factor_vars = factor_vars,
@@ -88,88 +116,61 @@ find_k_inter_for_target_hr <- function(target_hr_harm,
       k_treat = k_treat,
       k_inter = k_inter_val,
       n_super = n_super,
-      verbose = FALSE  # Suppress output during search
-    )
-
-    # Get the harm subgroup HR
-    hr_harm_achieved <- dgm_temp$hazard_ratios$harm_subgroup
-
-    # Return difference from target
-    return(hr_harm_achieved - target_hr_harm)
+      verbose = FALSE
+    )$hazard_ratios$harm_subgroup
   }
 
   if (verbose) {
     cat("Searching for k_inter to achieve harm subgroup HR =", target_hr_harm, "\n")
-    cat("Search range: [", k_inter_range[1], ",", k_inter_range[2], "]\n")
+    cat("Search range: [", k_inter_range[1], ",", k_inter_range[2], "] (extendInt = \"yes\")\n")
   }
 
-  # Use uniroot to find k_inter
-  tryCatch({
-    result <- uniroot(
-      f = objective_function,
-      interval = k_inter_range,
-      tol = tol
-    )
+  # Bracketed root-finding with automatic interval extension + a hard relative-
+  # tolerance gate, shared with calibrate_k_inter(), calibrate_k_treat(), and
+  # calibrate_glm_interaction() via .calibrate_by_root().
+  sol <- .calibrate_by_root(
+    effect_fun = eff_at, target = target_hr_harm, interval = k_inter_range,
+    tol = tol, tol_rel = tol_rel, label = "HR(H)", param = "k_inter",
+    verbose = verbose
+  )
+  k_inter_optimal <- sol$root
 
-    k_inter_optimal <- result$root
+  # Rebuild the calibrated DGM to return alongside the solution.
+  dgm_final <- generate_aft_dgm_flex(
+    data = data,
+    continuous_vars = continuous_vars,
+    factor_vars = factor_vars,
+    outcome_var = outcome_var,
+    event_var = event_var,
+    treatment_var = treatment_var,
+    subgroup_vars = subgroup_vars,
+    subgroup_cuts = subgroup_cuts,
+    model = "alt",
+    k_treat = k_treat,
+    k_inter = k_inter_optimal,
+    n_super = n_super,
+    verbose = FALSE
+  )
+  hr_harm_final <- dgm_final$hazard_ratios$harm_subgroup
 
-    # Verify the result
-    dgm_final <- generate_aft_dgm_flex(
-      data = data,
-      continuous_vars = continuous_vars,
-      factor_vars = factor_vars,
-      outcome_var = outcome_var,
-      event_var = event_var,
-      treatment_var = treatment_var,
-      subgroup_vars = subgroup_vars,
-      subgroup_cuts = subgroup_cuts,
-      model = "alt",
-      k_treat = k_treat,
-      k_inter = k_inter_optimal,
-      n_super = n_super,
-      verbose = FALSE
-    )
+  if (verbose) {
+    cat("\n=== RESULTS ===\n")
+    cat("Optimal k_inter:", round(k_inter_optimal, 4), "\n")
+    cat("Achieved harm subgroup HR:", round(hr_harm_final, 4), "\n")
+    cat("Target harm subgroup HR:", target_hr_harm, "\n")
+    cat("Absolute error:", round(abs(hr_harm_final - target_hr_harm), 6), "\n")
+    cat("Overall HR:", round(dgm_final$hazard_ratios$overall, 4), "\n")
+    cat("No-harm subgroup HR:", round(dgm_final$hazard_ratios$no_harm_subgroup, 4), "\n")
+  }
 
-    hr_harm_final <- dgm_final$hazard_ratios$harm_subgroup
-
-    if (verbose) {
-      cat("\n=== RESULTS ===\n")
-      cat("Optimal k_inter:", round(k_inter_optimal, 4), "\n")
-      cat("Achieved harm subgroup HR:", round(hr_harm_final, 4), "\n")
-      cat("Target harm subgroup HR:", target_hr_harm, "\n")
-      cat("Absolute error:", round(abs(hr_harm_final - target_hr_harm), 6), "\n")
-      cat("Overall HR:", round(dgm_final$hazard_ratios$overall, 4), "\n")
-      cat("No-harm subgroup HR:", round(dgm_final$hazard_ratios$no_harm_subgroup, 4), "\n")
-    }
-
-    return(list(
-      k_inter = k_inter_optimal,
-      achieved_hr_harm = hr_harm_final,
-      target_hr_harm = target_hr_harm,
-      error = abs(hr_harm_final - target_hr_harm),
-      dgm = dgm_final,
-      convergence = result$iter
-    ))
-
-  }, error = function(e) {
-    if (verbose) {
-      cat("\nError in root finding. Trying boundary search...\n")
-      cat("Error message:", e$message, "\n")
-    }
-
-    # If uniroot fails, try boundary values
-    obj_lower <- objective_function(k_inter_range[1])
-    obj_upper <- objective_function(k_inter_range[2])
-
-    if (verbose) {
-      cat("HR at k_inter =", k_inter_range[1], ":", round(obj_lower + target_hr_harm, 4), "\n")
-      cat("HR at k_inter =", k_inter_range[2], ":", round(obj_upper + target_hr_harm, 4), "\n")
-      cat("\nSolution may be outside the search range.\n")
-      cat("Try adjusting k_inter_range parameter.\n")
-    }
-
-    return(NULL)
-  })
+  list(
+    k_inter = k_inter_optimal,
+    achieved_hr_harm = hr_harm_final,
+    target_hr_harm = target_hr_harm,
+    error = abs(hr_harm_final - target_hr_harm),
+    dgm = dgm_final,
+    convergence = sol$iter
+  )
 }
 
 
@@ -186,7 +187,6 @@ find_k_inter_for_target_hr <- function(target_hr_harm,
 #'   Default is TRUE.
 #' @param ... Additional arguments passed to \code{\link{generate_aft_dgm_flex}}.
 #'
-#' @keywords internal
 #' @return A data.frame of class "k_inter_sensitivity" with columns:
 #' \describe{
 #'   \item{k_inter}{Numeric k_inter value}
@@ -206,8 +206,31 @@ find_k_inter_for_target_hr <- function(target_hr_harm,
 #'   \item Table of key values
 #' }
 #'
+#' @examples
+#' \dontrun{
+#' # Analyze sensitivity to k_inter
+#' sensitivity_results <- sensitivity_analysis_k_inter(
+#'   k_inter_range = c(-2, 2),
+#'   n_points = 11,
+#'   data = survival::gbsg,
+#'   continuous_vars = c("age", "er", "pgr"),
+#'   factor_vars = c("meno", "grade"),
+#'   outcome_var = "rfstime",
+#'   event_var = "status",
+#'   treatment_var = "hormon",
+#'   subgroup_vars = c("er", "meno"),
+#'   subgroup_cuts = list(er = 20, meno = 0),
+#'   model = "alt",
+#'   plot = TRUE
+#' )
+#'
+#' # Results show relationship between k_inter and HRs
+#' print(sensitivity_results)
+#' }
+#'
 #' @importFrom graphics par plot lines abline legend grid text
 #' @importFrom utils txtProgressBar setTxtProgressBar
+#' @export
 sensitivity_analysis_k_inter <- function(k_inter_range = c(-5, 5),
                                          n_points = 21,
                                          plot = TRUE,
@@ -320,7 +343,6 @@ sensitivity_analysis_k_inter <- function(k_inter_range = c(-5, 5),
 #'   "greater" for values > cutpoint
 #' @param tol Numeric tolerance for root finding algorithm. Default is 0.0001
 #'
-#' @keywords internal
 #' @return A list containing:
 #' \describe{
 #'   \item{quantile}{The quantile value (between 0 and 1) that achieves the
@@ -336,7 +358,26 @@ sensitivity_analysis_k_inter <- function(k_inter_range = c(-5, 5),
 #' into the subgroup. This is particularly useful when you want to ensure a
 #' specific subgroup size regardless of the data distribution.
 #'
+#' @examples
+#' \dontrun{
+#' gbsg <- survival::gbsg
+#' # Find ER cutpoint for 12.5% subgroup
+#' result <- find_quantile_for_proportion(
+#'   data = gbsg,
+#'   var_name = "er",
+#'   target_prop = 0.125,
+#'   direction = "less"
+#' )
+#'
+#' print(result)
+#' # Use in subgroup definition
+#' subgroup_cuts = list(
+#'   er = list(type = "quantile", value = result$quantile)
+#' )
+#' }
+#'
 #' @seealso \code{\link{generate_aft_dgm_flex}}
+#' @keywords internal
 #' @importFrom stats quantile uniroot
 
 find_quantile_for_proportion <- function(data, var_name, target_prop,

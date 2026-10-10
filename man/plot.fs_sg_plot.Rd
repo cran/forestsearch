@@ -15,9 +15,19 @@ Default: 1 (first available)}
 \item{...}{Additional arguments passed to plot functions}
 }
 \value{
-Invisibly returns \code{x}.
+\code{x}, invisibly. No plot is drawn: a message names the
+\code{plot_sg_results()} call that produces the requested plot. An error is
+raised when a character \code{which} does not name an available plot.
 }
 \description{
 Plot Method for fs_sg_plot Objects
 }
-\keyword{internal}
+\examples{
+\dontrun{
+fs <- forestsearch(gbsg,
+  confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+  outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+p <- plot_subgroup(fs)
+plot(p)
+}
+}

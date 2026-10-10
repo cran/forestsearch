@@ -74,7 +74,7 @@
 #' }
 #'
 #' @examples
-#' \donttest{
+#' \dontrun{
 #' # Simulate data
 #' set.seed(123)
 #' df <- data.frame(
@@ -547,7 +547,6 @@ cox_cs_fit <- function(df,
 #'   Default is 1.
 #' @param ... Additional graphical parameters passed to plot()
 #'
-#' @keywords internal
 #' @return A list containing:
 #'   \item{cut.zero}{The minimum z value where loghr_po < hrz_crit}
 #'   \item{AHR_opt}{Average hazard ratio for optimal subgroup (z >= cut.zero)}
@@ -565,8 +564,27 @@ cox_cs_fit <- function(df,
 #' The "optimal" subgroup is defined as patients with z >= cut.zero, where
 #' cut.zero is the minimum z value with favorable treatment effect (loghr < hrz_crit).
 #'
+#' @examples
+#' \dontrun{
+#' # Using z_age as the subgroup score
+#' results <- plot_subgroup_effects(dgm_spline$df_super, z = "z_age", hrz_crit = 0)
+#'
+#' # Using subgroup identifier
+#' results <- plot_subgroup_effects(dgm_spline$df_super, z = "subgroup", hrz_crit = 0)
+#'
+#' # With reference lines
+#' results <- plot_subgroup_effects(dgm_spline$df_super, z = "z_size",
+#'                                   hrz_crit = 0,
+#'                                   log.hrs = c(-0.5, 0, 0.5))
+#'
+#' # Only AHR plot
+#' results <- plot_subgroup_effects(dgm_spline$df_super, z = "z_pgr",
+#'                                   plot_type = "ahr")
+#' }
+#'
 #' @importFrom stats quantile
 #' @importFrom graphics par plot rug abline legend
+#' @export
 plot_subgroup_effects <- function(df_super,
                                   z,
                                   hrz_crit = 0,

@@ -19,15 +19,25 @@ subgroup.consistency(
   Lsg,
   confs_labels,
   sg_focus = "hr",
-  stop_Kgroups = 10,
+  selection_rule = "neighborhood",
+  effect_neighborhood = 0.1,
+  stop_Kgroups = 200,
   stop_threshold = NULL,
-  showten_subgroups = FALSE,
+  show_candidate_summary = FALSE,
+  max_print = 10,
   pconsistency.digits = 2,
   seed = 8316951,
   checking = FALSE,
   use_twostage = FALSE,
   twostage_args = list(),
-  parallel_args = list()
+  parallel_args = list(),
+  estimator_fn = NULL,
+  consistency_threshold = NULL,
+  effect_label = "HR",
+  effect_log_scale = FALSE,
+  adjust_covariates = NULL,
+  consistency_method = c("resample", "split"),
+  glm_resample_spec = NULL
 )
 }
 \arguments{
@@ -37,14 +47,23 @@ for outcome (Y), event indicator (Event), and treatment (Treat).}
 \item{hr.subgroups}{Data.table of candidate subgroups from subgroup search,
 containing columns: HR, n, E, K, d0, d1, m0, m1, grp, and factor indicators.}
 
-\item{hr.threshold}{Numeric. Minimum hazard ratio threshold for candidates.
-Default: 1.0}
+\item{hr.threshold}{Numeric. \code{c1}, the \strong{screening threshold} on a
+candidate's own effect, re-applied here to the supplied
+\code{hr.subgroups} table.  On the comparison scale of the estimand
+(\code{forestsearch()} passes the already-resolved value for GLM
+outcomes).  Default: 1.0}
 
-\item{hr.consistency}{Numeric. Minimum HR required in each split for
-consistency. Default: 1.0}
+\item{hr.consistency}{Numeric. \code{c2}, \strong{an effect threshold} -- the
+minimum effect required in \emph{each} half of a split for that split to
+count as consistent.  \strong{Not} a proportion and \strong{not} the
+consistency rate; for the proportion see
+\code{pconsistency.threshold}.  Default: 1.0}
 
-\item{pconsistency.threshold}{Numeric. Minimum proportion of splits that
-must be consistent. Default: 0.9}
+\item{pconsistency.threshold}{Numeric. \verb{p*}, \strong{a proportion} in
+\code{[0, 1]} -- the minimum fraction of splits that must be consistent,
+where consistency of one split is decided by \code{hr.consistency}
+(\code{c2}).  \code{c2} sets the bar; \verb{p*} counts how often it is met.  Both names
+contain "consistency" and they are different quantities.  Default: 0.9}
 
 \item{m1.threshold}{Numeric. Maximum m1 threshold for filtering. Default: Inf}
 
@@ -63,15 +82,57 @@ Default: 100}
 
 \item{confs_labels}{Character vector mapping factor names to labels.}
 
-\item{sg_focus}{Character. Subgroup selection criterion: "hr", "maxSG",
-or "minSG". Default: "hr"}
+\item{sg_focus}{Character. Subgroup selection criterion. One of:
+\describe{
+\item{\code{"hr"} (or \code{"eff"})}{Sort by
+\eqn{(-Pcons, -hr, K)}; pick top.}
+\item{\code{"maxeff"}}{Sort by \eqn{(-hr, K)}; pick top.  No consistency
+filter.  Consistency (\code{Pcons}) does not enter the sort key, so it
+is evaluated for the SELECTED winner only (reported in the footer) and
+is \code{NA} for every other candidate -- the effect (from the search)
+is carried for all, but the per-candidate consistency refits are
+skipped.  Selection is identical to evaluating every candidate.}
+\item{\code{"maxSG"}}{Sort by \eqn{(-N, -Pcons, K)}; pick top.}
+\item{\code{"minSG"}}{Sort by \eqn{(N, -Pcons, K)}; pick top.}
+\item{\code{"hrMaxSG"} (or \code{"effMaxSG"})}{Among candidates
+with effect size within \code{effect_neighborhood} of the
+maximum, pick the one with the largest \eqn{N}.}
+\item{\code{"hrMinSG"} (or \code{"effMinSG"})}{Among candidates
+with effect size within \code{effect_neighborhood} of the
+maximum, pick the one with the smallest \eqn{N}.}
+}
+Default: \code{"hr"}.  The \code{"eff*"} forms are aliases for
+the \code{"hr*"} forms and read more naturally in GLM contexts
+(continuous MD, binary OR/RR/RD, count IRR).  Both vocabularies
+produce identical results.}
+
+\item{selection_rule}{Character. Rule defining the candidate
+inclusion set for \code{"hrMaxSG"} / \code{"hrMinSG"}.  One of
+\code{"neighborhood"} (default; current behaviour),
+\code{"pareto"} (2D Pareto-non-dominated set in (effect, N)),
+or \code{"both"} (intersection of the two).  Forwarded to
+\code{\link{sort_subgroups_preview}} (pre-consistency triage)
+and \code{\link{sort_subgroups}} (post-consistency selection).
+Must be \code{"neighborhood"} for other \code{sg_focus} values.}
+
+\item{effect_neighborhood}{Numeric in \code{[0, 1)}.  Relative
+tolerance for \code{"hrMaxSG"} and \code{"hrMinSG"}.  A candidate
+is in the \emph{effect-size neighborhood} iff its (natural-scale)
+effect is at least \code{(1 - effect_neighborhood) * max(effect)}.
+Default \code{0.10} (i.e., within 10\\% of the strongest effect).
+For GLM ratio measures (OR, IRR), the neighborhood test is applied
+on the natural scale (after exponentiation of \code{hr}).  Ignored
+when \code{sg_focus} is \code{"hr"}, \code{"maxSG"}, or
+\code{"minSG"}.  When \code{selection_rule = "pareto"}, must be
+left at its default (the rule does not consult it).}
 
 \item{stop_Kgroups}{Integer. Maximum number of candidates to evaluate.
-Default: 10}
+When the ranked pool exceeds this cap it is truncated and a warning naming
+both counts and the \code{sg_focus} ordering is emitted. Default: 200}
 
 \item{stop_threshold}{Numeric in \code{[0, 1]} or \code{NULL}.
 When a candidate subgroup's consistency probability (\code{Pcons})
-meets or exceeds this threshold, evaluation stops early — remaining
+meets or exceeds this threshold, evaluation stops early -- remaining
 candidates are skipped. Set to \code{NULL} to disable early stopping
 and evaluate all candidates up to \code{stop_Kgroups}. Default: \code{NULL}.
 
@@ -95,13 +156,37 @@ completes, so some additional candidates beyond the first meeting the
 threshold may be evaluated. Use a smaller \code{batch_size} in
 \code{parallel_args} for finer-grained early stopping.}
 
-\item{showten_subgroups}{Logical. If TRUE, prints up to 10 candidate
-subgroups after sorting by sg_focus, showing their rank, HR, sample size,
-events, and factor definitions. Useful for reviewing which candidates
-will be evaluated for consistency. Default: FALSE}
+\item{show_candidate_summary}{Logical. If \code{TRUE}, prints two
+diagnostic tables: a \strong{pre-consistency} candidate preview
+(all top-\code{stop_Kgroups} candidates entering consistency
+evaluation, with Frontier and InBand flags) and a
+\strong{post-consistency} summary (passing candidates only, with
+Pcons, Frontier, InBand, and Selected flags).  The two views
+together make the rule's filter visible end-to-end.  Pcons is
+shown only for passing candidates (the consistency evaluator
+returns NULL for non-passing ones).  Default: FALSE.}
 
-\item{pconsistency.digits}{Integer. Decimal places for consistency
-proportion. Default: 2}
+\item{max_print}{Integer. Maximum number of candidate rows printed in
+each \code{show_candidate_summary} table (forwarded to the internal
+\code{print_candidate_summary()}).  Candidates are sorted
+selection-first, so the selected subgroup is always shown; any
+remaining candidates beyond \code{max_print} are collapsed into a
+trailing "... N more candidate(s) not shown" line.  Affects console
+output only, not the returned object.  Default: 10.}
+
+\item{pconsistency.digits}{Integer. Number of decimal places to which the
+consistency proportion is rounded \strong{before} it is compared with
+\code{pconsistency.threshold}.  The rounded value decides admission and
+is the value the selection sort orders on, so this setting affects which
+subgroups are admitted, not only what is displayed.  At the default of 2,
+a threshold of \verb{p*} admits any candidate whose unrounded proportion is at
+or above the largest 0.01 grid point strictly below \verb{p*} plus half a step
+(0.005) -- so \verb{p* = 0.99} admits from about 0.985.  Raising the setting
+makes admission finer-grained and produces fewer exact ties for the
+selection rule to break.  Under \code{consistency_method = "resample"}
+the proportion is a continuous closed-form quantity, so the rounding is a
+deliberate coarsening rather than a formatting step.
+Default: 2}
 
 \item{seed}{Integer. Random seed for reproducible consistency splits.
 Default: 8316951. Set to NULL for non-reproducible random splits.
@@ -123,9 +208,24 @@ parallel execution (via future.seed).}
 
 \item{parallel_args}{List. Parallel processing configuration:
 \describe{
-\item{plan}{Future plan: "multisession", "multicore", or "sequential"}
-\item{workers}{Number of parallel workers}
-\item{batch_size}{Number of candidates to evaluate per batch. Smaller
+\item{plan}{Future plan: "multisession", "multicore", "callr", or
+"sequential".  A sequential plan runs the consistency screen as a
+plain in-process loop regardless of \code{workers}: no future backend
+is set up and no per-batch globals resolution is paid.  A parallel
+plan with \code{workers = 1} is honoured as parallel (one-worker
+batched backend); pass \code{plan = "sequential"} to run the plain
+loop.  Results under \code{consistency_method = "resample"} are
+identical on every path (the closed form consumes no RNG).  Under
+\code{"split"} the plain loop draws from a single RNG stream seeded
+once, whereas the batched backend gives each candidate its own
+L'Ecuyer-CMRG stream indexed by global position, so a sequential
+plan's \code{p.consistency} values differ from a parallel plan's
+within Monte-Carlo noise at the stated \code{fs.splits}; invariance
+to worker count holds within any plan.}
+\item{workers}{Number of parallel workers on a parallel plan.}
+\item{batch_size}{Number of candidates to evaluate per batch on a
+genuinely parallel plan -- the knob for the per-batch overhead
+described above.  Smaller
 values provide finer-grained early stopping but may increase overhead.
 Default: When stop_threshold is set and sg_focus is "hr" or "minSG",
 defaults to 1 (stop immediately when first candidate passes). For other
@@ -133,15 +233,70 @@ sg_focus values with stop_threshold, defaults to min(workers, n_candidates/4).
 When stop_threshold is NULL, defaults to workers*2 for efficiency.}
 \item{show_message}{Print parallel config messages}
 }}
+
+\item{estimator_fn}{Closure or \code{NULL}. Effect-estimator closure from
+\code{\link{make_effect_estimator}} for GLM outcomes.  Default \code{NULL}
+(uses Cox model).}
+
+\item{consistency_threshold}{Numeric or \code{NULL}. Threshold for GLM
+consistency evaluation.  Default \code{NULL} (uses \code{hr.consistency}).}
+
+\item{effect_label}{Character. Column label for the effect measure in
+diagnostic output (e.g., candidate subgroup table).  Default \code{"HR"}.
+Set automatically by \code{\link{forestsearch}} to the resolved
+\code{effect_measure} (e.g., \code{"IRR"}, \code{"OR"}) for GLM outcomes.}
+
+\item{effect_log_scale}{Logical. If \code{TRUE}, the \code{HR} column in
+\code{hr.subgroups} stores log-scale values (log-OR, log-IRR) and will
+be exponentiated for display in diagnostic output.  Default \code{FALSE}
+(Cox stores natural-scale HR).}
+
+\item{adjust_covariates}{Character vector or \code{NULL}. Additional Cox
+model terms used when scoring survival subgroups during consistency
+evaluation, e.g. \code{"strata(x1)"} for a stratified model or
+\code{"x2"} for linear adjustment.  Referenced columns must be present
+in \code{df}.  Ignored on the GLM path.  Default \code{NULL}
+(treatment-only, unadjusted).}
+
+\item{consistency_method}{Character. \code{"resample"} (default) for the
+multiplier (influence-function) approximation via
+\code{\link{consistency_resample}}, or \code{"split"} -- the retained
+fallback -- for the literal repeated 50/50 split-and-refit calculation,
+which costs \code{fs.splits * 2} refits per candidate evaluation.  On the
+GLM path \code{"resample"} requires a \code{glm_resample_spec}; without one
+(or when \code{consistency_resample} is unavailable) it falls back to
+\code{"split"} with a warning.  \code{\link{forestsearch}} builds that spec
+automatically; a direct caller on a GLM outcome must supply it.}
+
+\item{glm_resample_spec}{List or \code{NULL}. GLM resampling specification
+threaded from \code{\link{forestsearch}} when
+\code{consistency_method = "resample"} on a GLM outcome: components
+\code{outcome_type}, \code{effect_measure}, \code{treat.name},
+\code{outcome.name}, \code{offset.name}, \code{adjust_covariates},
+\code{adverse_outcome}, and \code{comparison_threshold} (the consistency
+threshold already on the comparison scale, i.e. \code{log(threshold)} for
+ratio measures).  \code{NULL} on the survival path.}
 }
 \value{
 A list containing:
 \describe{
-\item{out_sg}{Selected subgroup results}
+\item{out_sg}{Selected subgroup results.  When non-\code{NULL},
+contains \code{result} (sorted candidate table; top row is the
+selected subgroup) and \code{pareto_frontier} (data.table of
+non-dominated candidates on (effect, N), both maximized -- a
+post-hoc diagnostic, not used for selection).}
 \item{sg_focus}{Selection criterion used}
 \item{df_flag}{Data frame with treatment recommendations}
-\item{sg.harm}{Subgroup definition labels}
-\item{sg.harm.id}{Subgroup membership indicator}
+\item{sg.harm}{\strong{Subgroup definition labels} -- character
+vector of factor-level cut names (e.g., \code{c("z1.1", "z2.1")}),
+of length equal to the number of cuts defining the subgroup.
+\code{NULL} if no subgroup was identified.}
+\item{sg.harm.id}{\strong{Per-subject subgroup-membership
+indicator} -- integer vector of length \code{nrow(df)} with
+\code{1} if subject \eqn{i} is in the identified subgroup and
+\code{0} otherwise.  \code{NULL} if no subgroup was identified.
+\strong{Not} a character vector of cut expressions; see the
+\emph{Field naming collision} section below.}
 \item{algorithm}{"twostage" or "fixed"}
 \item{n_candidates_evaluated}{Number of candidates actually evaluated}
 \item{n_candidates_total}{Total candidates available}
@@ -156,4 +311,65 @@ A list containing:
 Evaluates candidate subgroups using split-sample consistency validation.
 For each candidate, repeatedly splits the data and checks whether the
 treatment effect direction is consistent across splits.
+}
+\section{Field naming collision with GRF results}{
+
+The field name \code{sg.harm.id} has \strong{different semantics} on
+this object versus on the result objects returned by
+\code{\link{grf.subg.harm.glm}} and \code{\link{grf.subg.harm.survival}}:
+
+\tabular{lll}{
+\strong{Object} \tab \strong{\code{sg.harm.id} contains} \tab \strong{Length / type} \cr
+\code{subgroup.consistency()} result (this function) \tab per-subject 0/1 membership indicator \tab integer, length \code{nrow(df)} \cr
+\code{grf.subg.harm.glm()} result \tab character vector of cut expressions \tab character, length = depth of selected tree \cr
+\code{grf.subg.harm.survival()} result \tab character vector of cut expressions \tab character, length = depth of selected tree \cr
+}
+
+\strong{Practical consequence.}  Do not paste \code{sg.harm.id} with
+\code{paste(..., collapse = " & ")} to print "the identified subgroup"
+without first checking object class.  For subgroup labels from a
+\code{\link{forestsearch}} or \code{subgroup.consistency()} result,
+use \code{sg.harm} (character vector of cut names) -- the FS main
+result exposes \code{sg.harm} at the top level.
+
+This naming collision is a documented CRAN-stable API for v0.1.x
+and v0.2.x; it is expected to be resolved via a deprecation cycle
+in a future minor release.
+}
+
+\examples{
+\dontrun{
+# Standard evaluation
+result <- subgroup.consistency(
+  df = trial_data,
+  hr.subgroups = candidates,
+  sg_focus = "hr",
+  n.splits = 400,
+  parallel_args = list(plan = "multisession", workers = 6)
+)
+
+# Show top 10 candidates before evaluation
+result <- subgroup.consistency(
+  df = trial_data,
+  hr.subgroups = candidates,
+  sg_focus = "hr",
+  show_candidate_summary = TRUE,  # Post-consistency summary
+  n.splits = 400
+)
+
+# With early stopping and custom batch size
+result <- subgroup.consistency(
+  df = trial_data,
+  hr.subgroups = candidates,
+  sg_focus = "hr",
+  stop_threshold = 0.95,
+  show_candidate_summary = TRUE,
+  parallel_args = list(
+    plan = "multisession",
+    workers = 6,
+    batch_size = 2  # Check early stopping after every 2 candidates
+  )
+)
+}
+
 }

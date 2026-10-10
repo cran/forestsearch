@@ -34,4 +34,8 @@ By caching results, we avoid:
 \item Redundant uniqueness checks
 }
 }
-\keyword{internal}
+\examples{
+df <- data.frame(age = c(40, 55, 70), size = c(20, 30, 25))
+confs <- c("age <= 50", "size > 25")
+evaluate_cuts_once(confs, df)
+}

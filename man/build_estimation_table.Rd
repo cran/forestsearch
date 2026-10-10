@@ -14,7 +14,10 @@ build_estimation_table(
   subtitle = NULL,
   font_size = 12,
   cde_H = NULL,
-  cde_Hc = NULL
+  cde_Hc = NULL,
+  subgroup_notation = c("harm", "benefit"),
+  trim_threshold = 1000,
+  trim_fraction = 0.01
 )
 }
 \arguments{
@@ -51,6 +54,27 @@ column is shown. When \code{NULL} (default), auto-detected from
 
 \item{cde_Hc}{Numeric or \code{NULL}. Controlled direct effect
 for the complement. Auto-detected analogously.}
+
+\item{subgroup_notation}{Character. \code{"harm"} (default) labels
+subgroups as H/Hc; \code{"benefit"} labels as G/Gc for
+benefit-search analyses (treatment switching).}
+
+\item{trim_threshold}{Numeric or \code{NULL}. When the raw mean of
+an estimator's values exceeds this absolute value, that row's
+Avg / SD / Min / Max are recomputed on the central
+\code{1 - 2 * trim_fraction} of estimates, and a small footnote
+marker is placed on the row's Avg cell. The Estimator label is
+left unchanged so the Unicode notation (e.g., \eqn{\hat\theta(\hat
+Q)}) renders normally; only the Avg cell carries the trim
+indicator. Set \code{NULL} to disable trimming entirely. Default:
+\code{1000} (a value typical simulation results will never
+approach unless a small subgroup produces a degenerate effect
+estimate).}
+
+\item{trim_fraction}{Numeric in \code{(0, 0.5)}. Fraction of
+estimates to trim from each tail (per row) when trimming
+triggers. Default: \code{0.01} (lower and upper 1\\%; central 98\\%
+used). Has no effect when \code{trim_threshold = NULL}.}
 }
 \value{
 A \code{gt} table object, or \code{NULL} if no estimable
@@ -97,6 +121,25 @@ When CDE columns (\code{cde.H.hat}, \code{cde.Hc.hat}) are present and
 CDE truth values are available, CDE estimation rows
 (theta-ddagger(H-hat)) are appended.  The b-dagger column for CDE rows
 reports bias relative to the CDE truth rather than the marginal HR.
+}
+\examples{
+\dontrun{
+# Basic usage (marginal truth only)
+build_estimation_table(
+  results = results_alt,
+  dgm = dgm_calibrated,
+  analysis_method = "FSlg"
+)
+
+# With CDE truth (full Table 5 alignment)
+build_estimation_table(
+  results = results_alt,
+  dgm = dgm_calibrated,
+  cde_H = 2.25,
+  cde_Hc = 0.60
+)
+}
+
 }
 \seealso{
 \code{\link{build_classification_table}},

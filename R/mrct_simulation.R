@@ -37,11 +37,16 @@
 #'   \code{\link{forestsearch}}: "minSG", "hr", or "maxSG". Default: "minSG"
 #' @param maxk Integer. Maximum number of factors in subgroup combinations (1 or 2).
 #'   Default: 1
-#' @param hr.threshold Numeric. Hazard ratio threshold for subgroup identification.
+#' @param hr.threshold Numeric. `c1`, the screening threshold on a candidate
+#'   subgroup's own hazard ratio, passed to \code{\link{forestsearch}}.
 #'   Default: 0.90
-#' @param hr.consistency Numeric. Consistency threshold for hazard ratio.
+#' @param hr.consistency Numeric. `c2`, \strong{an effect threshold} -- the
+#'   minimum hazard ratio required in each half of a split.  Not a proportion
+#'   and not the consistency rate.
 #'   Default: 0.80
-#' @param pconsistency.threshold Numeric. Probability threshold for consistency.
+#' @param pconsistency.threshold Numeric. `p*`, \strong{a proportion} in
+#'   \code{[0, 1]} -- the fraction of splits that must clear
+#'   \code{hr.consistency} (`c2`).  Not an effect threshold.
 #'   Default: 0.90
 #' @param confounders.name Character vector. Confounder variable names for ForestSearch.
 #'   If NULL, automatically extracted from dgm
@@ -120,6 +125,30 @@
 #' populations. It does not imply any prognostic effect. To include prognostic
 #' confounder effects, specify them when creating the DGM using
 #' \code{\link{create_dgm_for_mrct}} or \code{\link{generate_aft_dgm_flex}}.
+#'
+#' @examples
+#' \dontrun{
+#' # Create DGM for alternative hypothesis
+#' dgm_alt <- create_dgm_for_mrct(
+#'   df_case = df_case,
+#'   model_type = "alt",
+#'   log_hrs = log(c(3, 1.25, 0.50)),
+#'   verbose = TRUE
+#' )
+#'
+#' # Run simulations
+#' results <- mrct_region_sims(
+#'   dgm = dgm_alt,
+#'   n_sims = 100,
+#'   region_var = "z_regA",
+#'   sg_focus = "minSG",
+#'   parallel_args = list(plan = "multisession", workers = 4),
+#'   details = TRUE
+#' )
+#'
+#' # Summarize results
+#' cat("Subgroup identification rate:", mean(results$any_found) * 100, "%\n")
+#' }
 #'
 #' @seealso
 #' \code{\link{forestsearch}} for subgroup identification algorithm
@@ -398,7 +427,7 @@ mrct_region_sims <- function(
           sg_focus = sg_focus,
           conf_force = conf_force,
           maxk = maxk,
-          showten_subgroups = verbose_fs,
+          show_candidate_summary = verbose_fs,
           details = verbose_fs,
           plot.sg = FALSE,
           parallel_args = list(plan = "sequential")
@@ -436,6 +465,7 @@ mrct_region_sims <- function(
           cat("===================================================================\n")
         }
 
+        fs_call_args$quiet <- TRUE
         fs_result <- tryCatch({
           withCallingHandlers(
             do.call(forestsearch, fs_call_args),
@@ -600,7 +630,6 @@ mrct_region_sims <- function(
 #' @param df.case Data frame to validate
 #' @param verbose Logical. Print detailed validation results. Default: TRUE
 #'
-#' @keywords internal
 #' @return Logical. TRUE if all requirements met, FALSE otherwise (invisibly)
 #'
 #' @details
@@ -616,8 +645,19 @@ mrct_region_sims <- function(
 #'
 #' The function also validates variable types and value ranges.
 #'
+#' @examples
+#' \dontrun{
+#' # Check if dataset is ready for MRCT simulations
+#' is_valid <- validate_mrct_data(df.case)
+#'
+#' if (!is_valid) {
+#'   stop("Please fix data issues before running simulations")
+#' }
+#' }
+#'
 #' @seealso \code{\link{create_dgm_for_mrct}} for creating DGM from validated data
 #'
+#' @export
 
 validate_mrct_data <- function(df.case, verbose = TRUE) {
 
@@ -815,6 +855,37 @@ validate_mrct_data <- function(df.case, verbose = TRUE) {
 #' The regA variable (region indicator) is included as a factor by default
 #' but without a forced effect - its coefficient is estimated from data.
 #'
+#' @examples
+#' \dontrun{
+#' # Prepare data
+#' df_case <- read.csv("data/dfsynthetic.csv")
+#' df_case$regA <- df_case$region_asia
+#'
+#' # Alternative hypothesis (heterogeneous treatment effect)
+#' dgm_alt <- create_dgm_for_mrct(
+#'   df_case = df_case,
+#'   model_type = "alt",
+#'   log_hrs = log(c(3, 1.25, 0.50)),
+#'   verbose = TRUE
+#' )
+#'
+#' # Null hypothesis (uniform effect)
+#' dgm_null <- create_dgm_for_mrct(
+#'   df_case = df_case,
+#'   model_type = "null",
+#'   verbose = TRUE
+#' )
+#'
+#' # With forced confounder effect
+#' dgm_conf <- create_dgm_for_mrct(
+#'   df_case = df_case,
+#'   model_type = "alt",
+#'   confounder_var = "prior_treat",
+#'   confounder_effect = log(1.5),
+#'   verbose = TRUE
+#' )
+#' }
+#'
 #' @seealso
 #' \code{\link{generate_aft_dgm_flex}} for underlying DGM creation
 #' \code{\link{mrct_region_sims}} for running simulations with the DGM
@@ -953,7 +1024,6 @@ create_dgm_for_mrct <- function(
 #'   trim fraction and number of flagged observations is shown.
 #'   Default: NULL.
 #'
-#' @keywords internal
 #' @return List with components:
 #' \describe{
 #'   \item{dfPlot_estimates}{data.table formatted for plotting, with a
@@ -965,14 +1035,46 @@ create_dgm_for_mrct <- function(
 #'     \code{trimmed_sd}, \code{lower_bound}, \code{upper_bound}.}
 #' }
 #'
+#' @examples
+#' \dontrun{
+#' # Default (no trimming) — backward compatible
+#' plot_results <- SGplot_estimates(
+#'   results_alt,
+#'   label_training = "Non-Region A, ITT",
+#'   label_itt = "Overall, ITT",
+#'   label_testing = "Region A, ITT",
+#'   label_sg = "Region A, identified subgroup"
+#' )
+#' print(plot_results$plot_estimates)
+#'
+#' # With 1% symmetric trimming
+#' plot_results <- SGplot_estimates(
+#'   results_alt,
+#'   label_training = "Non-AP, ITT",
+#'   label_itt = "Overall, ITT",
+#'   label_testing = "AP, ITT",
+#'   label_sg = "AP, identified subgroup",
+#'   trim_fraction = 0.01
+#' )
+#' print(plot_results$plot_estimates)
+#' # Inspect trimming diagnostics
+#' print(plot_results$trim_info)
+#'
+#' # With explicit y-axis limits
+#' plot_results <- SGplot_estimates(
+#'   results_alt,
+#'   trim_fraction = 0.01,
+#'   ylim = c(0.2, 3.0)
+#' )
+#' }
+#'
 #' @seealso \code{\link{mrct_region_sims}} for generating simulation results,
 #'   \code{\link{summaryout_mrct}} for tabular summaries with trimming
 #'
-#' @importFrom data.table data.table rbindlist `:=`
+#' @importFrom data.table data.table rbindlist :=
 #' @importFrom stats quantile sd
-#' @importFrom ggplot2 ggplot aes geom_violin geom_boxplot geom_hline
-#'   scale_fill_brewer labs theme_minimal theme element_text coord_cartesian
-#'   scale_x_discrete
+#' @importFrom ggplot2 ggplot aes geom_violin geom_boxplot geom_hline scale_fill_brewer labs theme_minimal theme element_text coord_cartesian scale_x_discrete
+#' @export
 
 SGplot_estimates <- function(
     df,
@@ -1229,7 +1331,6 @@ null_or <- function(x, y) {
 #'   (e.g., 9 or 10). Default: 11.
 #' @param showtable Logical. Print the table. Default: TRUE
 #'
-#' @keywords internal
 #' @return List with components:
 #' \describe{
 #'   \item{res}{List of summary statistics from population. When
@@ -1241,12 +1342,37 @@ null_or <- function(x, y) {
 #'   \item{summary_df}{Data frame of computed summary statistics.}
 #' }
 #'
+#' @examples
+#' \dontrun{
+#' # Single scenario (backward-compatible)
+#' summaryout_mrct(
+#'   mrct_sims = results_alt,
+#'   tab_caption = "H1: Heterogeneous treatment effect"
+#' )
+#'
+#' # Dual scenario: alternative vs null side-by-side
+#' summaryout_mrct(
+#'   mrct_sims = results_alt,
+#'   mrct_sims_null = results_null,
+#'   scenario_labels = c("Alternative (HTE)", "Null (uniform)"),
+#'   tab_caption = "Operating characteristics: Alternative vs Null"
+#' )
+#'
+#' # Custom trimming: 2% from each tail when mean > 500
+#' summaryout_mrct(
+#'   mrct_sims = results_alt,
+#'   mrct_sims_null = results_null,
+#'   trim_threshold = 500,
+#'   trim_fraction = 0.02
+#' )
+#' }
+#'
 #' @seealso \code{\link{mrct_region_sims}} for generating simulation results
 #'
-#' @importFrom data.table as.data.table copy fifelse `:=`
+#' @importFrom data.table as.data.table copy fifelse :=
 #' @importFrom stats median sd quantile
-#' @importFrom gt gt tab_header tab_spanner tab_style cell_text cell_borders
-#'   cells_body tab_source_note cols_label cols_width tab_options px md
+#' @importFrom gt gt tab_header tab_spanner tab_style cell_text cell_borders cells_body tab_source_note cols_label cols_width tab_options px md
+#' @export
 
 summaryout_mrct <- function(
     pop_summary = NULL,

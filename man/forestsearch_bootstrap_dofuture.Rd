@@ -10,7 +10,9 @@ forestsearch_bootstrap_dofuture(
   seed = 8316951L,
   details = FALSE,
   show_three = FALSE,
-  parallel_args = list()
+  parallel_args = list(),
+  digits = 4,
+  mr_in_replicates = FALSE
 )
 }
 \arguments{
@@ -41,9 +43,48 @@ or "sequential"
 \item \code{show_message}: Logical. Show parallel setup messages
 }
 If empty list, inherits settings from original forestsearch call.}
+
+\item{digits}{Integer. Decimal places for construction-time numeric
+formatting in \code{FSsg_tab} (arm summaries, Diff, effect-estimate
+CI, bias-corrected CI).  Default 4 to provide round-down headroom
+for downstream display reformatting (e.g.,
+\code{\link{summarize_bootstrap_results}(digits = ...)}, which can
+round down but cannot recover precision lost at construction).
+Threaded through \code{\link{format_CI}} and
+\code{\link{SG_tab_estimates_glm}}.}
+
+\item{mr_in_replicates}{Logical.  Whether multiplier resampling (MR) runs
+\emph{inside} each bootstrap replicate.  \strong{Default \code{FALSE}}.
+
+\code{mr_inference} reaches each replicate through the reconstructed call
+in \code{fs.est$args_call_all}, so an analysis fitted with
+\code{mr_inference = TRUE} would otherwise run MR in every replicate --
+and nothing consumes the result.  Under the default the flag is stripped
+from the replicate call, so that work is not done at all.  This does
+\emph{not} affect the top-level analysis: \code{fs.est} keeps whatever
+de-biased estimate it was fitted with.
+
+\code{TRUE} lets \code{mr_inference} propagate unchanged into each
+replicate \emph{and} retains the result, returned as \code{$mr_replicates}
+-- a list of length \code{nb_boots} whose \code{b}-th element is that
+replicate's \code{mr_inference} object, or \code{NULL} where the replicate
+failed or identified no subgroup.  MR therefore runs in the replicates
+only if the original analysis set \code{mr_inference = TRUE}; running it
+and discarding the result is never a reachable combination.
+
+\strong{The retained objects are not aggregable into an estimate for the
+original analysis.}  Each replicate re-runs the search, selects its own
+subgroup, and de-biases \emph{that} subgroup -- so the collection
+describes MR's sampling behaviour across resampled selections, not a
+better estimate of the original quantity.  Averaging them, or pooling
+their intervals, is an error.  The bias-corrected estimate for the
+original analysis is the one this function already returns in
+\code{SG_CIs}, and the original subgroup's own MR estimate is on
+\code{fs.est}.}
 }
 \value{
-List with the following components:
+An \code{fs_bootstrap} object (a list with class
+\code{c("fs_bootstrap", "list")}) containing:
 \describe{
 \item{results}{Data.table with bias-corrected estimates for each bootstrap iteration}
 \item{SG_CIs}{List of confidence intervals for H and Hc (raw and bias-corrected)}
@@ -51,7 +92,31 @@ List with the following components:
 \item{Ystar_mat}{Matrix (nb_boots x n) of bootstrap sample indicators}
 \item{H_estimates}{Detailed estimates for subgroup H}
 \item{Hc_estimates}{Detailed estimates for subgroup Hc}
+\item{mr_replicates}{\code{NULL} under the default
+\code{mr_in_replicates = FALSE}.  Otherwise a list of length
+\code{nb_boots}, element \code{b} holding replicate \code{b}'s
+\code{mr_inference} object (or \code{NULL} for a failed or
+no-subgroup replicate), each computed against \emph{that replicate's}
+candidate family and selected subgroup.  See the
+\code{mr_in_replicates} parameter for why these must not be averaged.}
 \item{summary}{(If create_summary=TRUE) Enhanced summary with tables and diagnostics}
+\item{nb_boots}{Integer. Number of bootstrap iterations requested.
+Used by \code{\link{print.fs_bootstrap}} to compute identification
+percentages without re-inspecting \code{results}.  Added in v0.2.0.}
+\item{original_sg}{Character vector. The subgroup identified by the
+primary \code{\link{forestsearch}} call (\code{fs.est$sg.harm}),
+carried forward so that \code{\link{print.fs_bootstrap}} can
+report exact- and partial-match rates without retaining a
+reference to \code{fs.est}.  Added in v0.2.0.}
+\item{outcome_type}{Character. Outcome type of the underlying
+analysis: one of \code{"survival"}, \code{"binary"},
+\code{"continuous"}, or \code{"count"}.  Added in v0.2.0.}
+\item{effect_measure}{Character. Effect measure label
+(\code{"HR"} for survival; \code{"OR"}, \code{"RR"}, \code{"RD"},
+\code{"IRR"}, \code{"IRD"}, or \code{"MD"} for GLM outcomes).
+Added in v0.2.0.}
+\item{est.scale}{Character. Estimation scale for confidence
+intervals (\code{"hr"} or \code{"1/hr"}).  Added in v0.2.0.}
 }
 }
 \description{
@@ -85,6 +150,33 @@ where \eqn{H_{*}} is the original subgroup HR on bootstrap data.
 }
 }
 
+\section{Valid for every identifier configuration}{
+
+Unlike multiplier resampling, the full bootstrap places no alignment
+requirement on the identifier. It replays the entire pipeline on each
+resample -- refitting the front ends, re-enumerating the candidate family
+and re-running selection -- rather than linearizing the selection event, so
+neither of MR's two conditions (selection ranking on the inferential
+coefficient, and a fixed candidate family) bears on its validity. In the
+equivalence result those conditions state, the bootstrap is the reference
+standard, not a party to it.
+
+It is therefore valid for all six identifier configurations, including the
+three that rank on a native statistic: DINA under
+\code{dina_select_statistic = "dina"}, GRF under
+\code{grf_select_statistic = "dr"}, and GRF under
+\code{grf_selection = "tree"}. For those, it correctly estimates the
+selection bias that ranking on the native statistic induces on the
+reported effect \eqn{\hat\beta}. That is a coherent quantity, and the
+estimate of it is valid -- it simply sits outside the framework the
+manuscript develops, which is about identifiers whose selection map and
+reported effect are the same functional.
+
+The one place an alignment check does apply here is
+\code{mr_in_replicates = TRUE}, which asks for MR \emph{inside} each
+replicate; see that parameter.
+}
+
 \section{Performance}{
 
 Typical runtime: 1-5 seconds per bootstrap iteration. For 1000 bootstraps with
@@ -102,8 +194,48 @@ and number of workers.
 }
 }
 
+\examples{
+\dontrun{
+# Run ForestSearch
+fs_result <- forestsearch(
+  df.analysis = mydata,
+  outcome.name = "time",
+  event.name = "status",
+  treat.name = "treatment",
+  confounders.name = c("age", "sex", "stage")
+)
+
+# Run bootstrap with bias correction
+boot_results <- forestsearch_bootstrap_dofuture(
+  fs.est = fs_result,
+  nb_boots = 1000,
+  parallel_args = list(
+    plan = "multisession",
+    workers = 6,
+    show_message = TRUE
+  ),
+  create_summary = TRUE,
+  create_plots = TRUE
+)
+
+# View results
+print(boot_results$FSsg_tab)
+print(boot_results$summary$table)
+
+# Check success rate
+mean(!is.na(boot_results$results$H_biasadj_2))
+}
+
+}
 \seealso{
-\code{\link{forestsearch}} for initial subgroup identification
+\code{\link{forestsearch}} for initial subgroup identification, and its
+vocabulary section for how the full bootstrap (FB) implemented here
+relates to multiplier resampling (MR)
+\code{\link{fs_mr_inference}} for MR, the fast refit-free approximation to
+this function
+\code{\link{mr_estimates_table}} to render MR estimates in this function's
+table layout
+\code{\link{fs_fdr_report}} for harm-confirmation threshold sweeps
 \code{\link{bootstrap_results}} for the core bootstrap worker function
 \code{\link{build_cox_formula}} for Cox formula construction
 \code{\link{fit_cox_models}} for Cox model fitting

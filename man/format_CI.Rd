@@ -4,12 +4,16 @@
 \alias{format_CI}
 \title{Format Confidence Interval for Estimates}
 \usage{
-format_CI(estimates, col_names)
+format_CI(estimates, col_names, digits = 4)
 }
 \arguments{
 \item{estimates}{Data frame or data.table of estimates.}
 
 \item{col_names}{Character vector of column names for estimate, lower, upper.}
+
+\item{digits}{Integer. Decimal places for numeric formatting.  Default 4
+to provide round-down headroom for downstream display reformatting
+(e.g., \code{summarize_bootstrap_results(digits = ...)}).}
 }
 \value{
 Character string formatted as \"estimate (lower, upper)\".
@@ -17,4 +21,10 @@ Character string formatted as \"estimate (lower, upper)\".
 \description{
 Formats confidence interval for estimates.
 }
-\keyword{internal}
+\examples{
+\donttest{
+library(data.table)
+est <- data.table(hr = 1.58, lower = 0.86, upper = 2.90)
+format_CI(est, col_names = c("hr", "lower", "upper"))
+}
+}

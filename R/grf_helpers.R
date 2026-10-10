@@ -14,8 +14,13 @@
 #' @param sg.criterion Character. Subgroup selection criterion
 #' @param maxdepth Integer. Maximum tree depth
 #' @param seedit Integer. Random seed
-#' @keywords internal
 #' @return List with configuration parameters
+#' @examples
+#' cfg <- create_grf_config(frac.tau = 0.6, n.min = 60, dmin.grf = 6,
+#'                          RCT = TRUE, sg.criterion = "mDiff",
+#'                          maxdepth = 2, seedit = 42L)
+#' str(cfg)
+#' @export
 
 create_grf_config <- function(frac.tau, n.min, dmin.grf, RCT,
                               sg.criterion, maxdepth, seedit) {
@@ -44,15 +49,32 @@ create_grf_config <- function(frac.tau, n.min, dmin.grf, RCT,
 #' @param tau.rmst Numeric. Time horizon for RMST
 #' @param RCT Logical. Is this RCT data?
 #' @param seedit Integer. Random seed
-#' @keywords internal
+#' @param tune_grf Logical. If TRUE, enables cross-validated hyperparameter
+#'   tuning via \code{tune.parameters = "all"}. Default FALSE.
 #' @return Causal survival forest object
+#' @examples
+#' \donttest{
+#' library(survival)
+#' library(grf)
+#' df <- survival::gbsg
+#' X <- as.matrix(df[, c("age", "meno", "size", "nodes", "pgr", "er")])
+#' tau <- quantile(df$rfstime[df$status == 1], 0.6)
+#' cs <- fit_causal_forest(X = X, Y = df$rfstime, W = df$hormon,
+#'                         D = df$status, tau.rmst = tau,
+#'                         RCT = FALSE, seedit = 42L)
+#' }
+#' @export
 
-fit_causal_forest <- function(X, Y, W, D, tau.rmst, RCT, seedit) {
+fit_causal_forest <- function(X, Y, W, D, tau.rmst, RCT, seedit,
+                              tune_grf = FALSE) {
+  tune_arg <- if (tune_grf) "all" else "none"
   if (RCT) {
     cs.forest <- try(
       suppressWarnings(
         grf::causal_survival_forest(X, Y, W, D, W.hat = 0.5,
-                                    horizon = tau.rmst, seed = seedit)
+                                    horizon = tau.rmst, seed = seedit,
+                                    tune.parameters = tune_arg,
+                                    num.threads = .fs_grf_num_threads())
       ),
       TRUE
     )
@@ -60,7 +82,9 @@ fit_causal_forest <- function(X, Y, W, D, tau.rmst, RCT, seedit) {
     cs.forest <- try(
       suppressWarnings(
         grf::causal_survival_forest(X, Y, W, D,
-                                    horizon = tau.rmst, seed = seedit)
+                                    horizon = tau.rmst, seed = seedit,
+                                    tune.parameters = tune_arg,
+                                    num.threads = .fs_grf_num_threads())
       ),
       TRUE
     )
@@ -73,6 +97,53 @@ fit_causal_forest <- function(X, Y, W, D, tau.rmst, RCT, seedit) {
   return(cs.forest)
 }
 
+
+#' Fit Causal Forest for GLM Outcomes
+#'
+#' Fits a GRF causal forest for binary or continuous outcomes using
+#' [grf::causal_forest()].  This is the GLM counterpart to
+#' \code{\link{fit_causal_forest}}, which uses `causal_survival_forest`.
+#'
+#' @param X Numeric matrix. Covariates.
+#' @param Y Numeric vector. Outcome (binary 0/1 or continuous).
+#' @param W Numeric vector. Treatment indicator (0/1).
+#' @param RCT Logical. Is this RCT data?
+#' @param seedit Integer. Random seed.
+#' @param tune_grf Logical. If TRUE, enables cross-validated hyperparameter
+#'   tuning via \code{tune.parameters = "all"}. Default FALSE preserves
+#'   existing behavior.
+#' @return Causal forest object.
+#' @keywords internal
+fit_causal_forest_glm <- function(X, Y, W, RCT, seedit,
+                                  tune_grf = FALSE) {
+  tune_arg <- if (tune_grf) "all" else "none"
+  if (RCT) {
+    cf <- try(
+      suppressWarnings(
+        grf::causal_forest(X, Y, W, W.hat = 0.5, seed = seedit,
+                           tune.parameters = tune_arg,
+                           num.threads = .fs_grf_num_threads())
+      ),
+      TRUE
+    )
+  } else {
+    cf <- try(
+      suppressWarnings(
+        grf::causal_forest(X, Y, W, seed = seedit,
+                           tune.parameters = tune_arg,
+                           num.threads = .fs_grf_num_threads())
+      ),
+      TRUE
+    )
+  }
+
+  if (inherits(cf, "try-error")) {
+    stop("Failed to fit causal forest: ", attr(cf, "condition")$message)
+  }
+
+  return(cf)
+}
+
 #' Compute node metrics for a policy tree
 #'
 #' Aggregates scores by leaf node and calculates treatment effect differences
@@ -82,9 +153,14 @@ fit_causal_forest <- function(X, Y, W, D, tau.rmst, RCT, seedit) {
 #' @param tree Policy tree object
 #' @param X Matrix. Covariate matrix
 #' @param n.min Integer. Minimum subgroup size
-#' @keywords internal
 #' @return Data frame with node metrics
 #' @importFrom stats aggregate
+#' @examples
+#' \dontrun{
+#' # compute_node_metrics() is called internally by grf.subg.harm.survival().
+#' # See grf.subg.harm.survival() for the standard entry point.
+#' }
+#' @export
 
 compute_node_metrics <- function(data, dr.scores, tree, X, n.min) {
   data$predict.node <- predict(tree, X, type = "node.id")
@@ -117,9 +193,14 @@ compute_node_metrics <- function(data, dr.scores, tree, X, n.min) {
 #' @param dr.scores Matrix. Doubly robust scores
 #' @param maxdepth Integer. Maximum tree depth (1-3)
 #' @param n.min Integer. Minimum subgroup size
-#' @keywords internal
 #' @return List with trees and combined values
 #' @importFrom policytree policy_tree
+#' @examples
+#' \dontrun{
+#' # fit_policy_trees() is called internally by grf.subg.harm.survival().
+#' # See grf.subg.harm.survival() for the standard entry point.
+#' }
+#' @export
 
 fit_policy_trees <- function(X, data, dr.scores, maxdepth, n.min) {
   trees <- list()
@@ -224,16 +305,36 @@ extract_tree_cuts <- function(tree) {
   ))
 }
 
-#' Find the split that leads to a specific leaf node
+#' Find the split that leads to a specific leaf node (deprecated)
 #'
-#' Identifies the split point that creates a given leaf node
+#' @description
+#' \strong{Deprecated.}
+#'
+#' Returns only the single split immediately above `leaf_node`, rendered as
+#' `"var <= value"`.  This is **not** a correct subgroup definition for a leaf
+#' below depth 1: it drops the rest of the root-to-leaf path and mis-renders
+#' right-turns (which are `>`, not `<=`).  Use the path-based
+#' `.grf_build_subgroup_definition()` instead, which
+#' `grf.subg.harm.survival()` now calls internally.  Retained (exported) only
+#' for backward compatibility; it is no longer used inside the package and
+#' will be removed in a future release.
 #'
 #' @param tree Policy tree object
 #' @param leaf_node Integer. Leaf node identifier
-#' @keywords internal
-#' @return Character string with split expression or NULL
+#' @return Character string with a single split expression, or NULL.
+#' @seealso \code{\link{grf.subg.harm.survival}} for the standard entry point.
+#' @examples
+#' \dontrun{
+#' # Deprecated; grf.subg.harm.survival() builds the full path internally.
+#' }
+#' @export
 
 find_leaf_split <- function(tree, leaf_node) {
+  .Deprecated("grf.subg.harm.survival",
+              msg = paste0("'find_leaf_split()' is deprecated: it returns only ",
+                           "one split above a leaf and mis-renders right-turns. ",
+                           "GRF subgroup definitions are now built from the full ",
+                           "root-to-leaf path inside grf.subg.harm.survival()."))
   grf_names <- tree$columns
   tnodes <- tree$nodes
 
@@ -298,7 +399,6 @@ extract_all_tree_cuts <- function(trees, maxdepth) {
 #' @param trees List. Policy trees (indexed by depth)
 #' @param selected_depth Integer. Depth of the selected tree (from best_subgroup$depth)
 #' @param maxdepth Integer. Maximum tree depth (for populating tree-specific slots)
-#' @keywords internal
 #' @return List with cuts and names, structured similarly to extract_all_tree_cuts
 #'   but with only the selected tree's cuts in the `all` field
 #'
@@ -313,6 +413,15 @@ extract_all_tree_cuts <- function(trees, maxdepth) {
 #'   \item `selected_depth`: The depth that was selected
 #' }
 #'
+#' @examples
+#' \dontrun{
+#' # When best_subgroup$depth = 2, only tree2 cuts are returned in $all
+#' tree_cuts <- extract_selected_tree_cuts(trees, selected_depth = 2, maxdepth = 2)
+#' tree_cuts$all
+#' # Returns only cuts from depth 2 tree
+#' }
+#'
+#' @keywords internal
 
 extract_selected_tree_cuts <- function(trees, selected_depth, maxdepth) {
   result <- list()
@@ -510,9 +619,15 @@ create_null_result <- function(data, values, trees, config) {
 #' @param best_subgroup Data frame row. Selected subgroup (or NULL)
 #' @param sg_harm_id Character. Subgroup definition (or NULL)
 #' @param tree_cuts List. Cut information
-#' @keywords internal
-#' @return No return value, called for side effects (prints GRF diagnostic
-#'   information to the console).
+#' @return Called for its side effect of printing to the console. The value
+#'   is returned invisibly and is incidental: `tree_cuts$all` when a subgroup,
+#'   its definition and `tree_cuts` are all supplied, otherwise `NULL`.
+#' @examples
+#' \dontrun{
+#' # print_grf_details() is called internally by grf.subg.harm.survival().
+#' # See grf.subg.harm.survival() for the standard entry point.
+#' }
+#' @export
 
 print_grf_details <- function(config, values, best_subgroup, sg_harm_id, tree_cuts = NULL) {
   cat("tau, maxdepth =", c(config$tau.rmst, config$maxdepth), "\n")
@@ -553,8 +668,12 @@ print_grf_details <- function(config, values, best_subgroup, sg_harm_id, tree_cu
 #' @param W Numeric vector. Treatment indicator
 #' @param D Numeric vector. Event indicator
 #' @param n.min Integer. Minimum subgroup size
-#' @keywords internal
 #' @return Logical. TRUE if data is valid, FALSE with warning otherwise
+#' @examples
+#' W <- rep(0:1, each = 50)
+#' D <- rbinom(100, 1, 0.6)
+#' validate_grf_data(W, D, n.min = 60)
+#' @export
 
 validate_grf_data <- function(W, D, n.min) {
   # Check treatment variation
@@ -582,4 +701,38 @@ validate_grf_data <- function(W, D, n.min) {
   }
 
   return(TRUE)
+}
+
+
+#' Code one covariate column as the GRF forest matrix codes it
+#'
+#' The single definition of how a candidate covariate enters GRF on the GLM
+#' path.  Numeric columns pass through unchanged.  A factor or character
+#' column whose levels are all numeric strings (for example `"0"`/`"1"`)
+#' becomes those values via `as.numeric(as.character())`.  Any other factor or
+#' character column becomes integer codes via `as.integer(as.factor())`.
+#'
+#' `.build_grf_X()` applies it to build the forest's covariate matrix and
+#' `.grf_evaluate_subgroup()` applies it before comparing a column with a
+#' candidate cut, so a cut is always evaluated on the scale the forest split
+#' on.  Before this helper existed the evaluator compared the raw column, and a
+#' factor covariate returned `NA` membership for every cut on it.
+#'
+#' @param x A covariate column.
+#' @return `x` unchanged when it is neither a factor nor a character vector;
+#'   otherwise a numeric vector (all-numeric levels) or an integer vector
+#'   (other levels).
+#' @noRd
+.grf_code_column <- function(x) {
+  if (!is.factor(x) && !is.character(x)) {
+    return(x)
+  }
+  lvls <- if (is.factor(x)) levels(x) else unique(x)
+  if (!anyNA(suppressWarnings(as.numeric(lvls)))) {
+    # All-numeric levels: preserve the original values.
+    as.numeric(as.character(x))
+  } else {
+    # Non-numeric levels: integer codes.
+    as.integer(as.factor(x))
+  }
 }

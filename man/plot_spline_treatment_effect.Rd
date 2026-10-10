@@ -12,8 +12,19 @@ plot_spline_treatment_effect(dgm_result, add_points = TRUE)
 \item{add_points}{Logical; add observed data points. Default TRUE}
 }
 \value{
-No return value, called for side effects (produces a plot).
+Called for its side effect of producing a base-R plot.  Returns
+\code{NULL} invisibly.
 }
 \description{
 Plot Spline Treatment Effect Function
+}
+\examples{
+\dontrun{
+library(survival)
+df <- survival::gbsg
+dgm <- generate_aft_dgm_flex(df, outcome.name = "rfstime",
+                              event.name = "status", treat.name = "hormon",
+                              confounders.name = c("age", "meno", "nodes"))
+plot_spline_treatment_effect(dgm)
+}
 }

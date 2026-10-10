@@ -128,10 +128,9 @@ automatically by \code{plot_subgroup_results_forestplot()} based on
 row types (ITT, reference, posthoc, etc.).
 }
 \examples{
-\donttest{
+\dontrun{
 # Simple: just increase base_size for larger plot
 large_theme <- create_forest_theme(base_size = 14)
-print(large_theme)
 
 # Or use scale for quick adjustment
 large_theme <- create_forest_theme(base_size = 10, scale = 1.4)
@@ -139,9 +138,21 @@ large_theme <- create_forest_theme(base_size = 10, scale = 1.4)
 # Fine-tune specific elements
 custom_theme <- create_forest_theme(
   base_size = 14,
-  cv_fontsize = 12,
-  ci_lwd = 2.5
+  cv_fontsize = 12,  # Override auto-calculated CV font size
+  ci_lwd = 2.5       # Override auto-calculated CI line width
 )
+
+# Use with plot_subgroup_results_forestplot
+result <- plot_subgroup_results_forestplot(
+  fs_results = list(fs.est = fs, fs_bc = fs_bc),
+  df_analysis = df.analysis,
+  outcome.name = "time",
+  event.name = "status",
+  treat.name = "treatment",
+  theme = large_theme
+)
+
+render_forestplot(result)
 }
 
 }

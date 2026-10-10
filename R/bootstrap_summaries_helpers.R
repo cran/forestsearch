@@ -13,12 +13,20 @@
 #' @param title Character. Custom title (optional)
 #' @param subtitle Character. Custom subtitle (optional)
 #'
-#' @keywords internal
 #' @return A gt table object
 #'
-#' @importFrom gt gt tab_header tab_spanner tab_footnote tab_source_note md
-#'   cols_label tab_style cell_fill cell_text cells_body cells_column_labels
+#' @importFrom gt gt tab_header tab_spanner tab_footnote tab_source_note md cols_label tab_style cell_fill cell_text cells_body cells_column_labels
 #' @importFrom dplyr all_of
+#' @examples
+#' \dontrun{
+#' fs <- forestsearch(gbsg,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+#' fs_bc <- forestsearch_bootstrap_dofuture(fs, nb_boots = 100)
+#' summaries <- summarize_bootstrap_results(fs$sg.harm, fs_bc)
+#' format_bootstrap_table(summaries$table_data)
+#' }
+#' @export
 format_bootstrap_table <- function(FSsg_tab,
                                    nb_boots,
                                    est.scale = "hr",
@@ -52,27 +60,91 @@ format_bootstrap_table <- function(FSsg_tab,
     )
   }
 
-  # Column labels configuration
+  # Robustness: forestsearch_bootstrap_dofuture() returns a partial result
+  # with FSsg_tab = NULL when it cannot compute H/Hc estimates -- e.g. when
+  # resample selection is too unstable to yield bias-corrected effects (a
+  # documented early-return, not an error).  The coercion above turns that
+  # into a 0-column frame, after which the column logic below (FSsg_tab[[1]],
+  # cols_label, ...) would raise a cryptic "subscript out of bounds".
+  # Return an informative placeholder gt instead so summarize_bootstrap_results()
+  # and downstream consumers (vignettes) degrade gracefully.
+  if (ncol(FSsg_tab) == 0L || nrow(FSsg_tab) == 0L) {
+    placeholder <- data.frame(
+      Result = paste0(
+        "No bias-corrected estimates available: the bootstrap did not ",
+        "produce H/Hc effects (resample selection was too unstable, or no ",
+        "resample reproduced an identified subgroup)."
+      ),
+      stringsAsFactors = FALSE
+    )
+    return(
+      gt::gt(placeholder) |>
+        gt::tab_header(title = title, subtitle = subtitle) |>
+        gt::cols_label(Result = "") |>
+        gt::cols_align(align = "left")
+    )
+  }
+
+  # Column labels configuration.
+  # Every entry is guarded by a column-name check, so the labels list
+  # only contains keys that exist in FSsg_tab.  This protects
+  # gt::cols_label() against degraded upstream tables that may be
+  # missing one or more expected columns.
   col_names <- colnames(FSsg_tab)
-  labels_list <- list(Subgroup = "Subgroup")
+  labels_list <- list()
+  if ("Subgroup" %in% col_names) labels_list$Subgroup <- "Subgroup"
+
+  # Auto-detect GLM vs survival from column names.  GLM tables have
+  # "Rate(C)/Rate(T)" (binary) or "Mean(C)/Mean(T)" (continuous/count)
+  # instead of "m1/m0/RMST" (survival).
+  is_glm_table <- any(grepl("Rate\\(", col_names)) ||
+                  any(grepl("Mean\\(", col_names)) ||
+                  !any(c("m1", "m0", "RMST") %in% col_names)
 
   if ("n" %in% col_names) labels_list$n <- "N"
   if ("n1" %in% col_names) labels_list$n1 <- gt::md("N<sub>T</sub>")
   if ("events" %in% col_names) labels_list$events <- "Events"
-  if ("m1" %in% col_names) labels_list$m1 <- gt::md("Med<sub>T</sub>")
-  if ("m0" %in% col_names) labels_list$m0 <- gt::md("Med<sub>C</sub>")
-  if ("RMST" %in% col_names) labels_list$RMST <- gt::md("RMST<sub>d</sub>")
 
-  # Handle HR column
-  hr_col <- grep("HR.*CI", col_names, value = TRUE)[1]
-  if (!is.na(hr_col) && length(hr_col) > 0) {
-    labels_list[[hr_col]] <- gt::md("HR<br/>(95% CI)<sup>\u2020</sup>")
+  if (!is_glm_table) {
+    # Survival-specific columns
+    if ("m1" %in% col_names) labels_list$m1 <- gt::md("Med<sub>T</sub>")
+    if ("m0" %in% col_names) labels_list$m0 <- gt::md("Med<sub>C</sub>")
+    if ("RMST" %in% col_names) labels_list$RMST <- gt::md("RMST<sub>d</sub>")
+  } else {
+    # GLM-specific columns: handle both Rate (binary) and Mean (cts/count)
+    rate_c <- grep("^Rate\\(C\\)", col_names, value = TRUE)[1]
+    rate_t <- grep("^Rate\\(T\\)", col_names, value = TRUE)[1]
+    if (!is.na(rate_c)) labels_list[[rate_c]] <- gt::md("Rate<sub>C</sub>")
+    if (!is.na(rate_t)) labels_list[[rate_t]] <- gt::md("Rate<sub>T</sub>")
+
+    mean_c <- grep("^Mean\\(C\\)", col_names, value = TRUE)[1]
+    mean_t <- grep("^Mean\\(T\\)", col_names, value = TRUE)[1]
+    if (!is.na(mean_c)) labels_list[[mean_c]] <- gt::md("Mean<sub>C</sub>")
+    if (!is.na(mean_t)) labels_list[[mean_t]] <- gt::md("Mean<sub>T</sub>")
   }
 
-  # Handle adjusted HR column
-  hr_adj_col <- grep("HR\\*", col_names, value = TRUE)[1]
-  if (!is.na(hr_adj_col) && length(hr_adj_col) > 0) {
-    labels_list[[hr_adj_col]] <- gt::md("HR<sup>\u2021</sup><br/>(95% CI)")
+  # Handle effect estimate column (HR for survival, IRR/OR/RD/MD for GLM)
+  # Detect the effect measure from column names
+  effect_col <- grep("(HR|IRR|OR|RR|RD|IRD|MD)\\s*\\(.*CI\\)", col_names, value = TRUE)[1]
+  effect_measure_detected <- if (!is.na(effect_col)) {
+    sub("\\s*\\(.*", "", effect_col)
+  } else {
+    "HR"
+  }
+
+  if (!is.na(effect_col)) {
+    labels_list[[effect_col]] <- gt::md(paste0(
+      effect_measure_detected, "<br/>(95% CI)<sup>\u2020</sup>"
+    ))
+  }
+
+  # Handle adjusted / bias-corrected column
+  bc_col <- grep("(HR|IRR|OR|RR|RD|IRD|MD)\\*", col_names, value = TRUE)[1]
+  if (!is.na(bc_col)) {
+    bc_measure <- sub("\\*$", "", bc_col)
+    labels_list[[bc_col]] <- gt::md(paste0(
+      bc_measure, "<sup>\u2021</sup><br/>(95% CI)"
+    ))
   }
 
   # Create base gt table
@@ -91,37 +163,60 @@ format_bootstrap_table <- function(FSsg_tab,
       gt::tab_spanner(label = "Sample Size", columns = sample_size_cols)
   }
 
-  survival_cols <- intersect(c("m1", "m0", "RMST"), col_names)
-  if (length(survival_cols) > 0) {
-    tbl <- tbl |>
-      gt::tab_spanner(label = "Survival", columns = survival_cols)
+  if (!is_glm_table) {
+    survival_cols <- intersect(c("m1", "m0", "RMST"), col_names)
+    if (length(survival_cols) > 0) {
+      tbl <- tbl |>
+        gt::tab_spanner(label = "Survival", columns = survival_cols)
+    }
+  } else {
+    # GLM spanner: "Event Rates" for binary (Rate cols) or "Subgroup Means"
+    # for continuous/count (Mean cols).
+    rate_cols <- grep("^Rate\\(", col_names, value = TRUE)
+    mean_cols <- grep("^Mean\\(", col_names, value = TRUE)
+    if (length(rate_cols) > 0) {
+      tbl <- tbl |>
+        gt::tab_spanner(label = "Event Rates", columns = rate_cols)
+    } else if (length(mean_cols) > 0) {
+      tbl <- tbl |>
+        gt::tab_spanner(label = "Subgroup Means", columns = mean_cols)
+    }
   }
 
-  hr_cols <- grep("HR", col_names, value = TRUE)
-  if (length(hr_cols) > 0) {
+  # Treatment effect spanner — match all effect columns generically
+  effect_all_cols <- grep(
+    "(HR|IRR|OR|RR|RD|IRD|MD)(\\s*\\(|\\*)", col_names, value = TRUE
+  )
+  if (length(effect_all_cols) > 0) {
     tbl <- tbl |>
-      gt::tab_spanner(label = "Treatment Effect", columns = gt::starts_with("HR"))
+      gt::tab_spanner(label = "Treatment Effect", columns = effect_all_cols)
   }
 
   # Add methodology footnotes
-  if (!is.na(hr_col) && length(hr_col) > 0) {
+  if (!is.na(effect_col)) {
+    unadj_label <- if (is_glm_table) {
+      sprintf("**Unadjusted %s**: GLM estimate with robust standard errors",
+              effect_measure_detected)
+    } else {
+      "**Unadjusted HR**: Standard Cox regression hazard ratio with robust standard errors"
+    }
     tbl <- tbl |>
       gt::tab_footnote(
-        footnote = gt::md(
-          "**Unadjusted HR**: Standard Cox regression hazard ratio with robust standard errors"
-        ),
-        locations = gt::cells_column_labels(columns = dplyr::all_of(hr_col))
+        footnote = gt::md(unadj_label),
+        locations = gt::cells_column_labels(columns = dplyr::all_of(effect_col))
       )
   }
 
-  if (!is.na(hr_adj_col) && length(hr_adj_col) > 0) {
+  if (!is.na(bc_col)) {
+    bc_label <- sprintf(
+      "**Bias-corrected %s**: Bootstrap-adjusted estimate using infinitesimal jackknife method (%d iterations). Corrects for optimism in subgroup selection.",
+      if (is_glm_table) effect_measure_detected else "HR",
+      nb_boots
+    )
     tbl <- tbl |>
       gt::tab_footnote(
-        footnote = gt::md(sprintf(
-          "**Bias-corrected HR**: Bootstrap-adjusted estimate using infinitesimal jackknife method (%d iterations). Corrects for optimism in subgroup selection.",
-          nb_boots
-        )),
-        locations = gt::cells_column_labels(columns = dplyr::all_of(hr_adj_col))
+        footnote = gt::md(bc_label),
+        locations = gt::cells_column_labels(columns = dplyr::all_of(bc_col))
       )
   }
 
@@ -150,10 +245,17 @@ format_bootstrap_table <- function(FSsg_tab,
   }
 
   # Add source note
-  source_note_text <- paste0(
-    "*Note*: Med = Median survival time (months). ",
-    "RMST<sub>d</sub> = Restricted mean survival time difference."
-  )
+  if (is_glm_table) {
+    source_note_text <- paste0(
+      "*Note*: Rate<sub>C</sub> = control arm event rate; ",
+      "Rate<sub>T</sub> = treatment arm event rate."
+    )
+  } else {
+    source_note_text <- paste0(
+      "*Note*: Med = Median survival time (months). ",
+      "RMST<sub>d</sub> = Restricted mean survival time difference."
+    )
+  }
 
   if (!is.null(boot_success_rate)) {
     source_note_text <- paste0(
@@ -324,8 +426,7 @@ create_timing_summary_table <- function(overall_timing,
 #' @param boot_success_rate Numeric. Proportion of successful bootstraps
 #'
 #' @return A gt table object
-#' @importFrom gt gt tab_header tab_spanner tab_footnote tab_source_note md
-#'   cols_label tab_style cell_fill cell_text
+#' @importFrom gt gt tab_header tab_spanner tab_footnote tab_source_note md cols_label tab_style cell_fill cell_text
 #' @keywords internal
 format_bootstrap_timing_table <- function(timing_list, nb_boots, boot_success_rate) {
 
@@ -430,14 +531,14 @@ format_bootstrap_timing_table <- function(timing_list, nb_boots, boot_success_ra
 #' @param Hc_estimates List. Hc subgroup estimates
 #'
 #' @return A gt table object
-#' @importFrom gt gt tab_header tab_footnote tab_source_note md cols_label
-#'   tab_style cell_fill cell_text cells_body cells_column_labels
+#' @importFrom gt gt tab_header tab_footnote tab_source_note md cols_label tab_style cell_fill cell_text cells_body cells_column_labels
 #' @keywords internal
 format_bootstrap_diagnostics_table <- function(diagnostics,
                                                nb_boots,
                                                results,
                                                H_estimates = NULL,
-                                               Hc_estimates = NULL) {
+                                               Hc_estimates = NULL,
+                                               effect_label = "HR") {
 
   if (!requireNamespace("gt", quietly = TRUE)) {
     stop("Package 'gt' is required for table formatting.")
@@ -482,7 +583,9 @@ format_bootstrap_diagnostics_table <- function(diagnostics,
 
     diagnostics_rows$H <- data.frame(
       Category = c("Subgroup H (Questionable)", "", "", ""),
-      Metric = c("Observed HR", "Bias-corrected HR", "Bootstrap CV (%)", "N estimates"),
+      Metric = c(paste("Observed", effect_label),
+                 paste("Bias-corrected", effect_label),
+                 "Bootstrap CV (%)", "N estimates"),
       Value = c(
         sprintf("%.3f", H_estimates$H0),
         sprintf("%.3f", H_estimates$H2),
@@ -500,7 +603,9 @@ format_bootstrap_diagnostics_table <- function(diagnostics,
 
     diagnostics_rows$Hc <- data.frame(
       Category = c("Subgroup Hc (Recommend)", "", "", ""),
-      Metric = c("Observed HR", "Bias-corrected HR", "Bootstrap CV (%)", "N estimates"),
+      Metric = c(paste("Observed", effect_label),
+                 paste("Bias-corrected", effect_label),
+                 "Bootstrap CV (%)", "N estimates"),
       Value = c(
         sprintf("%.3f", Hc_estimates$H0),
         sprintf("%.3f", Hc_estimates$H2),
@@ -570,17 +675,31 @@ format_bootstrap_diagnostics_table <- function(diagnostics,
 #' @param overall_timing List with overall timing information (optional)
 #'
 #' @return List of ggplot2 objects
-#' @importFrom ggplot2 ggplot aes geom_histogram geom_vline labs theme_minimal
-#'   theme element_text
+#' @importFrom ggplot2 ggplot aes geom_histogram geom_vline labs theme_minimal theme element_text
 #' @importFrom rlang .data
 #' @keywords internal
 create_bootstrap_diagnostic_plots <- function(results,
                                               H_estimates,
                                               Hc_estimates,
-                                              overall_timing = NULL) {
+                                              overall_timing = NULL,
+                                              effect_label = "HR") {
 
   if (!requireNamespace("ggplot2", quietly = TRUE)) {
     return(NULL)
+  }
+
+  # Multiplicative effect measures live on the log scale in the bootstrap
+  # results, so the observed/bias-corrected vertical lines need log().
+  # Additive measures (MD, RD) are already on the identity scale and must
+  # NOT be log-transformed -- log(MD) on a negative MD produces NaN and
+  # warnings (the symptom that motivated this fix).
+  is_log_scale <- toupper(effect_label) %in% c("HR", "OR", "RR", "IRR")
+
+  scale_xintercept <- function(x) if (is_log_scale) log(x) else x
+  x_axis_label     <- if (is_log_scale) {
+    paste0("Log ", effect_label, " (bias-corrected)")
+  } else {
+    paste0(effect_label, " (bias-corrected)")
   }
 
   plots <- list()
@@ -593,7 +712,8 @@ create_bootstrap_diagnostic_plots <- function(results,
       p1 <- ggplot2::ggplot(valid_H, ggplot2::aes(x = .data$H_biasadj_2)) +
         ggplot2::geom_histogram(bins = 30, fill = "#4472C4", alpha = 0.7, color = "white") +
         ggplot2::geom_vline(
-          xintercept = c(log(H_estimates$H2), log(H_estimates$H0)),
+          xintercept = c(scale_xintercept(H_estimates$H2),
+                         scale_xintercept(H_estimates$H0)),
           color = c("green", "red"),
           linetype = "dashed",
           linewidth = 1
@@ -601,7 +721,7 @@ create_bootstrap_diagnostic_plots <- function(results,
         ggplot2::labs(
           title = "Bootstrap Distribution: Subgroup H",
           subtitle = "Green = bias-corrected, Red = observed",
-          x = "Log Hazard Ratio (bias-corrected)",
+          x = x_axis_label,
           y = "Frequency"
         ) +
         ggplot2::theme_minimal() +
@@ -622,7 +742,8 @@ create_bootstrap_diagnostic_plots <- function(results,
       p2 <- ggplot2::ggplot(valid_Hc, ggplot2::aes(x = .data$Hc_biasadj_2)) +
         ggplot2::geom_histogram(bins = 30, fill = "#70AD47", alpha = 0.7, color = "white") +
         ggplot2::geom_vline(
-          xintercept = c(log(Hc_estimates$H2), log(Hc_estimates$H0)),
+          xintercept = c(scale_xintercept(Hc_estimates$H2),
+                         scale_xintercept(Hc_estimates$H0)),
           color = c("green", "red"),
           linetype = "dashed",
           linewidth = 1
@@ -630,7 +751,7 @@ create_bootstrap_diagnostic_plots <- function(results,
         ggplot2::labs(
           title = "Bootstrap Distribution: Subgroup Hc",
           subtitle = "Green = bias-corrected, Red = observed",
-          x = "Log Hazard Ratio (bias-corrected)",
+          x = x_axis_label,
           y = "Frequency"
         ) +
         ggplot2::theme_minimal() +
@@ -946,6 +1067,12 @@ summarize_factor_presence_robust <- function(results,
 #'
 #' Low event counts (below threshold) can lead to unstable HR estimates.
 #' This summary helps identify potential issues with sparse events.
+#'
+#' @examples
+#' \dontrun{
+#' # After running bootstrap analysis
+#' summarize_bootstrap_events(fs_bc, threshold = 10)
+#' }
 #'
 #' @export
 summarize_bootstrap_events <- function(boot_results, threshold = 5) {

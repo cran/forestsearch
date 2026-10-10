@@ -20,6 +20,33 @@ Displays a concise summary of ForestSearch results including the
 identified subgroup definition, consistency metrics, algorithm details,
 and computation time.
 }
+\section{Post-selection inference}{
+
+When the fit carries multiplier-resampling results (\code{mr_inference = TRUE},
+attached as \code{x$mr_inference}) and the field block ran
+(\code{ci_method = "field"}, the default), a further block reports: the
+one-sided 95\% lower bound for the identified subgroup (the field); the
+one-sided 95\% upper bound for its complement (field-s, the studentized
+complement field); the Bonferroni pair for a joint two-subgroup
+statement; the infinitesimal-jackknife (IJ) two-term two-sided interval,
+as a secondary summary; and the re-selection frequency
+\eqn{\hat p(\widehat H)} as a descriptive diagnostic.  Bounds are read by
+their location relative to a clinically meaningful effect size, not as
+tests at the null.  With \code{ci_method = "ij"} only the two-sided interval is
+shown; without MR results the output is unchanged.  The constructions and
+their simulation operating characteristics are described in León and
+Anderson (2026), \href{https://arxiv.org/abs/2609.38361}{arXiv:2609.38361}.
+}
+
+\examples{
+\dontrun{
+fs <- forestsearch(df.analysis = mydata, ...)
+print(fs)
+# or simply:
+fs
+}
+
+}
 \seealso{
 \code{\link{summary.forestsearch}} for detailed output,
 \code{\link{plot.forestsearch}} for visualization.

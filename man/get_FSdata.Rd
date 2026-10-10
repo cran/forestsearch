@@ -14,13 +14,19 @@ get_FSdata(
   conf_force = NULL,
   conf.cont_medians = NULL,
   conf.cont_medians_force = NULL,
+  conf.cont_jcuts = NULL,
+  dina_cuts = NULL,
+  collapse_cuts = TRUE,
+  collapse_cuts_args = list(),
   replace_med_grf = TRUE,
   defaultcut_names = NULL,
   cut_type = "default",
   exclude_cuts = NULL,
   outcome.name = "tte",
   event.name = "event",
-  details = TRUE
+  details = TRUE,
+  outcome_type = "survival",
+  offset.name = NULL
 )
 }
 \arguments{
@@ -42,6 +48,39 @@ get_FSdata(
 
 \item{conf.cont_medians_force}{Character vector of additional continuous confounders to force median cut.}
 
+\item{conf.cont_jcuts}{Named list of positive integers, one per
+continuous confounder for which J-quantile cuts are desired.  For a
+variable \code{X} listed as \code{X = J}, the default cut set
+(\code{cut_var()}: mean, median, Q1, Q3) is replaced by \code{J}
+binary cut points at the (k/(J+1))-th quantiles of X for
+\code{k = 1, ..., J}, defining J+1 non-overlapping intervals
+\deqn{[\min(X), c_1),\ [c_1, c_2),\ \ldots,\ [c_J, \max(X)].}
+Variables not listed here retain default behaviour.  J-quantile
+cuts are unconditional (not filtered by LASSO), matching
+\code{defaultcut_names} semantics.  Names must be in
+\code{confounders.name} and must not overlap with
+\code{defaultcut_names} or \code{conf.cont_medians_force}.}
+
+\item{dina_cuts}{Character vector of DINA cut expressions (optional),
+merged into the candidate pool exactly like \code{grf_cuts}.}
+
+\item{collapse_cuts}{Logical.  If TRUE, collapse near-redundant continuous
+candidate cuts after the full pool is assembled and resolved to literal
+numerics.  Cuts on the same variable and operator whose thresholds lie
+within a per-variable standard-error band are merged to a single
+rounded-centroid threshold, subject to a membership safety check; see
+\code{\link{collapse_redundant_cuts}}.  Categorical, indicator, bare-name
+and equality cuts are untouched.  Default TRUE; pass
+\code{collapse_cuts = FALSE} to recover the un-coarsened candidate pool
+used by earlier package versions.}
+
+\item{collapse_cuts_args}{List of overrides for the coarsening, merged onto
+the defaults \code{list(c = 1.0, tol = 0.05, digits = 0L)}: \code{c} is the
+band multiplier (\code{band = c * sd(x)/sqrt(n)}), \code{tol} the
+membership safety tolerance (fraction of n when < 1, absolute count
+when >= 1), and \code{digits} the rounding for the representative threshold.
+Ignored when \code{collapse_cuts = FALSE}.}
+
 \item{replace_med_grf}{Logical. If TRUE, removes median cuts that overlap with GRF cuts.}
 
 \item{defaultcut_names}{Character vector of confounders to force default cuts.}
@@ -55,23 +94,41 @@ get_FSdata(
 \item{event.name}{Character. Name of event indicator variable.}
 
 \item{details}{Logical. If TRUE, prints details during execution.}
+
+\item{outcome_type}{Character. One of \code{"survival"} (default),
+\code{"binary"}, or \code{"continuous"}.}
+
+\item{offset.name}{Character or \code{NULL}. Name of the follow-up time
+column for rate-based measures (IRR, IRD).}
 }
 \value{
-A named list containing:
-\item{df}{Data frame with binary cut-point indicator columns (named
-\code{q1}, \code{q2}, \ldots) appended to the original analysis data.}
-\item{confs_names}{Character vector of the internal column names
-(\code{q1}, \code{q2}, \ldots) corresponding to each candidate factor.}
-\item{confs}{Character vector of candidate factor specifications
-(continuous cut expressions and categorical variable names).}
-\item{lassokeep}{Character vector of factors retained by LASSO (if
-\code{use_lasso = TRUE}), or \code{NULL}.}
-\item{lassoomit}{Character vector of factors omitted by LASSO (if
-\code{use_lasso = TRUE}), or \code{NULL}.}
+A list with components:
+\describe{
+\item{\code{df}}{Data frame with derived subgroup factor columns.}
+\item{\code{confs_names}}{Character vector of factor column names
+added to \code{df}.}
+\item{\code{confs}}{Named character vector of cut expressions
+(continuous cuts plus categorical indicators).}
+\item{\code{lassokeep}}{Character vector of confounders retained
+by LASSO screening (empty if \code{use_lasso = FALSE}).}
+\item{\code{lassoomit}}{Character vector of confounders dropped by
+LASSO screening (empty if \code{use_lasso = FALSE}).}
+}
 }
 \description{
 Prepares a dataset for ForestSearch, including options for LASSO-based dimension reduction,
 GRF cuts, forced cuts, and flexible cut strategies. Returns a list with the processed data,
 subgroup factor names, cut expressions, and LASSO selection results.
 }
-\keyword{internal}
+\examples{
+\donttest{
+library(survival)
+df <- survival::gbsg
+df$grade3 <- as.integer(df$grade == "3")
+fs_data <- get_FSdata(df.analysis = df,
+  confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+  outcome.name = "rfstime", event.name = "status",
+  use_lasso = FALSE, use_grf = FALSE)
+names(fs_data)
+}
+}

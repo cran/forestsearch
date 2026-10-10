@@ -14,6 +14,58 @@
 #
 # =============================================================================
 
+#' Per-candidate L'Ecuyer-CMRG seeds for reproducible parallel consistency RNG
+#'
+#' Generates one L'Ecuyer-CMRG RNG stream per candidate, derived deterministically
+#' from a single master \code{seed}.  The consistency search evaluates candidates
+#' in worker-sized batches and calls \code{future.apply::future_lapply()} once per
+#' batch; passing a scalar \code{seed} (or \code{TRUE}) to \code{future.seed} on
+#' each batch call makes the RNG stream a candidate receives depend on its
+#' position \emph{within its batch}, and hence on the batch size -- which is
+#' derived from the number of workers.  The consequence is that identical seeds
+#' produce different consistency splits when the core count changes (e.g. an
+#' 11-worker laptop vs. a 102-worker server), so results are not reproducible
+#' across machines.
+#'
+#' Pre-generating the streams here and indexing them by \emph{global} candidate
+#' position (\code{candidate_seeds[batch_indices]}) makes each candidate's RNG
+#' depend only on its index and the master seed, invariant to batch size and
+#' worker count, while preserving batched early stopping.
+#'
+#' @param seed Integer master seed.
+#' @param n Integer number of candidates (length of the returned list).
+#' @return A length-\code{n} list of L'Ecuyer-CMRG \code{.Random.seed} vectors,
+#'   suitable for \code{future.seed} in \code{future.apply::future_lapply()}.
+#' @noRd
+.make_candidate_rng_seeds <- function(seed, n) {
+  # Derive the streams without disturbing the caller's RNG: save the current
+  # RNG kind and state, switch to L'Ecuyer-CMRG to generate per-candidate
+  # streams, then restore kind first and the exact prior state second.
+  has_seed <- exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  old_seed <- if (has_seed) {
+    get(".Random.seed", envir = .GlobalEnv, inherits = FALSE)
+  }
+  oldkind <- RNGkind("L'Ecuyer-CMRG")
+  on.exit({
+    RNGkind(oldkind[1L])
+    if (has_seed) {
+      assign(".Random.seed", old_seed, envir = .GlobalEnv)
+    } else if (exists(".Random.seed", envir = .GlobalEnv, inherits = FALSE)) {
+      rm(".Random.seed", envir = .GlobalEnv)
+    }
+  }, add = TRUE)
+
+  set.seed(seed)
+  s <- .Random.seed
+  seeds <- vector("list", n)
+  for (i in seq_len(n)) {
+    seeds[[i]] <- s
+    s <- parallel::nextRNGStream(s)
+  }
+  seeds
+}
+
+
 #' Evaluate Subgroup Consistency
 #'
 #' Evaluates candidate subgroups using split-sample consistency validation.
@@ -24,12 +76,21 @@
 #'   for outcome (Y), event indicator (Event), and treatment (Treat).
 #' @param hr.subgroups Data.table of candidate subgroups from subgroup search,
 #'   containing columns: HR, n, E, K, d0, d1, m0, m1, grp, and factor indicators.
-#' @param hr.threshold Numeric. Minimum hazard ratio threshold for candidates.
-#'   Default: 1.0
-#' @param hr.consistency Numeric. Minimum HR required in each split for
-#'   consistency. Default: 1.0
-#' @param pconsistency.threshold Numeric. Minimum proportion of splits that
-#'   must be consistent. Default: 0.9
+#' @param hr.threshold Numeric. `c1`, the \strong{screening threshold} on a
+#'   candidate's own effect, re-applied here to the supplied
+#'   \code{hr.subgroups} table.  On the comparison scale of the estimand
+#'   (\code{forestsearch()} passes the already-resolved value for GLM
+#'   outcomes).  Default: 1.0
+#' @param hr.consistency Numeric. `c2`, \strong{an effect threshold} -- the
+#'   minimum effect required in \emph{each} half of a split for that split to
+#'   count as consistent.  \strong{Not} a proportion and \strong{not} the
+#'   consistency rate; for the proportion see
+#'   \code{pconsistency.threshold}.  Default: 1.0
+#' @param pconsistency.threshold Numeric. `p*`, \strong{a proportion} in
+#'   \code{[0, 1]} -- the minimum fraction of splits that must be consistent,
+#'   where consistency of one split is decided by \code{hr.consistency}
+#'   (`c2`).  `c2` sets the bar; `p*` counts how often it is met.  Both names
+#'   contain "consistency" and they are different quantities.  Default: 0.9
 #' @param m1.threshold Numeric. Maximum m1 threshold for filtering. Default: Inf
 #' @param n.splits Integer. Number of splits for consistency evaluation.
 #'   Default: 100
@@ -39,13 +100,53 @@
 #' @param maxk Integer. Maximum number of factors in subgroup. Default: 7
 #' @param Lsg List of subgroup parameters.
 #' @param confs_labels Character vector mapping factor names to labels.
-#' @param sg_focus Character. Subgroup selection criterion: "hr", "maxSG",
-#'   or "minSG". Default: "hr"
+#' @param sg_focus Character. Subgroup selection criterion. One of:
+#'   \describe{
+#'     \item{\code{"hr"} (or \code{"eff"})}{Sort by
+#'       \eqn{(-Pcons, -hr, K)}; pick top.}
+#'     \item{\code{"maxeff"}}{Sort by \eqn{(-hr, K)}; pick top.  No consistency
+#'       filter.  Consistency (\code{Pcons}) does not enter the sort key, so it
+#'       is evaluated for the SELECTED winner only (reported in the footer) and
+#'       is \code{NA} for every other candidate -- the effect (from the search)
+#'       is carried for all, but the per-candidate consistency refits are
+#'       skipped.  Selection is identical to evaluating every candidate.}
+#'     \item{\code{"maxSG"}}{Sort by \eqn{(-N, -Pcons, K)}; pick top.}
+#'     \item{\code{"minSG"}}{Sort by \eqn{(N, -Pcons, K)}; pick top.}
+#'     \item{\code{"hrMaxSG"} (or \code{"effMaxSG"})}{Among candidates
+#'       with effect size within \code{effect_neighborhood} of the
+#'       maximum, pick the one with the largest \eqn{N}.}
+#'     \item{\code{"hrMinSG"} (or \code{"effMinSG"})}{Among candidates
+#'       with effect size within \code{effect_neighborhood} of the
+#'       maximum, pick the one with the smallest \eqn{N}.}
+#'   }
+#'   Default: \code{"hr"}.  The \code{"eff*"} forms are aliases for
+#'   the \code{"hr*"} forms and read more naturally in GLM contexts
+#'   (continuous MD, binary OR/RR/RD, count IRR).  Both vocabularies
+#'   produce identical results.
+#' @param selection_rule Character. Rule defining the candidate
+#'   inclusion set for \code{"hrMaxSG"} / \code{"hrMinSG"}.  One of
+#'   \code{"neighborhood"} (default; current behaviour),
+#'   \code{"pareto"} (2D Pareto-non-dominated set in (effect, N)),
+#'   or \code{"both"} (intersection of the two).  Forwarded to
+#'   \code{\link{sort_subgroups_preview}} (pre-consistency triage)
+#'   and \code{\link{sort_subgroups}} (post-consistency selection).
+#'   Must be \code{"neighborhood"} for other \code{sg_focus} values.
+#' @param effect_neighborhood Numeric in \code{[0, 1)}.  Relative
+#'   tolerance for \code{"hrMaxSG"} and \code{"hrMinSG"}.  A candidate
+#'   is in the \emph{effect-size neighborhood} iff its (natural-scale)
+#'   effect is at least \code{(1 - effect_neighborhood) * max(effect)}.
+#'   Default \code{0.10} (i.e., within 10\% of the strongest effect).
+#'   For GLM ratio measures (OR, IRR), the neighborhood test is applied
+#'   on the natural scale (after exponentiation of \code{hr}).  Ignored
+#'   when \code{sg_focus} is \code{"hr"}, \code{"maxSG"}, or
+#'   \code{"minSG"}.  When \code{selection_rule = "pareto"}, must be
+#'   left at its default (the rule does not consult it).
 #' @param stop_Kgroups Integer. Maximum number of candidates to evaluate.
-#'   Default: 10
+#'   When the ranked pool exceeds this cap it is truncated and a warning naming
+#'   both counts and the `sg_focus` ordering is emitted. Default: 200
 #' @param stop_threshold Numeric in \code{[0, 1]} or \code{NULL}.
 #'   When a candidate subgroup's consistency probability (\code{Pcons})
-#'   meets or exceeds this threshold, evaluation stops early — remaining
+#'   meets or exceeds this threshold, evaluation stops early -- remaining
 #'   candidates are skipped. Set to \code{NULL} to disable early stopping
 #'   and evaluate all candidates up to \code{stop_Kgroups}. Default: \code{NULL}.
 #'
@@ -68,17 +169,76 @@
 #'   completes, so some additional candidates beyond the first meeting the
 #'   threshold may be evaluated. Use a smaller \code{batch_size} in
 #'   \code{parallel_args} for finer-grained early stopping.
-#' @param showten_subgroups Logical. If TRUE, prints up to 10 candidate
-#'   subgroups after sorting by sg_focus, showing their rank, HR, sample size,
-#'   events, and factor definitions. Useful for reviewing which candidates
-#'   will be evaluated for consistency. Default: FALSE
-#' @param pconsistency.digits Integer. Decimal places for consistency
-#'   proportion. Default: 2
+#' @param show_candidate_summary Logical. If \code{TRUE}, prints two
+#'   diagnostic tables: a \strong{pre-consistency} candidate preview
+#'   (all top-\code{stop_Kgroups} candidates entering consistency
+#'   evaluation, with Frontier and InBand flags) and a
+#'   \strong{post-consistency} summary (passing candidates only, with
+#'   Pcons, Frontier, InBand, and Selected flags).  The two views
+#'   together make the rule's filter visible end-to-end.  Pcons is
+#'   shown only for passing candidates (the consistency evaluator
+#'   returns NULL for non-passing ones).  Default: FALSE.
+#' @param max_print Integer. Maximum number of candidate rows printed in
+#'   each \code{show_candidate_summary} table (forwarded to the internal
+#'   \code{print_candidate_summary()}).  Candidates are sorted
+#'   selection-first, so the selected subgroup is always shown; any
+#'   remaining candidates beyond \code{max_print} are collapsed into a
+#'   trailing "... N more candidate(s) not shown" line.  Affects console
+#'   output only, not the returned object.  Default: 10.
+#' @param pconsistency.digits Integer. Number of decimal places to which the
+#'   consistency proportion is rounded \strong{before} it is compared with
+#'   \code{pconsistency.threshold}.  The rounded value decides admission and
+#'   is the value the selection sort orders on, so this setting affects which
+#'   subgroups are admitted, not only what is displayed.  At the default of 2,
+#'   a threshold of `p*` admits any candidate whose unrounded proportion is at
+#'   or above the largest 0.01 grid point strictly below `p*` plus half a step
+#'   (0.005) -- so `p* = 0.99` admits from about 0.985.  Raising the setting
+#'   makes admission finer-grained and produces fewer exact ties for the
+#'   selection rule to break.  Under \code{consistency_method = "resample"}
+#'   the proportion is a continuous closed-form quantity, so the rounding is a
+#'   deliberate coarsening rather than a formatting step.
+#'   Default: 2
 #' @param seed Integer. Random seed for reproducible consistency splits.
 #'   Default: 8316951. Set to NULL for non-reproducible random splits.
 #'   The seed is used both for sequential execution (via set.seed()) and
 #'   parallel execution (via future.seed).
 #' @param checking Logical. Enable additional validation checks. Default: FALSE
+#' @param estimator_fn Closure or \code{NULL}. Effect-estimator closure from
+#'   \code{\link{make_effect_estimator}} for GLM outcomes.  Default \code{NULL}
+#'   (uses Cox model).
+#' @param consistency_threshold Numeric or \code{NULL}. Threshold for GLM
+#'   consistency evaluation.  Default \code{NULL} (uses \code{hr.consistency}).
+#' @param adjust_covariates Character vector or \code{NULL}. Additional Cox
+#'   model terms used when scoring survival subgroups during consistency
+#'   evaluation, e.g. \code{"strata(x1)"} for a stratified model or
+#'   \code{"x2"} for linear adjustment.  Referenced columns must be present
+#'   in \code{df}.  Ignored on the GLM path.  Default \code{NULL}
+#'   (treatment-only, unadjusted).
+#' @param consistency_method Character. \code{"resample"} (default) for the
+#'   multiplier (influence-function) approximation via
+#'   \code{\link{consistency_resample}}, or \code{"split"} -- the retained
+#'   fallback -- for the literal repeated 50/50 split-and-refit calculation,
+#'   which costs \code{fs.splits * 2} refits per candidate evaluation.  On the
+#'   GLM path \code{"resample"} requires a \code{glm_resample_spec}; without one
+#'   (or when \code{consistency_resample} is unavailable) it falls back to
+#'   \code{"split"} with a warning.  \code{\link{forestsearch}} builds that spec
+#'   automatically; a direct caller on a GLM outcome must supply it.
+#' @param glm_resample_spec List or \code{NULL}. GLM resampling specification
+#'   threaded from \code{\link{forestsearch}} when
+#'   \code{consistency_method = "resample"} on a GLM outcome: components
+#'   \code{outcome_type}, \code{effect_measure}, \code{treat.name},
+#'   \code{outcome.name}, \code{offset.name}, \code{adjust_covariates},
+#'   \code{adverse_outcome}, and \code{comparison_threshold} (the consistency
+#'   threshold already on the comparison scale, i.e. \code{log(threshold)} for
+#'   ratio measures).  \code{NULL} on the survival path.
+#' @param effect_label Character. Column label for the effect measure in
+#'   diagnostic output (e.g., candidate subgroup table).  Default \code{"HR"}.
+#'   Set automatically by \code{\link{forestsearch}} to the resolved
+#'   \code{effect_measure} (e.g., \code{"IRR"}, \code{"OR"}) for GLM outcomes.
+#' @param effect_log_scale Logical. If \code{TRUE}, the \code{HR} column in
+#'   \code{hr.subgroups} stores log-scale values (log-OR, log-IRR) and will
+#'   be exponentiated for display in diagnostic output.  Default \code{FALSE}
+#'   (Cox stores natural-scale HR).
 #' @param use_twostage Logical. Use two-stage adaptive algorithm. Default: FALSE
 #' @param twostage_args List. Parameters for two-stage algorithm:
 #'   \describe{
@@ -90,9 +250,24 @@
 #'   }
 #' @param parallel_args List. Parallel processing configuration:
 #'   \describe{
-#'     \item{plan}{Future plan: "multisession", "multicore", or "sequential"}
-#'     \item{workers}{Number of parallel workers}
-#'     \item{batch_size}{Number of candidates to evaluate per batch. Smaller
+#'     \item{plan}{Future plan: "multisession", "multicore", "callr", or
+#'       "sequential".  A sequential plan runs the consistency screen as a
+#'       plain in-process loop regardless of \code{workers}: no future backend
+#'       is set up and no per-batch globals resolution is paid.  A parallel
+#'       plan with \code{workers = 1} is honoured as parallel (one-worker
+#'       batched backend); pass \code{plan = "sequential"} to run the plain
+#'       loop.  Results under \code{consistency_method = "resample"} are
+#'       identical on every path (the closed form consumes no RNG).  Under
+#'       \code{"split"} the plain loop draws from a single RNG stream seeded
+#'       once, whereas the batched backend gives each candidate its own
+#'       L'Ecuyer-CMRG stream indexed by global position, so a sequential
+#'       plan's \code{p.consistency} values differ from a parallel plan's
+#'       within Monte-Carlo noise at the stated \code{fs.splits}; invariance
+#'       to worker count holds within any plan.}
+#'     \item{workers}{Number of parallel workers on a parallel plan.}
+#'     \item{batch_size}{Number of candidates to evaluate per batch on a
+#'       genuinely parallel plan -- the knob for the per-batch overhead
+#'       described above.  Smaller
 #'       values provide finer-grained early stopping but may increase overhead.
 #'       Default: When stop_threshold is set and sg_focus is "hr" or "minSG",
 #'       defaults to 1 (stop immediately when first candidate passes). For other
@@ -103,11 +278,23 @@
 #'
 #' @return A list containing:
 #'   \describe{
-#'     \item{out_sg}{Selected subgroup results}
+#'     \item{out_sg}{Selected subgroup results.  When non-\code{NULL},
+#'       contains \code{result} (sorted candidate table; top row is the
+#'       selected subgroup) and \code{pareto_frontier} (data.table of
+#'       non-dominated candidates on (effect, N), both maximized -- a
+#'       post-hoc diagnostic, not used for selection).}
 #'     \item{sg_focus}{Selection criterion used}
 #'     \item{df_flag}{Data frame with treatment recommendations}
-#'     \item{sg.harm}{Subgroup definition labels}
-#'     \item{sg.harm.id}{Subgroup membership indicator}
+#'     \item{sg.harm}{\strong{Subgroup definition labels} -- character
+#'       vector of factor-level cut names (e.g., \code{c("z1.1", "z2.1")}),
+#'       of length equal to the number of cuts defining the subgroup.
+#'       \code{NULL} if no subgroup was identified.}
+#'     \item{sg.harm.id}{\strong{Per-subject subgroup-membership
+#'       indicator} -- integer vector of length \code{nrow(df)} with
+#'       \code{1} if subject \eqn{i} is in the identified subgroup and
+#'       \code{0} otherwise.  \code{NULL} if no subgroup was identified.
+#'       \strong{Not} a character vector of cut expressions; see the
+#'       \emph{Field naming collision} section below.}
 #'     \item{algorithm}{"twostage" or "fixed"}
 #'     \item{n_candidates_evaluated}{Number of candidates actually evaluated}
 #'     \item{n_candidates_total}{Total candidates available}
@@ -117,6 +304,64 @@
 #'     \item{stop_threshold}{Threshold used for early stopping}
 #'     \item{seed}{Random seed used for reproducibility (NULL if not set)}
 #'   }
+#'
+#' @section Field naming collision with GRF results:
+#' The field name \code{sg.harm.id} has \strong{different semantics} on
+#' this object versus on the result objects returned by
+#' \code{\link{grf.subg.harm.glm}} and \code{\link{grf.subg.harm.survival}}:
+#'
+#' \tabular{lll}{
+#'   \strong{Object} \tab \strong{\code{sg.harm.id} contains} \tab \strong{Length / type} \cr
+#'   \code{subgroup.consistency()} result (this function) \tab per-subject 0/1 membership indicator \tab integer, length \code{nrow(df)} \cr
+#'   \code{grf.subg.harm.glm()} result \tab character vector of cut expressions \tab character, length = depth of selected tree \cr
+#'   \code{grf.subg.harm.survival()} result \tab character vector of cut expressions \tab character, length = depth of selected tree \cr
+#' }
+#'
+#' \strong{Practical consequence.}  Do not paste \code{sg.harm.id} with
+#' \code{paste(..., collapse = " & ")} to print "the identified subgroup"
+#' without first checking object class.  For subgroup labels from a
+#' \code{\link{forestsearch}} or \code{subgroup.consistency()} result,
+#' use \code{sg.harm} (character vector of cut names) -- the FS main
+#' result exposes \code{sg.harm} at the top level.
+#'
+#' This naming collision is a documented CRAN-stable API for v0.1.x
+#' and v0.2.x; it is expected to be resolved via a deprecation cycle
+#' in a future minor release.
+#'
+#' @examples
+#' \dontrun{
+#' # Standard evaluation
+#' result <- subgroup.consistency(
+#'   df = trial_data,
+#'   hr.subgroups = candidates,
+#'   sg_focus = "hr",
+#'   n.splits = 400,
+#'   parallel_args = list(plan = "multisession", workers = 6)
+#' )
+#'
+#' # Show top 10 candidates before evaluation
+#' result <- subgroup.consistency(
+#'   df = trial_data,
+#'   hr.subgroups = candidates,
+#'   sg_focus = "hr",
+#'   show_candidate_summary = TRUE,  # Post-consistency summary
+#'   n.splits = 400
+#' )
+#'
+#' # With early stopping and custom batch size
+#' result <- subgroup.consistency(
+#'   df = trial_data,
+#'   hr.subgroups = candidates,
+#'   sg_focus = "hr",
+#'   stop_threshold = 0.95,
+#'   show_candidate_summary = TRUE,
+#'   parallel_args = list(
+#'     plan = "multisession",
+#'     workers = 6,
+#'     batch_size = 2  # Check early stopping after every 2 candidates
+#'   )
+#' )
+#' }
 #'
 #' @importFrom data.table copy as.data.table is.data.table
 #' @importFrom survival coxph Surv
@@ -138,28 +383,69 @@ subgroup.consistency <- function(df,
                                  Lsg,
                                  confs_labels,
                                  sg_focus = "hr",
-                                 stop_Kgroups = 10,
+                                 selection_rule = "neighborhood",
+                                 effect_neighborhood = 0.10,
+                                 stop_Kgroups = 200,
                                  stop_threshold = NULL,
-                                 showten_subgroups = FALSE,
+                                 show_candidate_summary = FALSE,
+                                 max_print = 10,
                                  pconsistency.digits = 2,
                                  seed = 8316951,
                                  checking = FALSE,
                                  use_twostage = FALSE,
                                  twostage_args = list(),
-                                 parallel_args = list()) {
+                                 parallel_args = list(),
+                                 estimator_fn = NULL,
+                                 consistency_threshold = NULL,
+                                 effect_label = "HR",
+                                 effect_log_scale = FALSE,
+                                 adjust_covariates = NULL,
+                                 consistency_method = c("resample", "split"),
+                                 glm_resample_spec = NULL) {
 
   # ===========================================================================
   # SECTION 1: INPUT VALIDATION
   # ===========================================================================
 
+  # Accept the GLM-natural vocabulary (effMaxSG / effMinSG / eff) alongside
+  # the canonical Cox-flavored names (hrMaxSG / hrMinSG / hr).  Normalize
+  # at the entry point so all downstream code -- including the early-stop
+  # batching at Section 8, sort_subgroups_preview() / sort_subgroups() in
+  # the helpers, and the result-building in Section 10 -- sees the
+  # canonical form.
+  sg_focus <- .normalize_sg_focus(sg_focus)
+
+  # Consistency calculation method: literal splitting vs. resampling
+  # approximation. 'resample' covers the Cox (survival) path and the GLM path
+  # (when forestsearch supplies a glm_resample_spec for a supported measure);
+  # a missing consistency_resample() or an unspecified GLM path fall back to
+  # 'split'.
+  consistency_method <- match.arg(consistency_method)
+  if (identical(consistency_method, "resample")) {
+    if (!exists("consistency_resample", mode = "function")) {
+      warning("consistency_resample() not found; using 'split'. Install or ",
+              "source consistency_resample.R to enable the approximation.")
+      consistency_method <- "split"
+    } else if (!is.null(estimator_fn) && is.null(glm_resample_spec)) {
+      warning("consistency_method = 'resample' on the GLM (estimator_fn) path ",
+              "requires a glm_resample_spec; using 'split'.")
+      consistency_method <- "split"
+    }
+  }
+
   if (!is.data.frame(df) || nrow(df) == 0) {
     stop("df must be a non-empty data frame")
   }
 
-  required_cols <- c("Y", "Event", "Treat")
-  missing_cols <- setdiff(required_cols, names(df))
-  if (length(missing_cols) > 0) {
-    stop("df missing required columns: ", paste(missing_cols, collapse = ", "))
+  # For survival (default), require Y/Event/Treat; for GLM, the estimator
+
+  # closure handles column resolution internally
+  if (is.null(estimator_fn)) {
+    required_cols <- c("Y", "Event", "Treat")
+    missing_cols <- setdiff(required_cols, names(df))
+    if (length(missing_cols) > 0) {
+      stop("df missing required columns: ", paste(missing_cols, collapse = ", "))
+    }
   }
 
   if (!data.table::is.data.table(hr.subgroups)) {
@@ -257,6 +543,11 @@ subgroup.consistency <- function(df,
     ))
   }
 
+  if (identical(sg_focus, "maxeff")) {
+    # Guo & He's argmax ranges over the whole family; an effect floor would make
+    # it a constrained maximiser.
+    found.hrs <- hr.subgroups
+  } else {
   if (is.finite(m1.threshold)) {
     hr.subgroups <- hr.subgroups[!is.na(hr.subgroups$m1), ]
     if (nrow(hr.subgroups) == 0) {
@@ -276,10 +567,12 @@ subgroup.consistency <- function(df,
   } else {
     found.hrs <- hr.subgroups[hr.subgroups$HR >= hr.threshold, ]
   }
+  }
 
   if (nrow(found.hrs) == 0) {
     if (details) {
-      cat("No subgroups meet criteria (HR >=", hr.threshold)
+      cat("No subgroups meet criteria (", effect_label, " >=",
+          if (effect_log_scale) exp(hr.threshold) else hr.threshold)
       if (is.finite(m1.threshold)) cat(" and m1 <=", m1.threshold)
       cat(")\n")
     }
@@ -301,12 +594,29 @@ subgroup.consistency <- function(df,
   if (nrow(found.hrs) > 1) {
     n_before <- nrow(found.hrs)
 
-    tryCatch({
-      found.hrs <- remove_near_duplicate_subgroups(found.hrs, details = details)
-    }, error = function(e) {
-      warning("Error removing duplicates: ", e$message,
-              ". Proceeding with original subgroups.")
-    })
+    if (identical(sg_focus, "maxeff")) {
+      # Exact membership dedup: distinct cut-encodings of the SAME subject-level
+      # subgroup (e.g. {er<=0} and {er<=0} & {er<=10}) are collapsed to one
+      # representative -- the fewest cuts (smallest K), ties broken by first
+      # selected-column index.  Statistics-based near-duplicate removal is NOT
+      # used for maxeff: it keys on K (so it misses same-membership pairs of
+      # different cut count) and could collapse two genuinely distinct
+      # subgroups that share summary statistics.
+      found.hrs <- tryCatch(
+        .maxeff_membership_dedup(found.hrs, df, names.Z),
+        error = function(e) {
+          warning("maxeff membership dedup failed: ", e$message,
+                  ". Proceeding with original candidates.")
+          found.hrs
+        })
+    } else {
+      tryCatch({
+        found.hrs <- remove_near_duplicate_subgroups(found.hrs, details = details)
+      }, error = function(e) {
+        warning("Error removing duplicates: ", e$message,
+                ". Proceeding with original subgroups.")
+      })
+    }
 
     if (nrow(found.hrs) == 0) {
       stop("All subgroups removed during duplicate removal.")
@@ -314,7 +624,10 @@ subgroup.consistency <- function(df,
   }
 
 
-  found.hrs <- sort_subgroups_preview(found.hrs, sg_focus)
+  found.hrs <- sort_subgroups_preview(found.hrs, sg_focus,
+                                      selection_rule      = selection_rule,
+                                      effect_neighborhood = effect_neighborhood,
+                                      effect_log_scale    = effect_log_scale)
 
 
   # Extract index matrix
@@ -324,8 +637,26 @@ subgroup.consistency <- function(df,
     cat("# of unique initial candidates:", nrow(found.hrs), "\n")
   }
 
-  # Limit to top stop_Kgroups candidates
-  maxsgs <- min(nrow(found.hrs), stop_Kgroups)
+  # Limit to top stop_Kgroups candidates.  Warn whenever the pool is ACTUALLY
+  # truncated (condition-based, not tied to any default value, so it cannot be
+  # outgrown by a future default): the criterion-optimal subgroup can rank below
+  # the cap, most acutely for the size foci where small high-effect subgroups
+  # sort last.  maxeff forces stop_Kgroups = Inf, so it never triggers here.
+  n_pool <- nrow(found.hrs)
+  maxsgs <- min(n_pool, stop_Kgroups)
+  if (n_pool > stop_Kgroups) {
+    msg <- sprintf(paste0(
+      "max_subgroups_search = %g truncated the candidate pool from %d to %d. ",
+      "Candidates ranked below %d under the sg_focus = '%s' preview ordering ",
+      "were not evaluated."),
+      stop_Kgroups, n_pool, maxsgs, maxsgs, sg_focus)
+    if (sg_focus %in% c("maxSG", "minSG")) {
+      msg <- paste0(msg, " Size-focused foci ('maxSG'/'minSG') order by subgroup ",
+                    "size, so small high-effect subgroups rank last and truncate ",
+                    "first.")
+    }
+    warning(msg, call. = FALSE)
+  }
   found.hrs <- found.hrs[seq_len(maxsgs), ]
   index.Z <- index.Z[seq_len(maxsgs), ]
 
@@ -340,51 +671,24 @@ subgroup.consistency <- function(df,
   }
 
   # ===========================================================================
-  # SECTION 5b: DISPLAY TOP CANDIDATE SUBGROUPS (if showten_subgroups = TRUE)
+  # SECTION 5b: PRE-CONSISTENCY CANDIDATE PREVIEW
   # ===========================================================================
-  if (showten_subgroups && details) {
-    n_show <- min(10, n_candidates)
-    cat("\n")
-    cat(paste(rep("=", 80), collapse = ""), "\n")
-    cat("TOP", n_show, "CANDIDATE SUBGROUPS FOR CONSISTENCY EVALUATION\n")
-    cat("Sorted by:", sg_focus, "\n")
-    cat(paste(rep("=", 80), collapse = ""), "\n\n")
-    # Print header
-    cat(sprintf("%-5s  %-8s  %-6s  %-6s  %-3s  %s\n",
-                "Rank", "HR", "N", "Events", "K", "Subgroup Definition"))
-    cat(paste(rep("-", 80), collapse = ""), "\n")
-
-
-    for (i in seq_len(n_show)) {
-      # Extract subgroup info
-      hr_i <- found.hrs$HR[i]
-      n_i <- found.hrs$n[i]
-      e_i <- found.hrs$E[i]
-      # Get factor names for this subgroup (e.g., "q1.1", "q3.0", "q5.1")
-      index_i <- as.numeric(unlist(index.Z[i, ]))
-      factors_i <- names.Z[index_i == 1]
-      k_i <- length(factors_i)
-
-      # Convert factor codes to labels using FS_labels()
-      factors_labels <- vapply(factors_i, FS_labels,
-                               character(1),
-                               confs_labels = confs_labels,
-                               USE.NAMES = FALSE)
-
-      # Format factors string (truncate if too long)
-      factors_str <- paste(factors_labels, collapse = " & ")
-      if (nchar(factors_str) > 45) {
-        factors_str <- paste0(substr(factors_str, 1, 42), "...")
-      }
-      # Print row
-      cat(sprintf("%-5d  %-8.3f  %-6d  %-6d  %-3d  %s\n",
-                  i, hr_i, n_i, e_i, k_i, factors_str))
-    }
-    cat(paste(rep("-", 80), collapse = ""), "\n")
-    if (n_candidates > 10) {
-      cat("... and", n_candidates - 10, "more candidates\n")
-    }
-    cat("\n")
+  # Shows the candidates that will be evaluated for consistency, in their
+  # preview-sort order.  Companion to Section 10b (post-consistency
+  # summary).  Both views are gated on the same flag.
+  if (isTRUE(show_candidate_summary) && details) {
+    print_candidate_preview(
+      found.hrs           = found.hrs,
+      index.Z             = index.Z,
+      names.Z             = names.Z,
+      confs_labels        = confs_labels,
+      sg_focus            = sg_focus,
+      selection_rule      = selection_rule,
+      effect_neighborhood = effect_neighborhood,
+      effect_log_scale    = effect_log_scale,
+      effect_label        = effect_label,
+      max_print           = max_print
+    )
   }
 
   # ===========================================================================
@@ -392,6 +696,27 @@ subgroup.consistency <- function(df,
   # ===========================================================================
 
   use_parallel <- length(parallel_args) > 0 && !is.null(parallel_args[[1]])
+
+  # A sequential plan is the caller asking NOT to parallelise: run the plain
+  # loop (Section 8, sequential branch) instead of standing up a one-worker
+  # future backend.  The backend path batches the candidates into
+  # future_lapply() calls of min(2 * workers, n) and pays a full round of
+  # globals resolution per call -- measured at 29.4 s against 4.5 s for the
+  # identical 749-candidate screen, 86% of a bootstrap replicate
+  # (REPORT_bootstrap_profile_2026-08-30.md).  The plan alone decides: a
+  # parallel plan with workers = 1 stays on the batched path, so results are
+  # invariant to worker count WITHIN any plan (the per-candidate RNG streams of
+  # .make_candidate_rng_seeds() are indexed by global position; the plain loop
+  # seeds a single stream once).  Under consistency_method = "resample" no RNG
+  # is consumed and every path gives identical results.  No warning: this is
+  # the code doing what it was asked, once per replicate in a bootstrap.
+  if (use_parallel && identical(parallel_args$plan, "sequential")) {
+    if (details) {
+      cat("Parallel config: sequential plan -- running the consistency ",
+          "screen as a plain loop\n", sep = "")
+    }
+    use_parallel <- FALSE
+  }
 
   if (use_parallel) {
     required_parallel <- c("plan", "workers")
@@ -426,7 +751,37 @@ subgroup.consistency <- function(df,
   # SECTION 8: EVALUATE CANDIDATES
   # ===========================================================================
 
-  if (!use_parallel) {
+  if (identical(sg_focus, "maxeff")) {
+    # -------------------------------------------------------------------------
+    # maxeff FAST PATH: winner-only consistency
+    # -------------------------------------------------------------------------
+    # Selection is the effect argmax (sort_subgroups(): setorder(-hr, K)); Pcons
+    # never enters the maxeff sort key.  found.hrs is already preview-sorted, so
+    # row 1 is the winner.  Evaluate consistency for the WINNER ONLY and carry
+    # every other candidate's effect (found.hrs$HR) with Pcons = NA.  Selection
+    # is provably identical, and this skips ~n-1 per-candidate Cox refits AND the
+    # parallel consistency loop's per-batch serialization overhead.  Runs
+    # sequentially on purpose: the per-candidate work is now a cheap row-assembly,
+    # so dispatching it to workers would only add overhead.
+    .maxeff_eval <- function(m, skip) evaluate_subgroup_consistency(
+      m = m, index.Z = index.Z, names.Z = names.Z, df = df, found.hrs = found.hrs,
+      n.splits = n.splits, hr.consistency = hr.consistency,
+      pconsistency.threshold = pconsistency.threshold,
+      pconsistency.digits = pconsistency.digits, maxk = maxk,
+      confs_labels = confs_labels, details = FALSE, estimator_fn = estimator_fn,
+      consistency_threshold = consistency_threshold, adjust_covariates = adjust_covariates,
+      consistency_method = consistency_method, glm_resample_spec = glm_resample_spec,
+      skip_consistency = skip)
+    for (m in seq_len(n_candidates)) {
+      res_m <- .maxeff_eval(m, skip = (m != 1L))
+      # The winner (m == 1) must always yield a row; if its consistency pass is
+      # inestimable (NULL), fall back to the effect-carry row (Pcons = NA).
+      if (m == 1L && is.null(res_m)) res_m <- .maxeff_eval(m, skip = TRUE)
+      if (!is.null(res_m)) results_list[[m]] <- res_m
+    }
+    n_evaluated <- n_candidates
+
+  } else if (!use_parallel) {
     # -------------------------------------------------------------------------
     # SEQUENTIAL EXECUTION
     # -------------------------------------------------------------------------
@@ -436,7 +791,7 @@ subgroup.consistency <- function(df,
       n_evaluated <- m
 
       if (use_twostage) {
-        results_list[[m]] <- evaluate_consistency_twostage(
+        res_m <- evaluate_consistency_twostage(
           m = m,
           index.Z = index.Z,
           names.Z = names.Z,
@@ -453,10 +808,15 @@ subgroup.consistency <- function(df,
           n.splits.max = n.splits,
           batch.size = ts_params$batch.size,
           conf.level = ts_params$conf.level,
-          min.valid.screen = ts_params$min.valid.screen
+          min.valid.screen = ts_params$min.valid.screen,
+          estimator_fn = estimator_fn,
+          consistency_threshold = consistency_threshold,
+          adjust_covariates = adjust_covariates,
+          consistency_method = consistency_method,
+          glm_resample_spec = glm_resample_spec
         )
       } else {
-        results_list[[m]] <- evaluate_subgroup_consistency(
+        res_m <- evaluate_subgroup_consistency(
           m = m,
           index.Z = index.Z,
           names.Z = names.Z,
@@ -468,13 +828,26 @@ subgroup.consistency <- function(df,
           pconsistency.digits = pconsistency.digits,
           maxk = maxk,
           confs_labels = confs_labels,
-          details = details
+          details = details,
+          estimator_fn = estimator_fn,
+          consistency_threshold = consistency_threshold,
+          adjust_covariates = adjust_covariates,
+          consistency_method = consistency_method,
+          glm_resample_spec = glm_resample_spec
         )
       }
 
-      # Check early stopping condition
-      if (!is.null(stop_threshold) && !is.null(results_list[[m]])) {
-        pcons_m <- as.numeric(results_list[[m]]["Pcons"])
+      # Store only non-NULL results.  Assigning NULL via `[[<-` deletes the
+      # pre-allocated slot and SHRINKS results_list, shifting every later
+      # index down and eventually driving the early-stop read below out of
+      # bounds.  Empty slots stay NULL from vector("list", n_candidates), so
+      # Section 9's Filter(Negate(is.null), ...) still drops them.
+      if (!is.null(res_m)) results_list[[m]] <- res_m
+
+      # Check early stopping condition (use the freshly computed res_m, not a
+      # re-read of results_list[[m]], which is populated only when non-NULL).
+      if (!is.null(stop_threshold) && !is.null(res_m)) {
+        pcons_m <- as.numeric(res_m["Pcons"])
 
         if (!is.na(pcons_m) && pcons_m >= stop_threshold) {
           early_stop_triggered <- TRUE
@@ -485,7 +858,7 @@ subgroup.consistency <- function(df,
             cat("EARLY STOP TRIGGERED\n")
             cat("  Candidate:", m, "of", n_candidates, "\n")
             cat("  Pcons:", round(pcons_m, 4), ">=", stop_threshold, "\n")
-            cat("  HR:", round(as.numeric(results_list[[m]]["hr"]), 3), "\n")
+            cat("  HR:", round(as.numeric(res_m["hr"]), 3), "\n")
             cat(paste(rep("=", 50), collapse = ""), "\n\n", sep = "")
           }
           break
@@ -518,10 +891,18 @@ subgroup.consistency <- function(df,
       # User-specified batch size
       batch_size_parallel <- min(as.integer(parallel_args$batch_size), n_candidates)
     } else if (!is.null(stop_threshold)) {
-      # Early stopping enabled - batch size depends on sg_focus
-      if (sg_focus %in% c("hr", "minSG")) {
-        # For "hr" or "minSG", first passing candidate is optimal
-        # Use batch_size = 1 to stop immediately
+      # Early stopping enabled - batch size depends on sg_focus.
+      # maxeffCons is the only focus for which first-passer stopping is sound:
+      # its key (-hr, K) is exactly the enumeration order (-HR, K), ties
+      # included, so the first qualifier is provably the winner.  Any key with a
+      # Pcons term -- primary (hr) or merely a size tiebreak (maxSG, minSG) --
+      # can be beaten by an unevaluated candidate, so forestsearch() resets
+      # stop_threshold to NULL for those and this branch is not reached.
+      # Callers invoking subgroup.consistency() directly with such a focus AND
+      # an explicit stop_threshold get larger batches, which does not make the
+      # truncation sound; it only reduces how much is skipped.
+      if (sg_focus %in% c("maxeffCons")) {
+        # Batch of 1 halts at the earliest sound point.
         batch_size_parallel <- 1L
       } else {
         # For other sg_focus values, use smaller batches for granularity
@@ -537,50 +918,56 @@ subgroup.consistency <- function(df,
           ", batch_size =", batch_size_parallel, "\n")
     }
 
-    # Create evaluation function closure
+    # Create evaluation function closure via a package-scope factory so its
+    # environment captures ONLY these small, exportable arguments -- not the
+    # whole subgroup.consistency() frame (which may hold a non-exportable
+    # externalptr, e.g. a screening forest, that breaks future serialization).
     if (use_twostage) {
-      eval_fun <- function(m) {
-        evaluate_consistency_twostage(
-          m = m,
-          index.Z = index.Z,
-          names.Z = names.Z,
-          df = df,
-          found.hrs = found.hrs,
-          hr.consistency = hr.consistency,
-          pconsistency.threshold = pconsistency.threshold,
-          pconsistency.digits = pconsistency.digits,
-          maxk = maxk,
-          confs_labels = confs_labels,
-          details = FALSE,
-          n.splits.screen = ts_params$n.splits.screen,
-          screen.threshold = ts_params$screen.threshold,
-          n.splits.max = n.splits,
-          batch.size = ts_params$batch.size,
-          conf.level = ts_params$conf.level,
-          min.valid.screen = ts_params$min.valid.screen
-        )
-      }
+      eval_fun <- .make_eval_consistency_twostage(
+        index.Z = index.Z, names.Z = names.Z, df = df, found.hrs = found.hrs,
+        hr.consistency = hr.consistency,
+        pconsistency.threshold = pconsistency.threshold,
+        pconsistency.digits = pconsistency.digits, maxk = maxk,
+        confs_labels = confs_labels,
+        n.splits.screen = ts_params$n.splits.screen,
+        screen.threshold = ts_params$screen.threshold,
+        n.splits.max = n.splits, batch.size = ts_params$batch.size,
+        conf.level = ts_params$conf.level,
+        min.valid.screen = ts_params$min.valid.screen,
+        estimator_fn = estimator_fn,
+        consistency_threshold = consistency_threshold,
+        adjust_covariates = adjust_covariates,
+        consistency_method = consistency_method,
+        glm_resample_spec = glm_resample_spec
+      )
     } else {
-      eval_fun <- function(m) {
-        evaluate_subgroup_consistency(
-          m = m,
-          index.Z = index.Z,
-          names.Z = names.Z,
-          df = df,
-          found.hrs = found.hrs,
-          n.splits = n.splits,
-          hr.consistency = hr.consistency,
-          pconsistency.threshold = pconsistency.threshold,
-          pconsistency.digits = pconsistency.digits,
-          maxk = maxk,
-          confs_labels = confs_labels,
-          details = FALSE
-        )
-      }
+      eval_fun <- .make_eval_subgroup_consistency(
+        index.Z = index.Z, names.Z = names.Z, df = df, found.hrs = found.hrs,
+        n.splits = n.splits, hr.consistency = hr.consistency,
+        pconsistency.threshold = pconsistency.threshold,
+        pconsistency.digits = pconsistency.digits, maxk = maxk,
+        confs_labels = confs_labels, estimator_fn = estimator_fn,
+        consistency_threshold = consistency_threshold,
+        adjust_covariates = adjust_covariates,
+        consistency_method = consistency_method,
+        glm_resample_spec = glm_resample_spec
+      )
     }
 
     # Process in batches
     n_batches <- ceiling(n_candidates / batch_size_parallel)
+
+    # Pre-generate one RNG stream per candidate from the master seed so that a
+    # candidate's consistency splits depend only on its GLOBAL index and `seed`
+    # -- not on the batch size / worker count.  Passing a scalar `seed` (or TRUE)
+    # to future.seed on each batch call assigned streams by within-batch
+    # position, which changed with the number of workers and broke cross-machine
+    # reproducibility.  With `seed = NULL` we fall back to future.seed = TRUE.
+    candidate_seeds <- if (!is.null(seed)) {
+      .make_candidate_rng_seeds(seed, n_candidates)
+    } else {
+      NULL
+    }
 
     for (batch_num in seq_len(n_batches)) {
 
@@ -593,19 +980,28 @@ subgroup.consistency <- function(df,
             ": candidates", start_idx, "-", end_idx, "\n")
       }
 
-      # Parallel evaluation of batch (suppress package version warnings)
-      # Use seed for reproducible parallel RNG
+      # Parallel evaluation of batch (suppress package version warnings).
+      # future.seed is the per-candidate stream list (indexed by global position)
+      # for reproducibility invariant to workers/batching; TRUE only when no seed.
       batch_results <- suppressWarnings({
         future.apply::future_lapply(
           batch_indices,
           eval_fun,
-          future.seed = if (!is.null(seed)) seed else TRUE
+          future.seed = if (!is.null(candidate_seeds)) {
+            candidate_seeds[batch_indices]
+          } else {
+            TRUE
+          }
         )
       })
 
-      # Store results
+      # Store results.  Guard against NULL: assigning NULL via `[[<-` deletes
+      # the pre-allocated slot and shrinks results_list, misaligning the
+      # global candidate indices.  Empty slots stay NULL for Section 9's filter.
       for (i in seq_along(batch_indices)) {
-        results_list[[batch_indices[i]]] <- batch_results[[i]]
+        if (!is.null(batch_results[[i]])) {
+          results_list[[batch_indices[i]]] <- batch_results[[i]]
+        }
       }
 
       n_evaluated <- end_idx
@@ -657,6 +1053,24 @@ subgroup.consistency <- function(df,
   if (any.found == 0) {
     if (details) cat("No subgroups found meeting consistency threshold\n")
 
+    # Emit the SUMMARY banner even in the zero-passed case so the
+    # downstream display (e.g., comparison vignette) shows a real
+    # post-consistency summary block rather than "(not available)".
+    # print_candidate_summary() handles out_sg = NULL: it emits the
+    # banner, the Evaluated/Passed=0 line, and the closing bar.
+    if (isTRUE(show_candidate_summary) && details) {
+      print_candidate_summary(
+        out_sg              = NULL,
+        n_evaluated         = n_evaluated,
+        sg_focus            = sg_focus,
+        selection_rule      = selection_rule,
+        effect_neighborhood = effect_neighborhood,
+        effect_log_scale    = effect_log_scale,
+        effect_label        = effect_label,
+        max_print           = max_print
+      )
+    }
+
     return(list(
       out_sg = NULL,
       sg_focus = sg_focus,
@@ -705,36 +1119,38 @@ subgroup.consistency <- function(df,
   if (any.found > 0) {
     result_new <- data.table::copy(res)
 
-    # Map sg_focus to output type
-    sg_focus_map <- list(
-      hr = "hr",
-      hrMaxSG = "maxSG",
-      maxSG = "maxSG",
-      hrMinSG = "minSG",
-      minSG = "minSG"
-    )
-
-    if (!sg_focus %in% names(sg_focus_map)) {
+    # Validate sg_focus.  Note: hrMaxSG and hrMinSG are passed through
+    # unchanged (no longer collapsed to maxSG/minSG), so that the
+    # neighborhood-based selection in sort_subgroups() is applied.
+    # The canonical set has ONE definition.  A re-inlined literal here compiles
+    # and passes every functional test while being free to drift from it, which
+    # is the drift .assert_sg_focus_dispatch_complete() exists to prevent; that
+    # guard now reads this site too.
+    valid_sg_focus <- .FS_SG_FOCUS_CANONICAL
+    if (!sg_focus %in% valid_sg_focus) {
       stop(sprintf("Unknown sg_focus value: %s", sg_focus))
     }
 
-    focus_type <- sg_focus_map[[sg_focus]]
     sgdetails <- ifelse(plot.sg, TRUE, FALSE)
 
     out_sg <- tryCatch({
       sg_consistency_out(
         df = df,
         result_new = result_new,
-        sg_focus = focus_type,
+        sg_focus = sg_focus,
         details = sgdetails,
         plot.sg = sgdetails,
         index.Z = index.Z,
         names.Z = names.Z,
         by.risk = by.risk,
-        confs_labels = confs_labels
+        confs_labels = confs_labels,
+        is_glm = !is.null(estimator_fn),
+        selection_rule      = selection_rule,
+        effect_neighborhood = effect_neighborhood,
+        effect_log_scale    = effect_log_scale
       )
     }, error = function(e) {
-      warning("Error in sg_consistency_out for '", focus_type, "': ", e$message)
+      warning("Error in sg_consistency_out for '", sg_focus, "': ", e$message)
       NULL
     })
 
@@ -745,6 +1161,26 @@ subgroup.consistency <- function(df,
     }
 
     if (details) cat("SG focus =", sg_focus, "\n")
+  }
+
+  # ===========================================================================
+  # SECTION 10b: PRINT POST-CONSISTENCY CANDIDATE SUMMARY
+  # ===========================================================================
+  # Replaces the legacy pre-consistency "TOP 10" preview (removed above).
+  # Shows up to max_subgroups_search (= n_candidates) evaluated candidates,
+  # but only those that passed consistency have rows in out_sg$result.
+  # Frontier / band / selected flags are derived from out_sg.
+  if (isTRUE(show_candidate_summary) && details) {
+    print_candidate_summary(
+      out_sg              = out_sg,
+      n_evaluated         = n_evaluated,
+      sg_focus            = sg_focus,
+      selection_rule      = selection_rule,
+      effect_neighborhood = effect_neighborhood,
+      effect_log_scale    = effect_log_scale,
+      effect_label        = effect_label,
+      max_print           = max_print
+    )
   }
 
   # ===========================================================================

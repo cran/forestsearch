@@ -19,7 +19,12 @@ grf.subg.harm.survival(
   sg.criterion = "mDiff",
   maxdepth = 2,
   seedit = 8316951,
-  return_selected_cuts_only = FALSE
+  return_selected_cuts_only = FALSE,
+  tune_grf = FALSE,
+  grf_selection = c("tree", "frontier"),
+  frontier_rule = c("effMaxSG", "eff", "maxSG", "minSG", "effMinSG"),
+  effect_neighborhood = 0.1,
+  selection_rule = c("neighborhood", "pareto", "both")
 )
 }
 \arguments{
@@ -54,12 +59,49 @@ grf.subg.harm.survival(
 \item{return_selected_cuts_only}{Logical. If TRUE, returns only cuts from the tree
 depth that identified the selected subgroup meeting \code{dmin.grf}. If FALSE (default),
 returns all cuts from all fitted trees (depths 1 through \code{maxdepth}).}
+
+\item{tune_grf}{Logical. If \code{TRUE}, enables cross-validated
+hyperparameter tuning via \code{tune.parameters = "all"} in the
+causal survival forest. Default \code{FALSE}.}
+
+\item{grf_selection}{Character, one of \code{"tree"} (default) or
+\code{"frontier"}. \code{"tree"} uses the GRF policy tree (standard
+behavior). \code{"frontier"} is an \strong{experimental} alternative that,
+on the same doubly-robust scores, enumerates single-covariate thresholds
+(and depth-2 covariate-pair conjunctions when \code{maxdepth >= 2}), takes
+the Pareto frontier of (harm-effect, size), and selects one subgroup under
+\code{frontier_rule}. The selected subgroup is always a single conjunction.
+In small benchmarks the policy tree matched or beat the frontier on harm
+recovery, so \code{"frontier"} is provided for comparison and exploration,
+not as a recommended default.}
+
+\item{frontier_rule}{Character, one of \code{"effMaxSG"} (default),
+\code{"eff"}, \code{"maxSG"}, \code{"minSG"}, or \code{"effMinSG"}; the rule
+applied to the frontier when \code{grf_selection = "frontier"}. Semantics
+match \code{dina_subgroup()}'s \code{sg_focus}: \code{"eff"} takes the
+maximum harm-effect candidate; \code{"maxSG"}/\code{"minSG"} the
+largest/smallest eligible candidate (effect >= \code{dmin.grf});
+\code{"effMaxSG"}/\code{"effMinSG"} the largest/smallest candidate within
+\code{effect_neighborhood} (relative) of the max harm-effect.}
+
+\item{effect_neighborhood}{Numeric in (0, 1); relative neighborhood for the
+\code{"effMaxSG"} / \code{"effMinSG"} rules. Default 0.10. Used only when
+\code{grf_selection = "frontier"}.}
+
+\item{selection_rule}{Character, one of \code{"neighborhood"} (default),
+\code{"pareto"}, \code{"both"}; the inclusion band for the
+\code{eff*SG} frontier rules, matching \code{forestsearch()} and
+\code{dina_subgroup()}.  Inert for the other rules.}
 }
 \value{
 A list with GRF results, including:
 \item{data}{Original data with added treatment recommendation flags}
 \item{grf.gsub}{Selected subgroup information}
-\item{sg.harm.id}{Expression defining the identified subgroup}
+\item{sg.harm.id}{\strong{Character vector of cut expressions}
+defining the identified subgroup (length = depth of the selected
+policy tree), or \code{NULL} if no subgroup was found.  \strong{Not}
+a per-subject membership indicator; see the \emph{Field naming
+collision} section below.}
 \item{tree.cuts}{Cut expressions - either all cuts from all trees (if
 \code{return_selected_cuts_only = FALSE}) or only cuts from the selected tree
 depth (if \code{return_selected_cuts_only = TRUE})}
@@ -91,4 +133,64 @@ reducing noise from non-selected trees.}
 
 When \code{return_selected_cuts_only = TRUE} and no subgroup meets the criteria,
 \code{tree.cuts} will be empty (character(0)).
+}
+\section{Field naming collision with forestsearch / subgroup.consistency}{
+
+The field name \code{sg.harm.id} has \strong{different semantics} on
+this object versus on the \code{grp.consistency} list returned by
+\code{\link{subgroup.consistency}} (and nested inside the
+\code{\link{forestsearch}} result):
+
+\tabular{lll}{
+\strong{Object} \tab \strong{\code{sg.harm.id} contains} \tab \strong{Length / type} \cr
+\code{grf.subg.harm.survival()} result (this function) \tab character vector of cut expressions \tab character, length = depth of selected tree \cr
+\code{subgroup.consistency()} result \tab per-subject 0/1 membership indicator \tab integer, length \code{nrow(data)} \cr
+}
+
+\strong{Practical consequence.}  On this object, pasting
+\code{paste(obj$sg.harm.id, collapse = " & ")} correctly renders
+the identified subgroup.  On a \code{grp.consistency} list the same
+expression silently concatenates a long 0/1 indicator and produces
+output like \code{"0 & 0 & 1 & 0 & ..."}.  When writing code that
+must handle both object types, dispatch on class first, or use the
+top-level \code{sg.harm} field that the \code{\link{forestsearch}}
+result exposes.
+
+This naming collision is a documented CRAN-stable API for v0.1.x
+and v0.2.x; it is expected to be resolved via a deprecation cycle
+in a future minor release.
+}
+
+\examples{
+\dontrun{
+# Return all cuts (default behavior)
+result_all <- grf.subg.harm.survival(
+  data = trial_data,
+  confounders.name = c("age", "biomarker", "region"),
+  outcome.name = "tte",
+  event.name = "event",
+  id.name = "id",
+  treat.name = "treat",
+  dmin.grf = 0.1,
+  maxdepth = 2
+)
+result_all$tree.cuts
+# Returns cuts from both depth 1 and depth 2 trees
+
+# Return only cuts from the selected tree
+result_selected <- grf.subg.harm.survival(
+  data = trial_data,
+  confounders.name = c("age", "biomarker", "region"),
+  outcome.name = "tte",
+  event.name = "event",
+  id.name = "id",
+  treat.name = "treat",
+  dmin.grf = 0.1,
+  maxdepth = 2,
+  return_selected_cuts_only = TRUE
+)
+result_selected$tree.cuts
+# Returns cuts only from the depth that identified the winning subgroup
+}
+
 }

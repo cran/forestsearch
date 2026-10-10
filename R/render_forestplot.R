@@ -80,10 +80,9 @@
 #' row types (ITT, reference, posthoc, etc.).
 #'
 #' @examples
-#' \donttest{
+#' \dontrun{
 #' # Simple: just increase base_size for larger plot
 #' large_theme <- create_forest_theme(base_size = 14)
-#' print(large_theme)
 #'
 #' # Or use scale for quick adjustment
 #' large_theme <- create_forest_theme(base_size = 10, scale = 1.4)
@@ -91,9 +90,21 @@
 #' # Fine-tune specific elements
 #' custom_theme <- create_forest_theme(
 #'   base_size = 14,
-#'   cv_fontsize = 12,
-#'   ci_lwd = 2.5
+#'   cv_fontsize = 12,  # Override auto-calculated CV font size
+#'   ci_lwd = 2.5       # Override auto-calculated CI line width
 #' )
+#'
+#' # Use with plot_subgroup_results_forestplot
+#' result <- plot_subgroup_results_forestplot(
+#'   fs_results = list(fs.est = fs, fs_bc = fs_bc),
+#'   df_analysis = df.analysis,
+#'   outcome.name = "time",
+#'   event.name = "status",
+#'   treat.name = "treatment",
+#'   theme = large_theme
+#' )
+#'
+#' render_forestplot(result)
 #' }
 #'
 #' @seealso \code{\link{plot_subgroup_results_forestplot}}, \code{\link{render_forestplot}}
@@ -193,8 +204,11 @@ create_forest_theme <- function(
 #'
 #' @param x An fs_forest_theme object
 #' @param ... Additional arguments (ignored)
-#' @keywords internal
-#' @return Invisibly returns \code{x}.
+#' @return The input \code{x}, invisibly.
+#' @examples
+#' theme <- create_forest_theme()
+#' print(theme)
+#' @export
 print.fs_forest_theme <- function(x, ...) {
   cat("ForestSearch Forest Plot Theme\n")
   cat("==============================\n")
@@ -232,6 +246,27 @@ print.fs_forest_theme <- function(x, ...) {
 #'
 #' \code{render_forestplot(result)}
 #'
+#' @examples
+#' \dontrun{
+#' # For larger plot, use theme parameter in plot_subgroup_results_forestplot:
+#' large_theme <- create_forest_theme(
+#'   base_size = 14,
+#'   row_padding = c(6, 4),
+#'   cv_fontsize = 11
+#' )
+#'
+#' result <- plot_subgroup_results_forestplot(
+#'   fs_results = list(fs.est = fs, fs_bc = fs_bc),
+#'   df_analysis = df.analysis,
+#'   outcome.name = "time",
+#'   event.name = "status",
+#'   treat.name = "treatment",
+#'   theme = large_theme
+#' )
+#'
+#' render_forestplot(result)
+#' }
+#'
 #' @importFrom grid grid.newpage grid.draw
 #' @export
 render_forestplot <- function(x, newpage = TRUE) {
@@ -258,10 +293,28 @@ render_forestplot <- function(x, newpage = TRUE) {
 #' @param dpi Numeric. Resolution for raster formats. Default: 300.
 #' @param bg Character. Background color. Default: "white".
 #'
-#' @keywords internal
 #' @return Invisibly returns the filename.
 #'
+#' @examples
+#' \dontrun{
+#' # Create plot with custom theme
+#' large_theme <- create_forest_theme(base_size = 14, row_padding = c(6, 4))
+#'
+#' result <- plot_subgroup_results_forestplot(
+#'   fs_results = list(fs.est = fs, fs_bc = fs_bc),
+#'   df_analysis = df.analysis,
+#'   outcome.name = "time",
+#'   event.name = "status",
+#'   treat.name = "treatment",
+#'   theme = large_theme
+#' )
+#'
+#' # Save to file
+#' save_forestplot(result, "forest_plot.pdf", width = 14, height = 12)
+#' }
+#'
 #' @importFrom grDevices pdf png svg jpeg dev.off
+#' @export
 save_forestplot <- function(
     x,
     filename,
@@ -313,8 +366,17 @@ save_forestplot <- function(
 #'
 #' @param x An fs_forestplot object
 #' @param ... Additional arguments (ignored)
-#' @keywords internal
-#' @return Invisibly returns \code{x}.
+#' @return The input \code{x}, invisibly.
+#' @examples
+#' \dontrun{
+#' fs <- forestsearch(gbsg,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+#' fp <- plot_subgroup_results_forestplot(list(fs.est = fs), gbsg,
+#'   outcome.name = "rfstime", event.name = "status", treat.name = "hormon")
+#' print(fp)
+#' }
+#' @export
 print.fs_forestplot <- function(x, ...) {
   cat("ForestSearch Subgroup Results Forest Plot\n")
   cat("=========================================\n")
@@ -342,8 +404,17 @@ print.fs_forestplot <- function(x, ...) {
 #'
 #' @param x An fs_forestplot object
 #' @param ... Additional arguments (ignored)
-#' @keywords internal
-#' @return Invisibly returns \code{x}.
+#' @return The input \code{x}, invisibly.
+#' @examples
+#' \dontrun{
+#' fs <- forestsearch(gbsg,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+#' fp <- plot_subgroup_results_forestplot(list(fs.est = fs), gbsg,
+#'   outcome.name = "rfstime", event.name = "status", treat.name = "hormon")
+#' plot(fp)
+#' }
+#' @export
 plot.fs_forestplot <- function(x, ...) {
   render_forestplot(x)
   invisible(x)

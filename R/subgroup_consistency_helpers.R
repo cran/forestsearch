@@ -19,10 +19,16 @@
 #' @param parallel_args List with \code{plan} (character), \code{workers} (integer),
 #'   and \code{show_message} (logical).
 #'
-#' @keywords internal
 #' @return None. Sets up parallel backend as side effect.
 #'
+#' @examples
+#' \donttest{
+#' setup_parallel_SGcons(list(plan = "sequential", workers = 1,
+#'                             show_message = FALSE))
+#' future::plan(future::sequential)  # reset
+#' }
 #' @importFrom future plan multisession multicore sequential
+#' @export
 setup_parallel_SGcons <- function(parallel_args = list(
     plan = "multisession",
     workers = 4,
@@ -30,7 +36,7 @@ setup_parallel_SGcons <- function(parallel_args = list(
 )) {
   plan_type <- parallel_args$plan
   n_workers <- parallel_args$workers
-  show_message <- parallel_args$show_message
+  show_message <- isTRUE(parallel_args$show_message)
 
   if (is.null(plan_type)) stop("parallel_args$plan must be specified.")
 
@@ -82,9 +88,12 @@ setup_parallel_SGcons <- function(parallel_args = list(
 #' @param n Integer. Number of trials.
 #' @param conf.level Numeric. Confidence level (default 0.95).
 #'
-#' @keywords internal
 #' @return Named numeric vector with elements: estimate, lower, upper.
 #'
+#' @examples
+#' wilson_ci(90, 100)
+#' wilson_ci(5, 20, conf.level = 0.90)
+#' @export
 wilson_ci <- function(x, n, conf.level = 0.95) {
   if (n == 0) {
     return(c(estimate = NA_real_, lower = 0, upper = 1))
@@ -115,9 +124,13 @@ wilson_ci <- function(x, n, conf.level = 0.95) {
 #' @param conf.level Numeric. Confidence level for decision (default 0.95).
 #' @param min_samples Integer. Minimum samples before allowing early stop.
 #'
-#' @keywords internal
 #' @return Character. One of "continue", "pass", or "fail".
 #'
+#' @examples
+#' early_stop_decision(95, 100, threshold = 0.90)
+#' early_stop_decision(60, 100, threshold = 0.90)
+#' early_stop_decision(10, 15, threshold = 0.90)  # below min_samples
+#' @export
 early_stop_decision <- function(n_success, n_total, threshold,
                                 conf.level = 0.95, min_samples = 20) {
   if (n_total < min_samples) {
@@ -149,33 +162,59 @@ early_stop_decision <- function(n_success, n_total, threshold,
 #'
 #' @param df data.frame or data.table with Y, Event, Treat columns.
 #' @param cox_init Numeric. Initial value for coefficient (default 0).
+#'   Ignored when `adjust_covariates` is supplied (the default coxph
+#'   starting values are used so the init length matches the number of
+#'   model coefficients).
+#' @param adjust_covariates Character vector or `NULL`. Additional terms
+#'   appended to the model right-hand side after `Treat`.  Terms are pasted
+#'   verbatim, so `"strata(x1)"` produces a stratified Cox model.  The
+#'   referenced columns must be present in `df`.  `NULL` (default) fits the
+#'   unadjusted `Surv(Y, Event) ~ Treat` model.
 #'
-#' @keywords internal
-#' @return Numeric. Estimated hazard ratio, or NA if model fails.
+#' @return Numeric. Estimated hazard ratio for `Treat`, or NA if model fails.
 #'
+#' @examples
+#' \donttest{
+#' set.seed(42)
+#' df <- data.frame(
+#'   Y     = rexp(80),
+#'   Event = rbinom(80, 1, 0.6),
+#'   Treat = rep(0:1, 40)
+#' )
+#' get_split_hr_fast(df)
+#' }
 #' @importFrom survival coxph Surv
-get_split_hr_fast <- function(df, cox_init = 0) {
+#' @export
+get_split_hr_fast <- function(df, cox_init = 0, adjust_covariates = NULL) {
   if (nrow(df) < 2 || sum(df$Event) < 2) {
     return(NA_real_)
   }
 
+  adj <- .fs_adjust_terms(adjust_covariates)
+  if (length(adj) > 0L) {
+    fmla <- stats::reformulate(c("Treat", adj), response = "survival::Surv(Y, Event)")
+  } else {
+    fmla <- survival::Surv(Y, Event) ~ Treat
+  }
+
+  # coxph treats `init = NULL` as a length-0 init (an error), so the init
+  # argument is omitted entirely on the adjusted path; the scalar warm-start
+  # only applies to the single-coefficient treatment-only model.
+  fit_args <- list(
+    formula = fmla, data = df,
+    robust = FALSE, model = FALSE, x = FALSE, y = FALSE
+  )
+  if (length(adj) == 0L) fit_args$init <- cox_init
+
   fit <- tryCatch(
-    suppressWarnings(
-      survival::coxph(
-        survival::Surv(Y, Event) ~ Treat,
-        data = df,
-        init = cox_init,
-        robust = FALSE,
-        model = FALSE,
-        x = FALSE,
-        y = FALSE
-      )
-    ),
+    suppressWarnings(do.call(survival::coxph, fit_args)),
     error = function(e) NULL
   )
 
   if (is.null(fit)) return(NA_real_)
-  return(exp(fit$coefficients[1]))
+  cf <- fit$coefficients
+  beta <- if ("Treat" %in% names(cf)) cf[["Treat"]] else cf[1]
+  return(exp(beta))
 }
 
 
@@ -186,13 +225,40 @@ get_split_hr_fast <- function(df, cox_init = 0) {
 #'
 #' @param df.x data.table. Subgroup data with columns Y, Event, Treat.
 #' @param N.x Integer. Number of observations in subgroup.
-#' @param hr.consistency Numeric. Minimum HR threshold for consistency.
+#' @param hr.consistency Numeric. `c2`, \strong{an effect threshold} -- the
+#'   minimum effect required in \emph{each} half of a split for that split to
+#'   count as consistent.  \strong{Not} a proportion and \strong{not} the
+#'   consistency rate.  \code{forestsearch()} calls this
+#'   \code{consistency.threshold} / \code{hr.consistency}.
 #' @param cox_init Numeric. Initial value for Cox model (log HR).
+#' @param estimator_fn Closure or \code{NULL}. Effect-estimator closure from
+#'   \code{\link{make_effect_estimator}} for GLM outcomes.  Default \code{NULL}
+#'   (uses Cox model).
+#' @param consistency_threshold Numeric or \code{NULL}. Threshold for GLM
+#'   consistency evaluation.  Default \code{NULL} (uses \code{hr.consistency}).
+#' @param adjust_covariates Character vector or \code{NULL}. Additional Cox
+#'   model terms (e.g. \code{"strata(x1)"}) passed to
+#'   \code{\link{get_split_hr_fast}} on the survival path.  Ignored on the
+#'   GLM path.  Default \code{NULL} (unadjusted).
 #'
-#' @keywords internal
 #' @return Numeric. 1 if both splits meet threshold, 0 if not, NA if error.
 #'
-run_single_consistency_split <- function(df.x, N.x, hr.consistency, cox_init = 0) {
+#' @examples
+#' \donttest{
+#' library(data.table)
+#' set.seed(1)
+#' df <- data.table(
+#'   Y     = rexp(100),
+#'   Event = rbinom(100, 1, 0.55),
+#'   Treat = rep(0:1, 50)
+#' )
+#' run_single_consistency_split(df, N.x = 100, hr.consistency = 1.0)
+#' }
+#' @export
+run_single_consistency_split <- function(df.x, N.x, hr.consistency, cox_init = 0,
+                                         estimator_fn = NULL,
+                                         consistency_threshold = NULL,
+                                         adjust_covariates = NULL) {
 
   in.split1 <- tryCatch({
     sample(c(TRUE, FALSE), N.x, replace = TRUE, prob = c(0.5, 0.5))
@@ -210,18 +276,94 @@ run_single_consistency_split <- function(df.x, N.x, hr.consistency, cox_init = 0
     return(NA_real_)
   }
 
+  # --- GLM path: use estimator closure ---
+  if (!is.null(estimator_fn) && !is.null(consistency_threshold)) {
+    # Minimum per-arm check (replaces event-count check for non-survival)
+    for (half in list(df.x.split1, df.x.split2)) {
+      treat_col <- intersect(c("Treat", "treat"), names(half))
+      if (length(treat_col) > 0L) {
+        tc <- treat_col[1L]
+        if (sum(half[[tc]] == 1L) < 3L || sum(half[[tc]] == 0L) < 3L) {
+          return(NA_real_)
+        }
+      }
+    }
+
+    res1 <- estimator_fn(df.x.split1)
+    res2 <- estimator_fn(df.x.split2)
+
+    if (is.na(res1$estimate) || is.na(res2$estimate)) return(NA_real_)
+
+    return(as.numeric(
+      res1$estimate >= consistency_threshold &&
+        res2$estimate >= consistency_threshold
+    ))
+  }
+
+  # --- Survival path (existing, unchanged) ---
   if (sum(df.x.split1$Event) < 2 || sum(df.x.split2$Event) < 2) {
     return(NA_real_)
   }
 
-  hr.split1 <- get_split_hr_fast(df.x.split1, cox_init)
-  hr.split2 <- get_split_hr_fast(df.x.split2, cox_init)
+  hr.split1 <- get_split_hr_fast(df.x.split1, cox_init, adjust_covariates = adjust_covariates)
+  hr.split2 <- get_split_hr_fast(df.x.split2, cox_init, adjust_covariates = adjust_covariates)
 
   if (!is.na(hr.split1) && !is.na(hr.split2)) {
     as.numeric(hr.split1 > hr.consistency && hr.split2 > hr.consistency)
   } else {
     NA_real_
   }
+}
+
+
+# =============================================================================
+# RESAMPLE-PATH HELPERS (shared by single-stage and two-stage evaluators)
+# =============================================================================
+
+#' Can the GLM resampling approximation represent this effect measure?
+#'
+#' The resampling approximation requires the treatment effect to be a single
+#' model coefficient with a well-defined influence function. That holds for
+#' OR/RR (logistic / log-binomial), RD (identity-link binomial), MD (OLS), and
+#' IRR (Poisson with offset). It does not hold for IRD (a delta-method rate
+#' difference) or propensity-adjusted (IPTW / G-computation) effects, for which
+#' the caller falls back to literal splitting.
+#'
+#' @param spec List; the `glm_resample_spec` threaded from [forestsearch()].
+#' @return Logical scalar.
+#' @keywords internal
+.glm_resample_supported <- function(spec) {
+  if (is.null(spec) || is.null(spec$effect_measure)) return(FALSE)
+  spec$effect_measure %in% c("OR", "RR", "RD", "MD", "IRR")
+}
+
+#' Consistency proportion via literal splitting (single-stage)
+#'
+#' Runs `n.splits` Bernoulli splits through [run_single_consistency_split()]
+#' and returns the rounded proportion of consistent splits, or `NA_real_` when
+#' too few valid splits are obtained. Survival and GLM (`estimator_fn`) paths.
+#'
+#' @keywords internal
+.consistency_via_splits <- function(df.x, N.x, n.splits, hr.consistency,
+                                    cox_init, estimator_fn,
+                                    consistency_threshold, adjust_covariates,
+                                    pconsistency.digits, m = NA, details = FALSE) {
+  flag.consistency <- numeric(n.splits)
+  for (i in seq_len(n.splits)) {
+    flag.consistency[i] <- run_single_consistency_split(
+      df.x, N.x, hr.consistency, cox_init,
+      estimator_fn = estimator_fn,
+      consistency_threshold = consistency_threshold,
+      adjust_covariates = adjust_covariates
+    )
+  }
+  n_valid <- sum(!is.na(flag.consistency))
+  if (n_valid < 10) {
+    if (details) cat("Subgroup ", m, ": too few valid splits (", n_valid, ")\n", sep = "")
+    return(NA_real_)
+  }
+  tryCatch(round(mean(flag.consistency, na.rm = TRUE), pconsistency.digits),
+           error = function(e) NA_real_)
 }
 
 
@@ -242,11 +384,19 @@ run_single_consistency_split <- function(df.x, N.x, hr.consistency, cox_init = 0
 #' @param confs_labels Character vector. Labels for each factor, indexed by
 #'   factor number.
 #'
-#' @keywords internal
 #' @return Character. Human-readable label wrapped in braces, e.g.,
 #'   `"{age <= 50}"` or `"!{age <= 50}"` for complement. Returns the
 #'   original code if no match is found.
 #'
+#' @examples
+#' \dontrun{
+#' labels <- c("age <= 50", "tumor size <= 20", "nodes <= 3")
+#' FS_labels("q1.1", labels)
+#' FS_labels("q1.0", labels)
+#' FS_labels("q2", labels)
+#' FS_labels(c("q1", "q3"), labels)
+#' }
+#' @export
 
 FS_labels <- function(Qsg, confs_labels) {
   # Handle vector input
@@ -263,7 +413,7 @@ FS_labels <- function(Qsg, confs_labels) {
     idx <- as.integer(matches[2])
     action <- matches[3]
   } else {
-    # Try short format: q<index> (e.g., "q1") — default action = 1
+    # Try short format: q<index> (e.g., "q1") -- default action = 1
     pattern_short <- "^q(\\d+)$"
     matches <- regmatches(Qsg, regexec(pattern_short, Qsg))[[1]]
 
@@ -289,40 +439,463 @@ FS_labels <- function(Qsg, confs_labels) {
 
 
 
-#' Sort Subgroups by Focus
+#' Sort Subgroups by Focus (post-consistency)
 #'
 #' Sorts a data.table of subgroup results according to the specified focus.
+#' For \code{"hrMaxSG"} and \code{"hrMinSG"}, candidates are first
+#' partitioned into a \emph{candidate inclusion set} (the "band"), then
+#' ranked within the band by sample size.  The \code{selection_rule}
+#' argument controls how the band is defined:
+#' \itemize{
+#'   \item \code{"neighborhood"} -- 1D effect-size band (default; legacy
+#'     behaviour): a candidate is in-band iff its effect is within
+#'     \code{effect_neighborhood} of the maximum.
+#'   \item \code{"pareto"} -- 2D Pareto-non-dominated set in
+#'     (effect, N) space: a candidate is in-band iff no other candidate
+#'     has both a larger effect and a larger N.
+#'   \item \code{"both"} -- intersection of the two: a candidate is
+#'     in-band iff it satisfies the neighborhood test \emph{and} is
+#'     Pareto-non-dominated.
+#' }
+#' See Details.
 #'
-#' @param result_new A data.table of subgroup results.
-#' @param sg_focus Sorting focus: "hr", "hrMaxSG", "maxSG", "hrMinSG", "minSG".
-#' @keywords internal
-#' @return A sorted data.table.
+#' @param result_new A data.table of subgroup results with columns
+#'   \code{Pcons}, \code{hr}, \code{N}, \code{K}.
+#' @param sg_focus Character. Sorting focus.  One of \code{"hr"},
+#'   \code{"maxSG"}, \code{"hrMaxSG"}, \code{"minSG"}, \code{"hrMinSG"}.
+#' @param selection_rule Character. Rule defining the candidate
+#'   inclusion set for \code{"hrMaxSG"} / \code{"hrMinSG"}.  One of
+#'   \code{"neighborhood"} (default; current behaviour),
+#'   \code{"pareto"}, or \code{"both"}.  Must be \code{"neighborhood"}
+#'   for other \code{sg_focus} values.
+#' @param effect_neighborhood Numeric in \code{[0, 1)}.  Relative
+#'   tolerance defining the effect-size neighborhood for
+#'   \code{"hrMaxSG"} and \code{"hrMinSG"}.  A candidate is in the
+#'   neighborhood iff its (natural-scale) effect is at least
+#'   \code{(1 - effect_neighborhood) * max(effect)}.  Default
+#'   \code{0.10} (i.e., within 10\% of the strongest effect).  Used by
+#'   \code{selection_rule} \code{"neighborhood"} and \code{"both"};
+#'   ignored by \code{"pareto"} (and rejected if non-default with
+#'   \code{"pareto"}).
+#' @param effect_log_scale Logical.  If \code{TRUE}, the \code{hr}
+#'   column stores log-scale values (log-OR, log-IRR) and is
+#'   exponentiated before applying the inclusion test.  Default
+#'   \code{FALSE} (Cox stores natural-scale HR).
+#'
+#' @details
+#' \strong{Sort keys by \code{sg_focus}:}
+#' \describe{
+#'   \item{\code{"hr"}}{\code{(-Pcons, -hr, K)} -- prefer high consistency
+#'     and large effect.}
+#'   \item{\code{"maxSG"}}{\code{(-N, -Pcons, K)} -- prefer large
+#'     subgroups with high consistency.}
+#'   \item{\code{"minSG"}}{\code{(N, -Pcons, K)} -- prefer small
+#'     subgroups with high consistency.}
+#'   \item{\code{"hrMaxSG"}}{\code{(-in_band, -N, -Pcons, -hr, K)} -- among
+#'     candidates in the inclusion band defined by \code{selection_rule},
+#'     prefer the largest sample size.}
+#'   \item{\code{"hrMinSG"}}{\code{(-in_band, N, -Pcons, -hr, K)} -- among
+#'     candidates in the inclusion band defined by \code{selection_rule},
+#'     prefer the smallest sample size.}
+#' }
+#'
+#' \code{"hrMaxSG"} and \code{"hrMinSG"} use a \emph{lexicographic with
+#' candidate band} rule: effect size is primary, but a bounded set of
+#' candidates near (or trading off against) the maximum is accepted to
+#' optimize sample size.
+#'
+#' \strong{Selection rules:}
+#' \describe{
+#'   \item{\code{"neighborhood"}}{1D \eqn{\varepsilon}-band on the effect
+#'     scale: \code{in_band = (hr >= (1 - effect_neighborhood) * max(hr))}.
+#'     Setting \code{effect_neighborhood = 0} reduces this to a strict
+#'     max-effect filter.  This is the legacy behaviour.}
+#'   \item{\code{"pareto"}}{2D Pareto-non-dominated set: a candidate is
+#'     in-band iff no other candidate has both \code{hr_j >= hr_i} and
+#'     \code{N_j >= N_i} with at least one strict inequality.  Reuses
+#'     the same dominance computation as \code{compute_pareto_frontier()}.
+#'     Removes the \code{effect_neighborhood} tuning parameter from the
+#'     selection criterion.}
+#'   \item{\code{"both"}}{Intersection: in-band iff in the
+#'     \eqn{\varepsilon}-band \emph{and} Pareto-non-dominated.  Strictest
+#'     of the three.}
+#' }
+#'
+#' @return A sorted data.table.  The top row is the selected subgroup
+#'   under \code{sg_focus}; remaining rows are diagnostic.
+#'
+#' @examples
+#' \donttest{
+#' library(data.table)
+#' dt <- data.table(Pcons = c(0.92, 0.95, 0.88, 0.90),
+#'                  hr    = c(2.5,  2.4,  2.3,  2.0),
+#'                  N     = c(70,   100,  150,  200),
+#'                  K     = c(1, 2, 1, 2))
+#' # hrMaxSG with 10% neighborhood: HR 2.5, 2.4, 2.3 are in-band;
+#' # among those, N = 150 is largest -> top row is N=150, hr=2.3.
+#' sort_subgroups(dt, sg_focus = "hrMaxSG", effect_neighborhood = 0.10)
+#'
+#' # Same data with selection_rule = "pareto": the dominance set in
+#' # (hr, N) is used instead of the 1D effect band.
+#' sort_subgroups(dt, sg_focus = "hrMaxSG", selection_rule = "pareto")
+#' }
 #' @importFrom data.table setorder
-sort_subgroups <- function(result_new, sg_focus) {
-  if (sg_focus == "hr") data.table::setorder(result_new, -Pcons, -hr, K)
-  if (sg_focus == "maxSG") data.table::setorder(result_new, -N, -Pcons, K)
-  if (sg_focus == "hrMaxSG") data.table::setorder(result_new, -N, -hr, K)
-  if (sg_focus == "minSG") data.table::setorder(result_new, N, -Pcons, K)
-  if (sg_focus == "hrMinSG") data.table::setorder(result_new, N, -hr, K)
-  result_new
+#' @export
+sort_subgroups <- function(result_new, sg_focus,
+                           selection_rule = "neighborhood",
+                           effect_neighborhood = 0.10,
+                           effect_log_scale = FALSE) {
+
+  # Normalize the alias vocabulary ("eff", "effMaxSG", "effMinSG", "maxcons")
+  # before anything keys on sg_focus.  This function is exported and may be
+  # called directly, in which case no caller has normalized for us; the
+  # .validate_selection_rule() call below is present for the same reason.
+  # Normalizing FIRST also means selection_rule = "pareto" is accepted for
+  # "effMaxSG"/"effMinSG", matching their canonical "hrMaxSG"/"hrMinSG" forms.
+  sg_focus <- .normalize_sg_focus(sg_focus)
+
+  .validate_selection_rule(selection_rule, sg_focus, effect_neighborhood)
+
+  # Effect maximiser, no auxiliary condition.  Distinct from "hr", which sorts
+  # (-Pcons, -hr, K) and lets consistency dominate.  K breaks exact ties toward
+  # the simpler rule; it cannot override the effect ordering.
+  if (sg_focus == "maxeff") {
+    data.table::setorder(result_new, -hr, K)
+    return(result_new)
+  }
+  # maxeffCons: the effect maximiser among CONSISTENCY-QUALIFYING candidates.
+  # The key is identical to maxeff's, but the population it ranges over is not:
+  # every row reaching here already cleared pconsistency.threshold, because
+  # evaluate_subgroup_consistency() returns NULL below it.  So the consistency
+  # gate is applied by construction and needs no term in the sort key.  The
+  # difference from maxeff is upstream, in subgroup.consistency(): maxeff takes
+  # a winner-only fast path and keeps its winner even when consistency fails,
+  # whereas maxeffCons must evaluate every candidate.
+  if (sg_focus == "maxeffCons") {
+    data.table::setorder(result_new, -hr, K)
+    return(result_new)
+  }
+  if (sg_focus == "hr") {
+    data.table::setorder(result_new, -Pcons, -hr, K)
+    return(result_new)
+  }
+  if (sg_focus == "maxSG") {
+    data.table::setorder(result_new, -N, -Pcons, K)
+    return(result_new)
+  }
+  if (sg_focus == "minSG") {
+    data.table::setorder(result_new, N, -Pcons, K)
+    return(result_new)
+  }
+
+  if (sg_focus %in% c("hrMaxSG", "hrMinSG")) {
+
+    hr_vec <- as.numeric(result_new$hr)
+    if (isTRUE(effect_log_scale)) hr_vec <- exp(hr_vec)
+
+    if (all(is.na(hr_vec))) {
+      data.table::setorder(result_new, -Pcons, -hr, K)
+      return(result_new)
+    }
+
+    N_vec     <- as.numeric(result_new$N)
+    Pcons_vec <- as.numeric(result_new$Pcons)
+    K_vec     <- as.numeric(result_new$K)
+
+    in_band <- .compute_inclusion_band(
+      hr_vec              = hr_vec,
+      n_vec               = N_vec,
+      selection_rule      = selection_rule,
+      effect_neighborhood = effect_neighborhood
+    )
+
+    ord <- if (sg_focus == "hrMaxSG") {
+      order(-in_band, -N_vec, -Pcons_vec, -hr_vec, K_vec)
+    } else {
+      order(-in_band,  N_vec, -Pcons_vec, -hr_vec, K_vec)
+    }
+
+    return(result_new[ord, ])
+  }
+
+  stop(sprintf("Unknown sg_focus value: %s", sg_focus))
 }
 
-#' Sort Subgroups by Focus at consistency stage (consistency not available at this point)
+#' Sort Subgroups by Focus (pre-consistency)
 #'
-#' Sorts a data.table of subgroup results according to the specified focus.
+#' Sorts a data.table of candidate subgroups before consistency
+#' evaluation.  Mirrors \code{\link{sort_subgroups}} but operates on the
+#' pre-consistency column convention (\code{HR}, \code{n}, \code{K})
+#' and omits \code{Pcons} tiebreakers (consistency not yet available).
 #'
-#' @param result_new A data.table of subgroup results.
-#' @param sg_focus Sorting focus: "hr", "hrMaxSG", "maxSG", "hrMinSG", "minSG".
+#' @param result_new A data.table of candidate subgroups with columns
+#'   \code{HR}, \code{n}, \code{K}.
+#' @param sg_focus Character. Sorting focus.  One of \code{"hr"},
+#'   \code{"maxSG"}, \code{"hrMaxSG"}, \code{"minSG"}, \code{"hrMinSG"}.
+#' @param selection_rule Character. See \code{\link{sort_subgroups}}.
+#'   Default \code{"neighborhood"}.
+#' @param effect_neighborhood Numeric in \code{[0, 1)}.  See
+#'   \code{\link{sort_subgroups}}.  Default \code{0.10}.
+#' @param effect_log_scale Logical.  See \code{\link{sort_subgroups}}.
+#'   Default \code{FALSE}.
+#'
 #' @return A sorted data.table.
 #' @importFrom data.table setorder
 #' @keywords internal
-sort_subgroups_preview <- function(result_new, sg_focus) {
-  if (sg_focus == "hr") data.table::setorder(result_new, -HR, K)
-  if (sg_focus == "maxSG") data.table::setorder(result_new, -n, K)
-  if (sg_focus == "hrMaxSG") data.table::setorder(result_new, -HR, -n, K)
-  if (sg_focus == "minSG") data.table::setorder(result_new, n, K)
-  if (sg_focus == "hrMinSG") data.table::setorder(result_new, -HR, n, K)
-  result_new
+sort_subgroups_preview <- function(result_new, sg_focus,
+                                   selection_rule = "neighborhood",
+                                   effect_neighborhood = 0.10,
+                                   effect_log_scale = FALSE) {
+
+  # See sort_subgroups(): normalize aliases before keying on sg_focus, since
+  # this function is exported and may be called without a normalizing caller.
+  sg_focus <- .normalize_sg_focus(sg_focus)
+
+  .validate_selection_rule(selection_rule, sg_focus, effect_neighborhood)
+
+  if (sg_focus == "maxeff") {
+    data.table::setorder(result_new, -HR, K)
+    return(result_new)
+  }
+  # maxeffCons enumerates effect-descending, matching its selection key's
+  # primary term -- which is what makes first-passer early stopping valid for
+  # it (see subgroup.consistency()'s batch guard).
+  if (sg_focus == "maxeffCons") {
+    data.table::setorder(result_new, -HR, K)
+    return(result_new)
+  }
+  if (sg_focus == "hr") {
+    data.table::setorder(result_new, -HR, K)
+    return(result_new)
+  }
+  if (sg_focus == "maxSG") {
+    data.table::setorder(result_new, -n, K)
+    return(result_new)
+  }
+  if (sg_focus == "minSG") {
+    data.table::setorder(result_new, n, K)
+    return(result_new)
+  }
+
+  if (sg_focus %in% c("hrMaxSG", "hrMinSG")) {
+
+    hr_vec <- as.numeric(result_new$HR)
+    if (isTRUE(effect_log_scale)) hr_vec <- exp(hr_vec)
+
+    if (all(is.na(hr_vec))) {
+      data.table::setorder(result_new, -HR, K)
+      return(result_new)
+    }
+
+    n_vec <- as.numeric(result_new$n)
+    K_vec <- as.numeric(result_new$K)
+
+    in_band <- .compute_inclusion_band(
+      hr_vec              = hr_vec,
+      n_vec               = n_vec,
+      selection_rule      = selection_rule,
+      effect_neighborhood = effect_neighborhood
+    )
+
+    # Frontier-preserving preview sort:
+    # Include `-on_frontier` as a lex axis between `-in_band` and `-N`
+    # so the full Pareto frontier (on (effect, N)) is guaranteed
+    # inclusion in the top-`stop_Kgroups` candidates that go to
+    # consistency.  Without this, restrictive rules like
+    # `selection_rule = "both"` can crowd low-N frontier members out
+    # of the top-K by filling slots with higher-N dominated
+    # candidates (see issue documented in NEWS).
+    # NB: this affects only candidate FILTERING for consistency
+    # evaluation -- the post-consistency winner is still chosen by
+    # sort_subgroups() (unchanged), so selection semantics are
+    # preserved.
+    on_frontier <- as.integer(!.pareto_dominated_xy(hr_vec, n_vec))
+
+    ord <- if (sg_focus == "hrMaxSG") {
+      order(-in_band, -on_frontier, -n_vec, -hr_vec, K_vec)
+    } else {
+      order(-in_band, -on_frontier,  n_vec, -hr_vec, K_vec)
+    }
+
+    return(result_new[ord, ])
+  }
+
+  stop(sprintf("Unknown sg_focus value: %s", sg_focus))
+}
+
+# Internal validator for effect_neighborhood -------------------------------
+.validate_effect_neighborhood <- function(x) {
+  if (!is.numeric(x) || length(x) != 1L || is.na(x) || x < 0 || x >= 1) {
+    stop("'effect_neighborhood' must be a single numeric in [0, 1).",
+         call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+# Internal validator for selection_rule ------------------------------------
+# Shared by sort_subgroups() and sort_subgroups_preview().
+# Enforces:
+#   1. selection_rule must be one of c("neighborhood", "pareto", "both").
+#   2. selection_rule != "neighborhood" only valid for sg_focus in
+#      {"hrMaxSG", "hrMinSG"}.
+#   3. selection_rule == "pareto" forbids non-default effect_neighborhood
+#      (since the rule does not consult it).
+
+.SELECTION_RULES <- c("neighborhood", "pareto", "both")
+.EFFECT_NEIGHBORHOOD_DEFAULT <- 0.10
+
+.validate_selection_rule <- function(selection_rule, sg_focus,
+                                     effect_neighborhood) {
+  if (!is.character(selection_rule) || length(selection_rule) != 1L ||
+      !selection_rule %in% .SELECTION_RULES) {
+    stop(sprintf(
+      "'selection_rule' must be one of: %s.",
+      paste(shQuote(.SELECTION_RULES), collapse = ", ")),
+      call. = FALSE)
+  }
+  if (selection_rule != "neighborhood" &&
+      !sg_focus %in% c("hrMaxSG", "hrMinSG")) {
+    stop(sprintf(
+      "'selection_rule = \"%s\"' is only meaningful for sg_focus in {\"hrMaxSG\", \"hrMinSG\"}; got sg_focus = \"%s\".",
+      selection_rule, sg_focus),
+      call. = FALSE)
+  }
+  if (selection_rule == "pareto" &&
+      !isTRUE(all.equal(effect_neighborhood,
+                        .EFFECT_NEIGHBORHOOD_DEFAULT))) {
+    stop(sprintf(
+      "'selection_rule = \"pareto\"' does not consult 'effect_neighborhood', but a non-default value (%g) was supplied.  Use 'selection_rule = \"both\"' if you want both criteria, or leave 'effect_neighborhood' at its default (%g).",
+      effect_neighborhood, .EFFECT_NEIGHBORHOOD_DEFAULT),
+      call. = FALSE)
+  }
+  invisible(TRUE)
+}
+
+# Shared inclusion-band computation ----------------------------------------
+# Used by both sort_subgroups() (post-consistency: hr / N columns) and
+# sort_subgroups_preview() (pre-consistency: HR / n columns).  Vector-
+# based to avoid a column-name dependency.  Returns an integer 0/1
+# indicator vector (1 = in candidate band) of length length(hr_vec).
+# The validator is assumed to have already enforced selection_rule
+# consistency.
+
+.compute_inclusion_band <- function(hr_vec, n_vec, selection_rule,
+                                    effect_neighborhood) {
+  n <- length(hr_vec)
+  in_nbhd <- if (selection_rule %in% c("neighborhood", "both")) {
+    .validate_effect_neighborhood(effect_neighborhood)
+    hr_max   <- max(hr_vec, na.rm = TRUE)
+    hr_floor <- (1 - effect_neighborhood) * hr_max
+    as.integer(!is.na(hr_vec) & hr_vec >= hr_floor)
+  } else {
+    rep(1L, n)
+  }
+  in_pareto <- if (selection_rule %in% c("pareto", "both")) {
+    dominated <- .pareto_dominated_xy(hr_vec, n_vec)
+    as.integer(!dominated)
+  } else {
+    rep(1L, n)
+  }
+  # AND-combination: candidate is in-band only if both criteria are
+  # satisfied.  For pure rules one of the two vectors is all 1s, so the
+  # product reduces to the active rule's indicator.
+  in_nbhd * in_pareto
+}
+
+#' Compute Pareto Frontier on (Effect, N)
+#'
+#' Returns the subset of candidate subgroups that are not dominated on
+#' the two-objective space (effect size, sample size), where both
+#' objectives are maximized.  A candidate \eqn{i} is dominated iff
+#' another candidate \eqn{j} has \eqn{hr_j \ge hr_i} and
+#' \eqn{N_j \ge N_i}, with at least one inequality strict.
+#'
+#' @param result_dt A data.table with numeric columns \code{hr} and
+#'   \code{N}.  Typically the post-consistency result table.
+#' @param effect_log_scale Logical.  If \code{TRUE}, exponentiate
+#'   \code{hr} before comparing (so the dominance test is on the
+#'   natural scale for ratio measures).  Default \code{FALSE}.
+#'
+#' @return A data.table of non-dominated rows, sorted by \code{hr}
+#'   descending.  Returns an empty 0-row data.table if input is empty.
+#'
+#' @details The frontier is intended as a \strong{post-hoc reporting}
+#'   artifact, not a selection criterion.  The selected subgroup
+#'   (under \code{sg_focus}) may or may not appear on the frontier --
+#'   in particular, \code{"hrMinSG"} may select an N-dominated point
+#'   by design (preferring small subgroups).
+#'
+#' @keywords internal
+compute_pareto_frontier <- function(result_dt, effect_log_scale = FALSE) {
+  if (!data.table::is.data.table(result_dt) || nrow(result_dt) == 0L) {
+    return(if (data.table::is.data.table(result_dt)) result_dt[integer(0), ]
+           else data.table::data.table())
+  }
+
+  is_dominated <- pareto_dominated_flags(result_dt,
+                                         effect_log_scale = effect_log_scale)
+  frontier <- result_dt[!is_dominated, ]
+  if (nrow(frontier) > 1L) data.table::setorder(frontier, -hr)
+  frontier
+}
+
+#' Pareto Dominance Flags
+#'
+#' Internal helper.  For each row of \code{result_dt}, returns
+#' \code{TRUE} if the row is dominated in (\code{hr}, \code{N}) space
+#' (both maximized) by another row, and \code{FALSE} otherwise.  Rows
+#' with \code{NA} \code{hr} or \code{N} are flagged as dominated.
+#'
+#' Used by both \code{compute_pareto_frontier()} (which filters by
+#' the negation of this vector) and the \code{selection_rule = "pareto"}
+#' branches of \code{sort_subgroups()} / \code{sort_subgroups_preview()}
+#' (which use it as an inclusion indicator).
+#'
+#' @param result_dt Data.table of candidate subgroups with columns
+#'   \code{hr} and \code{N}.
+#' @param effect_log_scale Logical.  If \code{TRUE}, \code{hr} is
+#'   exponentiated before comparison.
+#'
+#' @return Logical vector of length \code{nrow(result_dt)}.
+#' @keywords internal
+
+pareto_dominated_flags <- function(result_dt, effect_log_scale = FALSE) {
+  if (!data.table::is.data.table(result_dt) || nrow(result_dt) == 0L) {
+    return(logical(0))
+  }
+  hr_vec <- as.numeric(result_dt$hr)
+  if (isTRUE(effect_log_scale)) hr_vec <- exp(hr_vec)
+  N_vec <- as.numeric(result_dt$N)
+  .pareto_dominated_xy(hr_vec, N_vec)
+}
+
+# Vector-based core: O(n^2) dominance loop on two maximized vectors.
+# Used by pareto_dominated_flags() (post-consistency, hr / N) and
+# .compute_inclusion_band() (which both consistency stages call,
+# passing the appropriate effect / size vectors regardless of the
+# data.table column-name convention).
+
+.pareto_dominated_xy <- function(x_vec, y_vec) {
+  stopifnot(length(x_vec) == length(y_vec))
+  n <- length(x_vec)
+  is_dominated <- logical(n)
+  if (n == 0L) return(is_dominated)
+  for (i in seq_len(n)) {
+    if (is.na(x_vec[i]) || is.na(y_vec[i])) {
+      is_dominated[i] <- TRUE
+      next
+    }
+    for (j in seq_len(n)) {
+      if (i == j) next
+      if (is.na(x_vec[j]) || is.na(y_vec[j])) next
+      if (x_vec[j] >= x_vec[i] && y_vec[j] >= y_vec[i] &&
+          (x_vec[j] >  x_vec[i] || y_vec[j] >  y_vec[i])) {
+        is_dominated[i] <- TRUE
+        break
+      }
+    }
+  }
+  is_dominated
 }
 
 #' Extract Subgroup Information
@@ -392,8 +965,6 @@ plot_subgroup <- function(df.sub, df.subC, by.risk, confs_labels, this.1_label, 
     exp.lab <- "treat"
     dfcount <- weightedsurv::df_counting(df.sub, tte.name = tte.name, event.name = event.name, treat.name = treat.name, arms = c(exp.lab, con.lab), by.risk = by.risk)
     dfcountC <- weightedsurv::df_counting(df.subC, tte.name = tte.name, event.name = event.name, treat.name = treat.name, arms = c(exp.lab, con.lab), by.risk = by.risk)
-    oldpar <- par(no.readonly = TRUE)
-    on.exit(par(oldpar), add = TRUE)
     par(mfrow = c(1, 2))
     weightedsurv::plot_weighted_km(dfcount, conf.int = TRUE, show.logrank = TRUE, put.legend.lr = "topleft", ymax = 1.05, xmed.fraction = 0.65)
     weightedsurv::plot_weighted_km(dfcountC, conf.int = TRUE, show.logrank = TRUE, put.legend.lr = "topleft", ymax = 1.05, xmed.fraction = 0.65)
@@ -418,23 +989,62 @@ plot_subgroup <- function(df.sub, df.subC, by.risk, confs_labels, this.1_label, 
 #' @param plot.sg Logical. Plot subgroup curves.
 #' @param by.risk Numeric. Risk interval for plotting.
 #' @param confs_labels Character vector. Human-readable labels.
+#' @param is_glm Logical. If \code{TRUE}, suppresses Kaplan-Meier survival
+#'   plots (which are not meaningful for GLM outcomes).  Default \code{FALSE}.
+#' @param selection_rule Character. Rule defining the candidate
+#'   inclusion set for \code{"hrMaxSG"} / \code{"hrMinSG"}.  See
+#'   \code{\link{sort_subgroups}}.  Default \code{"neighborhood"}.
+#' @param effect_neighborhood Numeric in \code{[0, 1)}.  Relative
+#'   tolerance for \code{"hrMaxSG"}/\code{"hrMinSG"} selection.  See
+#'   \code{\link{sort_subgroups}}.  Default \code{0.10}.
+#' @param effect_log_scale Logical.  If \code{TRUE}, the \code{hr}
+#'   column stores log-scale values and is exponentiated for the
+#'   neighborhood test and for Pareto-frontier dominance.  Default
+#'   \code{FALSE}.
 #'
-#' @keywords internal
-#' @return List with results, subgroup definition, labels, flags, and group id.
+#' @return List with elements:
+#'   \describe{
+#'     \item{result}{Sorted candidate table (top row = selected subgroup).}
+#'     \item{pareto_frontier}{Data.table of non-dominated candidates on
+#'       (effect, N), both maximized.  See
+#'       \code{\link{compute_pareto_frontier}}.  May be \code{NULL} if
+#'       computation failed.}
+#'     \item{sg.harm}{Factor-level cut names defining the selected subgroup.}
+#'     \item{sg.harm_label}{Human-readable subgroup labels.}
+#'     \item{df_flag}{Per-subject treatment-recommendation flags.}
+#'     \item{sg.harm.id}{Per-subject subgroup-membership indicator.}
+#'   }
 #'
 #' @importFrom data.table copy
+#' @examples
+#' \dontrun{
+#' # sg_consistency_out is called internally by forestsearch().
+#' # See forestsearch() for the standard entry point.
+#' fs <- forestsearch(gbsg,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+#' fs$grp.consistency$out_sg
+#' }
+#' @export
 sg_consistency_out <- function(df, result_new, sg_focus, index.Z, names.Z,
                                details = FALSE, plot.sg = FALSE,
-                               by.risk = 12, confs_labels) {
+                               by.risk = 12, confs_labels,
+                               is_glm = FALSE,
+                               selection_rule = "neighborhood",
+                               effect_neighborhood = 0.10,
+                               effect_log_scale = FALSE) {
 
-  result_new <- sort_subgroups(result_new, sg_focus)
+  result_new <- sort_subgroups(result_new, sg_focus,
+                               selection_rule      = selection_rule,
+                               effect_neighborhood = effect_neighborhood,
+                               effect_log_scale    = effect_log_scale)
   top_result <- result_new[1, ]
   subgroup_info <- extract_subgroup(df, top_result, index.Z, names.Z, confs_labels)
 
   # === ADD THIS PLOTTING SECTION ===
 
 
-  if (details && plot.sg) {
+  if (details && plot.sg && !is_glm) {
     sg.harm <- subgroup_info$sg.harm
 
     in_harm <- Reduce(`&`, lapply(sg.harm, function(v) df[[v]] == 1L))
@@ -456,8 +1066,19 @@ sg_consistency_out <- function(df, result_new, sg_focus, index.Z, names.Z,
 
   result_out <- data.table::copy(result_new)
 
+  # Pareto frontier on (effect, N), both maximized -- post-hoc diagnostic
+  pareto_frontier <- tryCatch(
+    compute_pareto_frontier(result_out, effect_log_scale = effect_log_scale),
+    error = function(e) {
+      warning("Failed to compute Pareto frontier: ", e$message,
+              call. = FALSE)
+      NULL
+    }
+  )
+
   list(
     result = result_out,
+    pareto_frontier = pareto_frontier,
     sg.harm = subgroup_info$sg.harm,
     sg.harm_label = subgroup_info$sg.harm_label,
     df_flag = subgroup_info$df_flag,
@@ -552,17 +1173,187 @@ remove_redundant_subgroups <- function(found.hrs) {
 #' @param hr.consistency Numeric. Minimum HR threshold for consistency.
 #' @param pconsistency.threshold Numeric. Minimum proportion of splits meeting
 #'   consistency.
-#' @param pconsistency.digits Integer. Rounding digits for consistency proportion.
+#' @param pconsistency.digits Integer. Number of decimal places to which the
+#'   consistency proportion is rounded \strong{before} it is compared with
+#'   \code{pconsistency.threshold}.  The rounded value decides admission and
+#'   is the value the selection sort orders on, so this setting affects which
+#'   subgroups are admitted, not only what is displayed.  At the default of 2,
+#'   a threshold of `p*` admits any candidate whose unrounded proportion is at
+#'   or above the largest 0.01 grid point strictly below `p*` plus half a step
+#'   (0.005) -- so `p* = 0.99` admits from about 0.985.  Raising the setting
+#'   makes admission finer-grained and produces fewer exact ties for the
+#'   selection rule to break.  Under \code{consistency_method = "resample"}
+#'   the proportion is a continuous closed-form quantity, so the rounding is a
+#'   deliberate coarsening rather than a formatting step.
 #' @param maxk Integer. Maximum number of factors in a subgroup.
 #' @param confs_labels Character vector. Labels for confounders.
 #' @param details Logical. Print details during execution.
+#' @param estimator_fn Closure or \code{NULL}. Effect-estimator closure from
+#'   \code{\link{make_effect_estimator}} for GLM outcomes.  Default \code{NULL}
+#'   (uses Cox model).
+#' @param consistency_threshold Numeric or \code{NULL}. Threshold for GLM
+#'   consistency evaluation.  Default \code{NULL} (uses \code{hr.consistency}).
+#' @param adjust_covariates Character vector or \code{NULL}. Additional Cox
+#'   model terms (e.g. \code{"strata(x1)"}) used when scoring survival
+#'   subgroups.  Referenced columns must be present in \code{df}.  Ignored
+#'   on the GLM path.  Default \code{NULL} (unadjusted).
+#' @param consistency_method Character. \code{"split"} (default) or
+#'   \code{"resample"}; see \code{\link{subgroup.consistency}}.  When
+#'   \code{"resample"} yields an unsupported/non-convergent rate the evaluator
+#'   falls back to literal splitting for that subgroup.
+#' @param glm_resample_spec List or \code{NULL}. GLM resampling specification
+#'   threaded from \code{\link{forestsearch}}; see
+#'   \code{\link{subgroup.consistency}}.  \code{NULL} on the survival path.
 #'
-#' @keywords internal
 #' @return Named numeric vector with consistency results, or NULL if criteria
 #'   not met.
 #'
+#' @examples
+#' \dontrun{
+#' # evaluate_subgroup_consistency() is called internally by forestsearch().
+#' # Use forestsearch() as the standard entry point:
+#' fs <- forestsearch(gbsg,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+#' }
+#' Build the consistency evaluation closure in a clean environment
+#'
+#' The parallel consistency search applies a per-candidate closure via
+#' `future_lapply`.  If that closure is defined inside `subgroup.consistency()`,
+#' its environment is the whole enclosing frame, which can hold non-exportable
+#' references (e.g. a screening forest's `externalptr`, or a large precomputed
+#' object); `future` then fails to serialize it to the workers
+#' ("non-exportable reference (externalptr) in ...future.FUN").  These factory
+#' functions are defined at package scope, so the closure they return captures
+#' only the small, exportable arguments passed here -- nothing from the caller's
+#' frame.
+#'
+#' @return A function of one argument `m` (the candidate index).
+#' @keywords internal
+#' @noRd
+.make_eval_subgroup_consistency <- function(index.Z, names.Z, df, found.hrs,
+                                            n.splits, hr.consistency,
+                                            pconsistency.threshold,
+                                            pconsistency.digits, maxk, confs_labels,
+                                            estimator_fn, consistency_threshold,
+                                            adjust_covariates, consistency_method,
+                                            glm_resample_spec) {
+  function(m) {
+    evaluate_subgroup_consistency(
+      m = m, index.Z = index.Z, names.Z = names.Z, df = df,
+      found.hrs = found.hrs, n.splits = n.splits,
+      hr.consistency = hr.consistency,
+      pconsistency.threshold = pconsistency.threshold,
+      pconsistency.digits = pconsistency.digits, maxk = maxk,
+      confs_labels = confs_labels, details = FALSE,
+      estimator_fn = estimator_fn,
+      consistency_threshold = consistency_threshold,
+      adjust_covariates = adjust_covariates,
+      consistency_method = consistency_method,
+      glm_resample_spec = glm_resample_spec
+    )
+  }
+}
+
+#' Two-stage variant of the clean-environment consistency evaluation factory
+#' @keywords internal
+#' @noRd
+.make_eval_consistency_twostage <- function(index.Z, names.Z, df, found.hrs,
+                                            hr.consistency, pconsistency.threshold,
+                                            pconsistency.digits, maxk, confs_labels,
+                                            n.splits.screen, screen.threshold,
+                                            n.splits.max, batch.size, conf.level,
+                                            min.valid.screen, estimator_fn,
+                                            consistency_threshold, adjust_covariates,
+                                            consistency_method, glm_resample_spec) {
+  function(m) {
+    evaluate_consistency_twostage(
+      m = m, index.Z = index.Z, names.Z = names.Z, df = df,
+      found.hrs = found.hrs, hr.consistency = hr.consistency,
+      pconsistency.threshold = pconsistency.threshold,
+      pconsistency.digits = pconsistency.digits, maxk = maxk,
+      confs_labels = confs_labels, details = FALSE,
+      n.splits.screen = n.splits.screen, screen.threshold = screen.threshold,
+      n.splits.max = n.splits.max, batch.size = batch.size,
+      conf.level = conf.level, min.valid.screen = min.valid.screen,
+      estimator_fn = estimator_fn,
+      consistency_threshold = consistency_threshold,
+      adjust_covariates = adjust_covariates,
+      consistency_method = consistency_method,
+      glm_resample_spec = glm_resample_spec
+    )
+  }
+}
+
+#' Evaluate Subgroup Consistency (Single-Stage)
+#'
+#' Evaluates a single candidate subgroup for treatment-effect consistency using
+#' repeated random data splits (the standard, non-two-stage algorithm).  For
+#' each split the subgroup effect is scored and compared against the harm
+#' threshold; the consistency rate is the proportion of splits meeting it.
+#' Called internally by \code{\link{forestsearch}} (via
+#' \code{\link{subgroup.consistency}}); \code{\link{evaluate_consistency_twostage}}
+#' is the screened, early-stopping counterpart used when
+#' \code{use_twostage = TRUE}.
+#'
+#' @param m Integer. Index of subgroup to evaluate.
+#' @param index.Z data.table or matrix. Factor indicators for all subgroups.
+#' @param names.Z Character vector. Names of factor columns.
+#' @param df data.frame. Original data with Y, Event, Treat, id columns.
+#' @param found.hrs data.table. Subgroup hazard ratio results.
+#' @param n.splits Integer. Number of random splits used to evaluate
+#'   consistency.
+#' @param hr.consistency Numeric. `c2`, \strong{an effect threshold} -- the
+#'   minimum effect required in \emph{each} half of a split for that split to
+#'   count as consistent.  \strong{Not} a proportion and \strong{not} the
+#'   consistency rate.  \code{forestsearch()} calls this
+#'   \code{consistency.threshold} / \code{hr.consistency}.
+#' @param pconsistency.threshold Numeric. `p*`, \strong{a proportion} in
+#'   \code{[0, 1]} -- the fraction of splits that must be consistent, where
+#'   one split's consistency is decided by \code{hr.consistency} (`c2`).
+#'   `c2` sets the bar; `p*` counts how often it is met.
+#' @param maxk Integer. Maximum number of factors in a subgroup.
+#' @param confs_labels Character vector. Labels for confounders.
+#' @param details Logical. Print progress details.
+#' @param estimator_fn Closure or \code{NULL}. Effect-estimator closure from
+#'   \code{\link{make_effect_estimator}} for GLM outcomes.  Default \code{NULL}
+#'   (uses Cox model).
+#' @param consistency_threshold Numeric or \code{NULL}. Threshold for GLM
+#'   consistency evaluation.  Default \code{NULL} (uses \code{hr.consistency}).
+#' @param adjust_covariates Character vector or \code{NULL}. Additional Cox
+#'   model terms (e.g. \code{"strata(x1)"}) used when scoring survival
+#'   subgroups.  Referenced columns must be present in \code{df}.  Ignored
+#'   on the GLM path.  Default \code{NULL} (unadjusted).
+#' @param consistency_method Character. \code{"split"} (default) or
+#'   \code{"resample"}; see \code{\link{subgroup.consistency}}.  When
+#'   \code{"resample"} engages it bypasses the split evaluation (the rate is
+#'   computed from a single fit); an unsupported/non-convergent GLM rate falls
+#'   through to the split evaluation.
+#' @param glm_resample_spec List or \code{NULL}. GLM resampling specification
+#'   threaded from \code{\link{forestsearch}}; see
+#'   \code{\link{subgroup.consistency}}.  \code{NULL} on the survival path.
+#' @param skip_consistency Logical. When \code{TRUE}, skip the consistency
+#'   estimation entirely and return the effect-carry result row (effect from
+#'   \code{found.hrs}, \code{Pcons = NA}) without forming the subgroup subset or
+#'   refitting.  Used by the \code{sg_focus = "maxeff"} fast path, which needs
+#'   effects for the argmax but consistency for the selected winner only.
+#'   Default \code{FALSE}.
+#'
+#' @return Named numeric vector with consistency results, or \code{NULL} if the
+#'   subgroup does not meet the criteria.
+#'
+#' @examples
+#' \dontrun{
+#' # evaluate_subgroup_consistency() is called internally by forestsearch().
+#' # Use forestsearch() as the entry point:
+#' fs <- forestsearch(gbsg,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+#' }
 #' @importFrom data.table data.table
 #' @importFrom survival coxph Surv
+#' @inheritParams subgroup.consistency
+#' @export
 evaluate_subgroup_consistency <- function(
     m,
     index.Z,
@@ -575,7 +1366,13 @@ evaluate_subgroup_consistency <- function(
     pconsistency.digits = 2,
     maxk,
     confs_labels,
-    details = FALSE
+    details = FALSE,
+    estimator_fn = NULL,
+    consistency_threshold = NULL,
+    adjust_covariates = NULL,
+    consistency_method = "split",
+    glm_resample_spec = NULL,
+    skip_consistency = FALSE
 ) {
 
   # -------------------------------------------------------------------------
@@ -609,6 +1406,25 @@ evaluate_subgroup_consistency <- function(
   this.m_label <- vapply(this.m, function(q) FS_labels(q, confs_labels), character(1))
 
   # -------------------------------------------------------------------------
+  # SECTION 2b: SKIP CONSISTENCY (Pcons = NA)
+  # -------------------------------------------------------------------------
+  # Effect-carry-only path used by the sg_focus = "maxeff" fast path: the argmax
+  # ranks on effect alone (found.hrs$HR, already computed by the search), so
+  # consistency need not be evaluated per candidate.  Build the result row from
+  # found.hrs with Pcons = NA and skip the subgroup subset + Cox refits below.
+  # The winner is evaluated separately with skip_consistency = FALSE.
+  if (isTRUE(skip_consistency)) {
+    k <- length(this.m)
+    Mnames <- paste("M", seq_len(maxk), sep = ".")
+    mfound <- rep("", maxk)
+    mfound[seq_len(k)] <- this.m_label
+    resultk <- c(NA_real_, found.hrs$HR[m], found.hrs$n[m],
+                 found.hrs$E[m], found.hrs$grp[m], m, k, mfound)
+    names(resultk) <- c("Pcons", "hr", "N", "E", "g", "m", "K", Mnames)
+    return(resultk)
+  }
+
+  # -------------------------------------------------------------------------
   # SECTION 3: IDENTIFY SUBGROUP MEMBERS
   # -------------------------------------------------------------------------
 
@@ -630,49 +1446,80 @@ evaluate_subgroup_consistency <- function(
   }
 
   # -------------------------------------------------------------------------
-  # SECTION 4: INITIALIZE COX MODEL
+  # SECTION 4: INITIALIZE EFFECT ESTIMATOR
   # -------------------------------------------------------------------------
 
-  cox_init <- tryCatch({
-    fit0 <- survival::coxph(
-      survival::Surv(Y, Event) ~ Treat,
-      data = df.x,
-      model = FALSE,
-      x = FALSE,
-      y = FALSE
-    )
-    fit0$coefficients[1]
-  }, error = function(e) 0)
+  if (!is.null(estimator_fn)) {
+    # GLM path: closure is pre-built; no Cox init needed
+    cox_init <- NULL
+  } else {
+    # Survival path: fit initial Cox model for warm-start
+    cox_init <- tryCatch({
+      fit0 <- survival::coxph(
+        survival::Surv(Y, Event) ~ Treat,
+        data = df.x,
+        model = FALSE,
+        x = FALSE,
+        y = FALSE
+      )
+      fit0$coefficients[1]
+    }, error = function(e) 0)
+  }
 
   # -------------------------------------------------------------------------
   # SECTION 5: RUN CONSISTENCY SPLITS
   # -------------------------------------------------------------------------
 
-  flag.consistency <- numeric(n.splits)
-
-  for (i in seq_len(n.splits)) {
-    flag.consistency[i] <- run_single_consistency_split(df.x, N.x, hr.consistency, cox_init)
-  }
-
-  # -------------------------------------------------------------------------
-  # SECTION 6: CALCULATE CONSISTENCY PROPORTION
-  # -------------------------------------------------------------------------
-
-  n_valid <- sum(!is.na(flag.consistency))
-
-  if (n_valid < 10) {
-    if (details) cat("Subgroup ", m, ": too few valid splits (", n_valid, ")\n", sep = "")
-    return(NULL)
-  }
-
-  p.consistency <- tryCatch({
-    round(mean(flag.consistency, na.rm = TRUE), pconsistency.digits)
-  }, error = function(e) {
-    return(NA_real_)
-  })
-
-  if (is.na(p.consistency)) {
-    return(NULL)
+  if (identical(consistency_method, "resample") && is.null(estimator_fn)) {
+    # Survival resampling approximation: one subgroup fit, no repeated splits.
+    rr <- consistency_resample(
+      df.x, hr.consistency = hr.consistency, method = "closed",
+      adjust_covariates = adjust_covariates, cox_init = cox_init
+    )
+    p.consistency <- round(rr$rate_closed, pconsistency.digits)
+    if (is.na(p.consistency)) {
+      # Inestimable closed form (e.g. non-convergent fit on a candidate):
+      # fall back to literal splitting rather than dropping the subgroup.
+      # Mirrors the GLM path so Cox and GLM behave identically.
+      p.consistency <- .consistency_via_splits(
+        df.x, N.x, n.splits, hr.consistency, cox_init, estimator_fn,
+        consistency_threshold, adjust_covariates, pconsistency.digits,
+        m, details)
+      if (is.na(p.consistency)) return(NULL)
+    }
+  } else if (identical(consistency_method, "resample") &&
+             !is.null(estimator_fn) && !is.null(glm_resample_spec) &&
+             .glm_resample_supported(glm_resample_spec)) {
+    # GLM resampling approximation. comparison_threshold is already on the
+    # comparison scale (log for ratio, identity for identity), matching what
+    # the splitter compares against, so no further transform is applied.
+    rr <- consistency_resample(
+      df.x, method = "closed",
+      outcome_type         = glm_resample_spec$outcome_type,
+      effect_measure       = glm_resample_spec$effect_measure,
+      comparison_threshold = glm_resample_spec$comparison_threshold,
+      treat.name           = glm_resample_spec$treat.name,
+      outcome.name         = glm_resample_spec$outcome.name,
+      offset.name          = glm_resample_spec$offset.name,
+      adjust_covariates    = glm_resample_spec$adjust_covariates,
+      adverse_outcome      = glm_resample_spec$adverse_outcome
+    )
+    p.consistency <- round(rr$rate_closed, pconsistency.digits)
+    if (is.na(p.consistency)) {
+      # Unsupported configuration (e.g. non-convergent identity-link binomial):
+      # fall back to literal splitting rather than dropping the subgroup.
+      p.consistency <- .consistency_via_splits(
+        df.x, N.x, n.splits, hr.consistency, cox_init, estimator_fn,
+        consistency_threshold, adjust_covariates, pconsistency.digits,
+        m, details)
+      if (is.na(p.consistency)) return(NULL)
+    }
+  } else {
+    p.consistency <- .consistency_via_splits(
+      df.x, N.x, n.splits, hr.consistency, cox_init, estimator_fn,
+      consistency_threshold, adjust_covariates, pconsistency.digits,
+      m, details)
+    if (is.na(p.consistency)) return(NULL)
   }
 
   # -------------------------------------------------------------------------
@@ -736,9 +1583,15 @@ evaluate_subgroup_consistency <- function(
 #' @param names.Z Character vector. Names of factor columns.
 #' @param df data.frame. Original data with Y, Event, Treat, id columns.
 #' @param found.hrs data.table. Subgroup hazard ratio results.
-#' @param hr.consistency Numeric. Minimum HR threshold for consistency.
-#' @param pconsistency.threshold Numeric. Final consistency threshold.
-#' @param pconsistency.digits Integer. Rounding digits for output.
+#' @param hr.consistency Numeric. `c2`, \strong{an effect threshold} -- the
+#'   minimum effect required in \emph{each} half of a split for that split to
+#'   count as consistent.  \strong{Not} a proportion and \strong{not} the
+#'   consistency rate.  \code{forestsearch()} calls this
+#'   \code{consistency.threshold} / \code{hr.consistency}.
+#' @param pconsistency.threshold Numeric. `p*`, \strong{a proportion} in
+#'   \code{[0, 1]} -- the fraction of splits that must be consistent, where
+#'   one split's consistency is decided by \code{hr.consistency} (`c2`).
+#'   `c2` sets the bar; `p*` counts how often it is met.
 #' @param maxk Integer. Maximum number of factors in a subgroup.
 #' @param confs_labels Character vector. Labels for confounders.
 #' @param details Logical. Print progress details.
@@ -749,12 +1602,39 @@ evaluate_subgroup_consistency <- function(
 #' @param batch.size Integer. Splits per batch in Stage 2 (default 20).
 #' @param conf.level Numeric. Confidence level for early stopping (default 0.95).
 #' @param min.valid.screen Integer. Minimum valid splits in Stage 1 (default 10).
+#' @param estimator_fn Closure or \code{NULL}. Effect-estimator closure from
+#'   \code{\link{make_effect_estimator}} for GLM outcomes.  Default \code{NULL}
+#'   (uses Cox model).
+#' @param consistency_threshold Numeric or \code{NULL}. Threshold for GLM
+#'   consistency evaluation.  Default \code{NULL} (uses \code{hr.consistency}).
+#' @param adjust_covariates Character vector or \code{NULL}. Additional Cox
+#'   model terms (e.g. \code{"strata(x1)"}) used when scoring survival
+#'   subgroups.  Referenced columns must be present in \code{df}.  Ignored
+#'   on the GLM path.  Default \code{NULL} (unadjusted).
+#' @param consistency_method Character. \code{"split"} (default) or
+#'   \code{"resample"}; see \code{\link{subgroup.consistency}}.  When
+#'   \code{"resample"} engages it bypasses the two-stage split screening (the
+#'   rate is computed from a single fit); an unsupported/non-convergent GLM
+#'   rate falls through to the Stage 1/2 splitting.
+#' @param glm_resample_spec List or \code{NULL}. GLM resampling specification
+#'   threaded from \code{\link{forestsearch}}; see
+#'   \code{\link{subgroup.consistency}}.  \code{NULL} on the survival path.
 #'
-#' @keywords internal
 #' @return Named numeric vector with consistency results, or NULL if not met.
 #'
+#' @examples
+#' \dontrun{
+#' # evaluate_consistency_twostage() is called internally by forestsearch()
+#' # when use_twostage = TRUE. Use forestsearch() as the entry point:
+#' fs <- forestsearch(gbsg,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status",
+#'   use_twostage = TRUE)
+#' }
 #' @importFrom data.table data.table as.data.table
 #' @importFrom survival coxph Surv
+#' @inheritParams subgroup.consistency
+#' @export
 evaluate_consistency_twostage <- function(
     m,
     index.Z,
@@ -772,7 +1652,12 @@ evaluate_consistency_twostage <- function(
     n.splits.max = 400,
     batch.size = 20,
     conf.level = 0.95,
-    min.valid.screen = 10
+    min.valid.screen = 10,
+    estimator_fn = NULL,
+    consistency_threshold = NULL,
+    adjust_covariates = NULL,
+    consistency_method = "split",
+    glm_resample_spec = NULL
 ) {
 
   # ===========================================================================
@@ -802,25 +1687,32 @@ evaluate_consistency_twostage <- function(
 
   .get_split_hr_fast <- function(df_split, cox_initial = NULL) {
     if (nrow(df_split) < 2 || sum(df_split$Event) < 2) return(NA_real_)
+    adj <- .fs_adjust_terms(adjust_covariates)
+    if (length(adj) > 0L) {
+      fmla <- stats::reformulate(c("Treat", adj),
+                                 response = "survival::Surv(Y, Event)")
+    } else {
+      fmla <- survival::Surv(Y, Event) ~ Treat
+    }
+    fit_args <- list(
+      formula = fmla, data = df_split,
+      robust = FALSE, model = FALSE, x = FALSE, y = FALSE
+    )
+    # `init = NULL` is an error in coxph; only pass the scalar warm-start
+    # for the single-coefficient treatment-only model.
+    if (length(adj) == 0L) fit_args$init <- cox_initial
     fit <- tryCatch(
-      suppressWarnings(
-        survival::coxph(
-          survival::Surv(Y, Event) ~ Treat,
-          data = df_split,
-          init = cox_initial,
-          robust = FALSE,
-          model = FALSE,
-          x = FALSE,
-          y = FALSE
-        )
-      ),
+      suppressWarnings(do.call(survival::coxph, fit_args)),
       error = function(e) NULL
     )
     if (is.null(fit)) return(NA_real_)
-    return(exp(fit$coefficients[1]))
+    cf <- fit$coefficients
+    beta <- if ("Treat" %in% names(cf)) cf[["Treat"]] else cf[1]
+    return(exp(beta))
   }
 
-  .run_single_consistency_split <- function(df.x, N.x, hr.cons, cox_init) {
+  .run_single_consistency_split <- function(df.x, N.x, hr.cons, cox_init,
+                                            est_fn = NULL, cons_thresh = NULL) {
     in.split1 <- tryCatch({
       sample(c(TRUE, FALSE), N.x, replace = TRUE, prob = c(0.5, 0.5))
     }, error = function(e) NULL)
@@ -831,6 +1723,27 @@ evaluate_consistency_twostage <- function(
     df.x.split2 <- df.x[df.x$insplit1 == FALSE, ]
 
     if (nrow(df.x.split1) < 5 || nrow(df.x.split2) < 5) return(NA_real_)
+
+    # GLM path
+    if (!is.null(est_fn) && !is.null(cons_thresh)) {
+      for (half in list(df.x.split1, df.x.split2)) {
+        treat_col <- intersect(c("Treat", "treat"), names(half))
+        if (length(treat_col) > 0L) {
+          tc <- treat_col[1L]
+          if (sum(half[[tc]] == 1L) < 3L || sum(half[[tc]] == 0L) < 3L) {
+            return(NA_real_)
+          }
+        }
+      }
+      res1 <- est_fn(df.x.split1)
+      res2 <- est_fn(df.x.split2)
+      if (is.na(res1$estimate) || is.na(res2$estimate)) return(NA_real_)
+      return(as.numeric(
+        res1$estimate >= cons_thresh && res2$estimate >= cons_thresh
+      ))
+    }
+
+    # Survival path (existing)
     if (sum(df.x.split1$Event) < 2 || sum(df.x.split2$Event) < 2) return(NA_real_)
 
     hr.split1 <- .get_split_hr_fast(df_split = df.x.split1, cox_initial = cox_init)
@@ -905,19 +1818,83 @@ evaluate_consistency_twostage <- function(
   }
 
   # ---------------------------------------------------------------------------
-  # Initialize Cox model
+  # Initialize effect estimator
   # ---------------------------------------------------------------------------
 
-  cox_init <- tryCatch({
-    fit0 <- survival::coxph(
-      survival::Surv(Y, Event) ~ Treat,
-      data = df.x,
-      model = FALSE,
-      x = FALSE,
-      y = FALSE
-    )
-    fit0$coefficients[1]
-  }, error = function(e) 0)
+  if (!is.null(estimator_fn)) {
+    cox_init <- NULL
+  } else {
+    cox_init <- tryCatch({
+      fit0 <- survival::coxph(
+        survival::Surv(Y, Event) ~ Treat,
+        data = df.x,
+        model = FALSE,
+        x = FALSE,
+        y = FALSE
+      )
+      fit0$coefficients[1]
+    }, error = function(e) 0)
+  }
+
+  # ---------------------------------------------------------------------------
+  # Resample short-circuit: the two-stage split machinery exists only to limit
+  # the number of refits via early stopping; the resampling approximation
+  # returns the rate from a single fit, so Stage 1/2 are bypassed entirely.
+  # Survival path always; GLM path when a resample spec is supplied for a
+  # supported measure. An unsupported/non-convergent GLM configuration falls
+  # through to the Stage 1/2 splitting below.
+  # ---------------------------------------------------------------------------
+  cox_resample <- identical(consistency_method, "resample") && is.null(estimator_fn)
+  glm_resample <- identical(consistency_method, "resample") &&
+                  !is.null(estimator_fn) && !is.null(glm_resample_spec) &&
+                  .glm_resample_supported(glm_resample_spec)
+
+  if (cox_resample || glm_resample) {
+    rr <- if (cox_resample) {
+      consistency_resample(
+        df.x, hr.consistency = hr.consistency, method = "closed",
+        adjust_covariates = adjust_covariates, cox_init = cox_init)
+    } else {
+      consistency_resample(
+        df.x, method = "closed",
+        outcome_type         = glm_resample_spec$outcome_type,
+        effect_measure       = glm_resample_spec$effect_measure,
+        comparison_threshold = glm_resample_spec$comparison_threshold,
+        treat.name           = glm_resample_spec$treat.name,
+        outcome.name         = glm_resample_spec$outcome.name,
+        offset.name          = glm_resample_spec$offset.name,
+        adjust_covariates    = glm_resample_spec$adjust_covariates,
+        adverse_outcome      = glm_resample_spec$adverse_outcome)
+    }
+    p.consistency <- round(rr$rate_closed, pconsistency.digits)
+
+    # Inestimable closed-form rate (NA) for EITHER family -> fall through to the
+    # Stage 1/2 splitting below rather than dropping the candidate.  Cox and GLM
+    # behave identically here.
+    resample_unsupported <- is.na(p.consistency)
+    if (!resample_unsupported) {
+      if (p.consistency < pconsistency.threshold) {
+        if (details) {
+          cat("Subgroup ", m, ": resample Pcons=", p.consistency,
+              " (threshold ", pconsistency.threshold, ")\n", sep = "")
+        }
+        return(NULL)
+      }
+      k <- length(this.m)
+      covsm <- rep("M", maxk)
+      mindex <- seq_len(maxk)
+      Mnames <- paste(covsm, mindex, sep = ".")
+      mfound <- matrix(rep("", maxk))
+      mfound[seq_len(k)] <- this.m_label
+      resultk <- c(p.consistency, found.hrs$HR[m], found.hrs$n[m],
+                   found.hrs$E[m], found.hrs$grp[m], m, k, mfound)
+      names(resultk) <- c("Pcons", "hr", "N", "E", "g", "m", "K", Mnames)
+      if (details) {
+        cat("Subgroup ", m, ": PASSED via resample (Pcons=", p.consistency, ")\n", sep = "")
+      }
+      return(resultk)
+    }
+  }
 
   # ---------------------------------------------------------------------------
   # Stage 1: Quick screening
@@ -925,7 +1902,10 @@ evaluate_consistency_twostage <- function(
 
   stage1_flags <- numeric(n.splits.screen)
   for (i in seq_len(n.splits.screen)) {
-    stage1_flags[i] <- .run_single_consistency_split(df.x, N.x, hr.consistency, cox_init)
+    stage1_flags[i] <- .run_single_consistency_split(
+      df.x, N.x, hr.consistency, cox_init,
+      est_fn = estimator_fn, cons_thresh = consistency_threshold
+    )
   }
 
   n_valid_stage1 <- sum(!is.na(stage1_flags))
@@ -985,7 +1965,10 @@ evaluate_consistency_twostage <- function(
 
     batch_flags <- numeric(batch.size)
     for (i in seq_len(batch.size)) {
-      batch_flags[i] <- .run_single_consistency_split(df.x, N.x, hr.consistency, cox_init)
+      batch_flags[i] <- .run_single_consistency_split(
+        df.x, N.x, hr.consistency, cox_init,
+        est_fn = estimator_fn, cons_thresh = consistency_threshold
+      )
     }
 
     n_batch_valid <- sum(!is.na(batch_flags))
@@ -1057,4 +2040,50 @@ evaluate_consistency_twostage <- function(
   }
 
   return(resultk)
+}
+
+#' Collapse identical-membership candidates for sg_focus = "maxeff"
+#'
+#' Two candidate cut-sets can define the SAME subject-level subgroup -- e.g.
+#' \code{{er <= 0}} and \code{{er <= 0} & {er <= 10}} when \code{er <= 0}
+#' implies \code{er <= 10}.  For the unconditional argmax these are exact
+#' duplicates; evaluating both wastes compute and lets the \code{(-hr, K)} order
+#' break a tie on cut count.  This keeps ONE representative per membership: the
+#' fewest cuts (smallest \code{K}), ties broken by the lexicographically
+#' smallest selected-column indices (a deterministic "first index").  No
+#' distinct subgroup is dropped -- a collapsed encoding always shares its
+#' membership with the retained representative.
+#'
+#' @param found.hrs data.table/data.frame of candidates; the \code{names.Z}
+#'   columns are 0/1 selection indicators.
+#' @param df Data frame carrying the \code{names.Z} cut columns (subject rows).
+#' @param names.Z Character vector of cut-indicator column names.
+#' @return \code{found.hrs} with duplicate-membership rows removed, original
+#'   row order preserved.
+#' @keywords internal
+#' @noRd
+.maxeff_membership_dedup <- function(found.hrs, df, names.Z) {
+  fh <- as.data.frame(found.hrs)
+  if (nrow(fh) <= 1L) return(found.hrs)
+
+  Zmat <- as.matrix(df[, names.Z, drop = FALSE]);  storage.mode(Zmat) <- "double"
+  Smat <- as.matrix(fh[, names.Z, drop = FALSE]);  storage.mode(Smat) <- "double"
+  n_subj <- nrow(Zmat)
+
+  keys <- character(nrow(fh))   # subject-membership key
+  ktie <- character(nrow(fh))   # deterministic tiebreak: sorted selected indices
+  Kvec <- integer(nrow(fh))
+  for (r in seq_len(nrow(fh))) {
+    sel <- which(Smat[r, ] == 1)
+    Kvec[r] <- length(sel)
+    memb <- if (length(sel) == 0L) rep(TRUE, n_subj)
+            else rowSums(Zmat[, sel, drop = FALSE]) == length(sel)
+    keys[r] <- paste0(which(memb), collapse = ",")
+    ktie[r] <- paste(sprintf("%05d", sort(sel)), collapse = ".")
+  }
+
+  # Order by K asc, then first-index; keep the first row seen per membership.
+  ord       <- order(Kvec, ktie)
+  keep_rows <- ord[!duplicated(keys[ord])]
+  found.hrs[sort(keep_rows), ]
 }

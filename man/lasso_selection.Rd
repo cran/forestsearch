@@ -9,7 +9,9 @@ lasso_selection(
   confounders.name,
   outcome.name,
   event.name,
-  seedit = 8316951
+  seedit = 8316951,
+  outcome_type = "survival",
+  offset.name = NULL
 )
 }
 \arguments{
@@ -22,6 +24,12 @@ lasso_selection(
 \item{event.name}{Character. Name of event indicator variable.}
 
 \item{seedit}{Integer. Random seed.}
+
+\item{outcome_type}{Character. One of \code{"survival"} (default),
+\code{"binary"}, \code{"continuous"}, or \code{"count"}.}
+
+\item{offset.name}{Character or \code{NULL}. Name of the follow-up time
+column for rate-based measures (IRR, IRD).}
 }
 \value{
 List with selected, omitted variables, coefficients, lambda, and fits.
@@ -29,4 +37,13 @@ List with selected, omitted variables, coefficients, lambda, and fits.
 \description{
 Performs LASSO variable selection using Cox regression.
 }
-\keyword{internal}
+\examples{
+\donttest{
+library(survival)
+df <- survival::gbsg
+df$grade3 <- as.integer(df$grade == "3")
+lasso_selection(df,
+  confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+  outcome.name = "rfstime", event.name = "status")
+}
+}

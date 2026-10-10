@@ -45,6 +45,8 @@ utils::globalVariables(c(
   "H_biasadj_2",
   "Hc_biasadj_1",
   "Hc_biasadj_2",
+  "grf_cuts_b",
+  "grf_cut",
 
 # ============================================================================
 # Subgroup identification
@@ -207,7 +209,7 @@ utils::globalVariables(c(
 
 # ============================================================================
 # Operating characteristics / simulation analysis
-# (from oc_analyses_gbsg_refactored.R, simulation_tables.R)
+# (from oc_analyses.R, simulation_tables.R)
 # ============================================================================
   "any.H",
   "ppv", "npv", "sens", "spec",
@@ -219,6 +221,7 @@ utils::globalVariables(c(
   "sim_id",
   "analysis",
   "trimmed",
+  ".trimmed",
   "aa",
   "sg_hat",
   "ahr.H.true", "ahr.Hc.true",
@@ -248,14 +251,19 @@ utils::globalVariables(c(
   "sg_label", "count", "bar_label",
 
 # ============================================================================
-# gg_forest() — ggplot2 aes() column names
+# gg_forest() -- ggplot2 aes() column names
 # ============================================================================
   "subgroup",   # y aesthetic in label and CI panels
   "row_col",    # colour/fill aesthetic mapped from data frame column
   "value",      # label aesthetic in annotation panels
   "col",        # colour aesthetic in label panel
   "lo",         # xend of CI segment
-  "hi"          # x of CI upper bound (also used in geom_point)
+  "hi",         # x of CI upper bound (also used in geom_point)
+
+# ============================================================================
+# fs_plot_bias_coverage() -- ggplot2 aes() column names
+# ============================================================================
+  "b", "r", "cell", "estimator", "cov", "cov1", "cov2", "obs", "ref"
 ))
 
 

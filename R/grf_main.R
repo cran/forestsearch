@@ -22,11 +22,43 @@
 #'   depth that identified the selected subgroup meeting `dmin.grf`. If FALSE (default),
 
 #'   returns all cuts from all fitted trees (depths 1 through `maxdepth`).
+#' @param tune_grf Logical. If \code{TRUE}, enables cross-validated
+#'   hyperparameter tuning via \code{tune.parameters = "all"} in the
+#'   causal survival forest. Default \code{FALSE}.
+#' @param grf_selection Character, one of \code{"tree"} (default) or
+#'   \code{"frontier"}. \code{"tree"} uses the GRF policy tree (standard
+#'   behavior). \code{"frontier"} is an \strong{experimental} alternative that,
+#'   on the same doubly-robust scores, enumerates single-covariate thresholds
+#'   (and depth-2 covariate-pair conjunctions when \code{maxdepth >= 2}), takes
+#'   the Pareto frontier of (harm-effect, size), and selects one subgroup under
+#'   \code{frontier_rule}. The selected subgroup is always a single conjunction.
+#'   In small benchmarks the policy tree matched or beat the frontier on harm
+#'   recovery, so \code{"frontier"} is provided for comparison and exploration,
+#'   not as a recommended default.
+#' @param frontier_rule Character, one of \code{"effMaxSG"} (default),
+#'   \code{"eff"}, \code{"maxSG"}, \code{"minSG"}, or \code{"effMinSG"}; the rule
+#'   applied to the frontier when \code{grf_selection = "frontier"}. Semantics
+#'   match \code{dina_subgroup()}'s \code{sg_focus}: \code{"eff"} takes the
+#'   maximum harm-effect candidate; \code{"maxSG"}/\code{"minSG"} the
+#'   largest/smallest eligible candidate (effect >= \code{dmin.grf});
+#'   \code{"effMaxSG"}/\code{"effMinSG"} the largest/smallest candidate within
+#'   \code{effect_neighborhood} (relative) of the max harm-effect.
+#' @param selection_rule Character, one of \code{"neighborhood"} (default),
+#'   \code{"pareto"}, \code{"both"}; the inclusion band for the
+#'   \code{eff*SG} frontier rules, matching \code{forestsearch()} and
+#'   \code{dina_subgroup()}.  Inert for the other rules.
+#' @param effect_neighborhood Numeric in (0, 1); relative neighborhood for the
+#'   \code{"effMaxSG"} / \code{"effMinSG"} rules. Default 0.10. Used only when
+#'   \code{grf_selection = "frontier"}.
 #'
 #' @return A list with GRF results, including:
 #'   \item{data}{Original data with added treatment recommendation flags}
 #'   \item{grf.gsub}{Selected subgroup information}
-#'   \item{sg.harm.id}{Expression defining the identified subgroup}
+#'   \item{sg.harm.id}{\strong{Character vector of cut expressions}
+#'     defining the identified subgroup (length = depth of the selected
+#'     policy tree), or \code{NULL} if no subgroup was found.  \strong{Not}
+#'     a per-subject membership indicator; see the \emph{Field naming
+#'     collision} section below.}
 #'   \item{tree.cuts}{Cut expressions - either all cuts from all trees (if
 #'     `return_selected_cuts_only = FALSE`) or only cuts from the selected tree
 #'     depth (if `return_selected_cuts_only = TRUE`)}
@@ -37,6 +69,31 @@
 #'   \item{selected_depth}{Depth of the tree that identified the subgroup (when found)}
 #'   \item{return_selected_cuts_only}{Logical indicating which cut extraction mode was used}
 #'   Additional tree-specific cuts and objects (tree1, tree2, tree3) based on maxdepth
+#'
+#' @section Field naming collision with forestsearch / subgroup.consistency:
+#' The field name \code{sg.harm.id} has \strong{different semantics} on
+#' this object versus on the \code{grp.consistency} list returned by
+#' \code{\link{subgroup.consistency}} (and nested inside the
+#' \code{\link{forestsearch}} result):
+#'
+#' \tabular{lll}{
+#'   \strong{Object} \tab \strong{\code{sg.harm.id} contains} \tab \strong{Length / type} \cr
+#'   \code{grf.subg.harm.survival()} result (this function) \tab character vector of cut expressions \tab character, length = depth of selected tree \cr
+#'   \code{subgroup.consistency()} result \tab per-subject 0/1 membership indicator \tab integer, length \code{nrow(data)} \cr
+#' }
+#'
+#' \strong{Practical consequence.}  On this object, pasting
+#' \code{paste(obj$sg.harm.id, collapse = " & ")} correctly renders
+#' the identified subgroup.  On a \code{grp.consistency} list the same
+#' expression silently concatenates a long 0/1 indicator and produces
+#' output like \code{"0 & 0 & 1 & 0 & ..."}.  When writing code that
+#' must handle both object types, dispatch on class first, or use the
+#' top-level \code{sg.harm} field that the \code{\link{forestsearch}}
+#' result exposes.
+#'
+#' This naming collision is a documented CRAN-stable API for v0.1.x
+#' and v0.2.x; it is expected to be resolved via a deprecation cycle
+#' in a future minor release.
 #'
 #' @details
 #' The `return_selected_cuts_only` parameter controls which cuts are returned:
@@ -53,6 +110,38 @@
 #'
 #' When `return_selected_cuts_only = TRUE` and no subgroup meets the criteria,
 #' `tree.cuts` will be empty (character(0)).
+#'
+#' @examples
+#' \dontrun{
+#' # Return all cuts (default behavior)
+#' result_all <- grf.subg.harm.survival(
+#'   data = trial_data,
+#'   confounders.name = c("age", "biomarker", "region"),
+#'   outcome.name = "tte",
+#'   event.name = "event",
+#'   id.name = "id",
+#'   treat.name = "treat",
+#'   dmin.grf = 0.1,
+#'   maxdepth = 2
+#' )
+#' result_all$tree.cuts
+#' # Returns cuts from both depth 1 and depth 2 trees
+#'
+#' # Return only cuts from the selected tree
+#' result_selected <- grf.subg.harm.survival(
+#'   data = trial_data,
+#'   confounders.name = c("age", "biomarker", "region"),
+#'   outcome.name = "tte",
+#'   event.name = "event",
+#'   id.name = "id",
+#'   treat.name = "treat",
+#'   dmin.grf = 0.1,
+#'   maxdepth = 2,
+#'   return_selected_cuts_only = TRUE
+#' )
+#' result_selected$tree.cuts
+#' # Returns cuts only from the depth that identified the winning subgroup
+#' }
 #'
 #' @importFrom grf causal_survival_forest
 #' @importFrom policytree double_robust_scores policy_tree
@@ -73,7 +162,18 @@ grf.subg.harm.survival <- function(data,
                                    sg.criterion = "mDiff",
                                    maxdepth = 2,
                                    seedit = 8316951,
-                                   return_selected_cuts_only = FALSE) {
+                                   return_selected_cuts_only = FALSE,
+                                   tune_grf = FALSE,
+                                   grf_selection = c("tree", "frontier"),
+                                   frontier_rule = c("effMaxSG", "eff", "maxSG",
+                                                     "minSG", "effMinSG"),
+                                   effect_neighborhood = 0.10,
+                                   selection_rule = c("neighborhood", "pareto",
+                                                      "both")) {
+
+  grf_selection <- match.arg(grf_selection)
+  frontier_rule <- match.arg(frontier_rule)
+  selection_rule <- match.arg(selection_rule)
 
   # ===========================================================================
   # SECTION: INPUT VALIDATION
@@ -111,6 +211,11 @@ grf.subg.harm.survival <- function(data,
 
   # Add return_selected_cuts_only to config for downstream functions
   config$return_selected_cuts_only <- return_selected_cuts_only
+  # Frontier-mode settings (selection = "frontier"); inert for the tree path.
+  config$selection           <- grf_selection
+  config$frontier_rule       <- frontier_rule
+  config$effect_neighborhood <- effect_neighborhood
+  config$selection_rule      <- selection_rule
 
   # ===========================================================================
   # SECTION: DATA PREPARATION
@@ -118,8 +223,7 @@ grf.subg.harm.survival <- function(data,
   # ===========================================================================
 
   # Convert confounders to numeric matrix
-  temp_matrix <- as.matrix(data[, confounders.name])
-  X <- apply(temp_matrix, 2, as.numeric)
+  X <- apply(data[, confounders.name, drop = FALSE], 2, as.numeric)
 
   # Extract outcome variables
   Y <- data[, outcome.name]
@@ -145,7 +249,8 @@ grf.subg.harm.survival <- function(data,
   # Purpose: Fit GRF causal survival forest to identify treatment heterogeneity
   # ===========================================================================
 
-  cs.forest <- fit_causal_forest(X, Y, W, D, tau.rmst, config$RCT, config$seedit)
+  cs.forest <- fit_causal_forest(X, Y, W, D, tau.rmst, config$RCT, config$seedit,
+                                  tune_grf = tune_grf)
 
   # ===========================================================================
   # SECTION: SUBGROUP IDENTIFICATION VIA POLICY TREES
@@ -157,6 +262,76 @@ grf.subg.harm.survival <- function(data,
 
   # Maximum sample size (used to exclude full population as subgroup)
   n.max <- length(Y)
+
+  # DR-score candidate family (depth-1 + depth-2) in (v1,d1,c1,v2,d2,c2) form,
+  # exposed so multiplier resampling (MR) can re-select over the SAME family GRF
+  # ranks (frontier) or, under the policy tree, over the cut-defined universe.
+  .mr_candidates <- tryCatch({
+    cc <- .grf_dr_candidates(X, dr.scores, n_min = config$n.min)
+    if (config$maxdepth >= 2L) {
+      cc2 <- .grf_dr_candidates_d2(X, dr.scores, n_min = config$n.min)
+      cc  <- if (is.null(cc)) cc2 else if (is.null(cc2)) cc else rbind(cc, cc2)
+    }
+    cc
+  }, error = function(e) NULL)
+
+  # ===========================================================================
+  # SECTION: FRONTIER SELECTION (selection = "frontier")
+  # Purpose: alternative to the policy tree -- enumerate threshold (and depth-2
+  #   pair) candidates on the SAME DR scores, take the Pareto frontier, select
+  #   under frontier_rule.  Default selection = "tree" skips this entirely.
+  # ===========================================================================
+  if (identical(config$selection, "frontier")) {
+    cand <- .grf_dr_candidates(X, dr.scores, n_min = config$n.min)
+    if (config$maxdepth >= 2L) {
+      cand2 <- .grf_dr_candidates_d2(X, dr.scores, n_min = config$n.min)
+      cand  <- if (is.null(cand)) cand2
+               else if (is.null(cand2)) cand else rbind(cand, cand2)
+    }
+    sel <- .grf_frontier_select(cand, dmin = config$dmin.grf,
+                                rule = config$frontier_rule,
+                                nbhd = config$effect_neighborhood,
+                                selection_rule = config$selection_rule)
+    if (is.null(sel)) {
+      if (details) print_grf_details(config, NULL, NULL, NULL)
+      nullres <- create_null_result(data, NULL, NULL, config)
+      nullres$sg_def    <- list(conjunctions = list(), labels = NULL,
+                                definition = NA_character_,
+                                is_disjunction = FALSE)
+      nullres$selection <- "frontier"
+      return(nullres)
+    }
+    sg_def     <- .grf_sg_def_from_candidate(sel)
+    sg_harm_id <- if (!is.null(sg_def$labels))
+                    gsub("^\\{|\\}$", "", sg_def$labels) else sg_def$definition
+    # Membership from the structured definition (reproduces the candidate's S).
+    tr_rec <- .grf_evaluate_subgroup(sg_def, data)
+    data$treat.recommend <- tr_rec
+    if (details) {
+      message(sprintf(paste0("[grf frontier] rule=%s  dmin=%.3g  ",
+                             "selected: %s  (effect=%.3f, size=%d)"),
+                      config$frontier_rule, config$dmin.grf,
+                      sg_def$definition, sel$effect, sel$size))
+    }
+    result <- list(
+      data           = data,
+      grf.gsub       = list(leaf.node = NA, depth = if (is.na(sel$v2)) 1L else 2L,
+                            effect = sel$effect, Nsg = sel$size),
+      sg.harm.id     = sg_harm_id,
+      sg_def         = sg_def,
+      tree           = NULL,
+      tau.rmst       = config$tau.rmst,
+      dmin.grf       = config$dmin.grf,
+      frac.tau       = config$frac.tau,
+      maxdepth       = config$maxdepth,
+      n.min          = config$n.min,
+      selected_depth = if (is.na(sel$v2)) 1L else 2L,
+      selection      = "frontier",
+      frontier       = .grf_mark_frontier(cand),
+      candidates     = .mr_candidates
+    )
+    return(result)
+  }
 
   # Fit policy trees and compute metrics
   tree_results <- fit_policy_trees(X, data, dr.scores, config$maxdepth, config$n.min)
@@ -199,8 +374,19 @@ grf.subg.harm.survival <- function(data,
   # Select the tree that identified the best subgroup
   selected_tree <- trees[[best_subgroup$depth]]
 
-  # Find the specific split that defines the subgroup
-  sg_harm_id <- find_leaf_split(selected_tree, best_subgroup$leaf.node)
+  # Find the decision rule that defines the subgroup.  The survival subgroup
+  # is a SINGLE leaf (best_subgroup$leaf.node), so its definition is the full
+  # root-to-leaf conjunction with correct per-split directions.  The earlier
+  # find_leaf_split() returned only the single split immediately above the
+  # leaf, which silently dropped the rest of the path and mis-rendered
+  # right-turns as "<=" -- producing a definition that did not match the
+  # subgroup GRF actually selected.  .grf_build_subgroup_definition() builds
+  # the correct path; sg.harm.id is the bare cut-expression vector (directions
+  # included), back-compatible in shape with the old single-leaf output.
+  sg_def     <- .grf_build_subgroup_definition(selected_tree,
+                                               best_subgroup$leaf.node)
+  sg_harm_id <- if (!is.null(sg_def$labels))
+                  gsub("^\\{|\\}$", "", sg_def$labels) else sg_def$definition
 
   # Extract cuts based on return_selected_cuts_only setting
   if (config$return_selected_cuts_only) {
@@ -227,12 +413,23 @@ grf.subg.harm.survival <- function(data,
     values = values,
     config = config
   )
+  # Structured subgroup definition (path-based, direction-correct; possibly a
+  # disjunction) for downstream membership evaluation on new data.
+  result$sg_def <- sg_def
+  result$candidates <- .mr_candidates   # DR-candidate family for MR
 
   return(result)
 }
 
 
-#' GRF Subgroup Evaluation and Performance Metrics
+# ── grf.subg.harm.glm() has been moved to grf_subg_harm_glm.R ──────────────
+# The canonical implementation lives in grf_subg_harm_glm.R and supports
+# outcome_type, effect_measure, offset.name, overdispersion, tune_grf,
+# and other GLM-extension parameters.  The old version that was here
+# (binary-only, @keywords internal, no outcome_type routing) has been
+# removed to avoid function-name collisions during devtools::load_all().
+# ────────────────────────────────────────────────────────────────────────────
+
 #'
 #' Evaluates the performance of GRF-identified subgroups, including hazard ratios,
 #' bias, and predictive values. This function is typically used in simulation studies
@@ -246,9 +443,14 @@ grf.subg.harm.survival <- function(data,
 #' @param analysis Character. Analysis label (default: "GRF").
 #' @param frac.tau Numeric. Fraction of tau for GRF horizon (default: 1.0).
 #'
-#' @keywords internal
 #' @return A data frame with evaluation metrics.
 #'
+#' @examples
+#' \dontrun{
+#' # grf.subg.eval() is called internally to evaluate GRF subgroup quality.
+#' # See grf.subg.harm.survival() for the standard entry point.
+#' }
+#' @export
 grf.subg.eval <- function(df,
                           grf.est,
                           dgm,

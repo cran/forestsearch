@@ -16,11 +16,15 @@ sg_tables(
   hr_0a = NA,
   ndecimals = 3,
   include_search_info = TRUE,
+  subgroup_notation = NULL,
   font_size = 12
 )
 }
 \arguments{
-\item{fs}{ForestSearch results object.}
+\item{fs}{ForestSearch results object, or a \code{grf_glm_result} object
+from \code{\link{grf.subg.harm.glm}}.  When a GRF object is supplied,
+only Table 1 (treatment effect estimates) is produced; Table 2
+(identified subgroups with consistency) returns \code{NULL}.}
 
 \item{which_df}{Character. Which data frame to use ("est" or "testing").}
 
@@ -47,10 +51,22 @@ from \code{maxk} (e.g., "Two-factor subgroups (maxk=2)").}
 \item{hr_0a}{Character. Adjusted HR for subgroup 0 (optional).}
 
 \item{ndecimals}{Integer. Number of decimals for formatted numbers
-(default: 3).}
+(default: 3).  Controls precision in both \code{sg10_out}
+(formatted via \code{gt::fmt_number}) and \code{tab_estimates}
+(threaded as \code{digits} to \code{\link{SG_tab_estimates_glm}}
+for arm summaries, Diff, effect-estimate CI, and bias-corrected
+CI).  GLM and GRF-GLM paths only; the survival path uses its own
+formatting in \code{\link{SG_tab_estimates}}.}
 
 \item{include_search_info}{Logical. Include search metadata table
 (default: TRUE).}
+
+\item{subgroup_notation}{Character or \code{NULL}.  When set to
+\code{"harm"} or \code{"benefit"}, overrides the default
+"Recommend"/"Questionable" labels with the Unicode labels from
+\code{\link{get_sg_labels}} (e.g., \eqn{\hat{H}}{H-hat} /
+\eqn{\hat{H}^c}{H-hat^c}
+for harm).  Default \code{NULL} (use "Recommend"/"Questionable").}
 
 \item{font_size}{Numeric. Font size in pixels for table text (default: 12).}
 }
@@ -63,4 +79,21 @@ Returns formatted summary tables for subgroups using the gt package,
 with search metadata and customizable decimal precision. Produces two
 tables: a treatment effect estimates table and an identified subgroups
 table, each with fully customizable titles and subtitles.
+}
+\examples{
+\dontrun{
+library(survival)
+fs <- forestsearch(
+  gbsg,
+  confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+  outcome.name     = "rfstime",
+  treat.name       = "hormon",
+  event.name       = "status",
+  fs.splits        = 50,
+  use_lasso        = FALSE,
+  use_grf          = FALSE
+)
+tabs <- sg_tables(fs)
+tabs$tab_estimates
+}
 }

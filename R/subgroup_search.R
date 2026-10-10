@@ -14,30 +14,98 @@
 #' @param ID Optional vector of subject IDs.
 #' @param Z Matrix or data frame of candidate subgroup factors (binary indicators).
 #' @param n.min Integer. Minimum subgroup size.
-#' @param d0.min Integer. Minimum number of events in control.
-#' @param d1.min Integer. Minimum number of events in treatment.
-#' @param hr.threshold Numeric. Hazard ratio threshold for subgroup selection.
-#' @param max.minutes Numeric. Maximum minutes for search.
+#' @param d0.min Integer. Minimum per-arm filter.  For survival and binary
+#'   outcomes: minimum number of **events** in the control arm within the
+#'   candidate subgroup.  Ignored for continuous outcomes (only
+#'   \code{n.min} applies).
+#' @param d1.min Integer. Same as \code{d0.min} for the treatment arm.
+#' @param hr.threshold Numeric. `c1`, the \strong{screening threshold on a
+#'   candidate subgroup's own effect}: a candidate is retained only if its
+#'   fitted effect exceeds this value.
+#'   The scale is the one the caller compares on, and it differs by path.
+#'   On the survival path \code{effect_threshold} is \code{NULL}, so this
+#'   value reaches the comparison unchanged and is compared against the
+#'   fitted hazard ratio on the \strong{natural} scale
+#'   (\code{fit_cox_for_subgroup()} returns \code{exp(coef)}): 1.25 means
+#'   HR >= 1.25, not log(1.25).  On the GLM paths the value arrives already
+#'   on the comparison scale that \code{forestsearch()} resolved from the
+#'   effect measure -- link scale for the ratio measures (OR, RR, IRR),
+#'   identity for RD, IRD and MD -- and is compared against the estimator's
+#'   estimate on that same scale.  This is \code{forestsearch()}'s
+#'   \code{effect.threshold} / \code{hr.threshold}.  It is not the per-split
+#'   threshold (`c2`, \code{hr.consistency}) and not the consistency rate
+#'   (`p*`, \code{pconsistency.threshold}); neither is applied here -- this
+#'   function performs the screening stage only.
+#' @param max.minutes Numeric. \strong{Currently inert; scheduled for
+#'   deprecation in v0.3.0.} Previously intended as a wall-clock budget for
+#'   the combination search, it is threaded to
+#'   \code{search_combinations_parallel()} and no path consults it, so it has
+#'   no effect on behaviour. Search scope is governed by \code{maxk} and the
+#'   candidate-factor controls. Retained because it is part of a public
+#'   signature; this description now matches \code{\link{forestsearch}}'s,
+#'   which has documented it as inert for some time.
 #' @param minp Numeric. Minimum prevalence rate for each factor.
 #' @param rmin Integer. Minimum required reduction in sample size when adding a factor.
 #' @param details Logical. Print details during execution.
 #' @param maxk Integer. Maximum number of factors in a subgroup.
 #' @param parallel_workers Integer. Number of parallel workers (default: all available cores).
+#' @param estimator_fn Closure or \code{NULL}. Effect-estimator closure from
+#'   \code{\link{make_effect_estimator}} for GLM outcomes.  Default \code{NULL}
+#'   (uses Cox model).
+#' @param df_analysis Data frame or \code{NULL}. Full analysis dataset, passed
+#'   to the GLM estimator for within-subgroup evaluation.
+#' @param effect_threshold Numeric or \code{NULL}. GLM effect threshold for
+#'   subgroup selection.  Default \code{NULL} (uses \code{hr.threshold}).
+#' @param effect_measure Character or \code{NULL}. Effect measure name
+#'   (e.g., \code{"OR"}, \code{"HR"}, \code{"RD"}).  Used for display labels
+#'   in the filtering summary.  Default \code{NULL}.
+#' @param outcome_type Character or \code{NULL}. One of \code{"survival"},
+#'   \code{"binary"}, \code{"continuous"}, \code{"count"}.  Controls
+#'   d0.min/d1.min interpretation: events per arm for binary/survival,
+#'   ignored for continuous.  Default \code{NULL} (inferred from
+#'   \code{estimator_fn} presence).
+#' @param adjust_covariates Character vector or \code{NULL}. Additional Cox
+#'   model terms (e.g. \code{"strata(x1)"} or \code{"x2"}) used to adjust the
+#'   candidate-search Cox scorer on the survival path.  Referenced columns are
+#'   sourced from \code{df_analysis}.  Ignored on the GLM path.  Default
+#'   \code{NULL} (treatment-only).
+#' @param disable_effect_floor Logical. When \code{TRUE}, the Status-6 effect
+#'   threshold (\code{hr.threshold}) is not applied, so the full estimable
+#'   candidate family is retained regardless of effect size.  Set by
+#'   \code{\link{forestsearch}} when \code{sg_focus = "maxeff"} so the effect
+#'   maximiser ranges over an unconditional family.  Default \code{FALSE}.
 #'
-#' @keywords internal
 #' @return List with found subgroups, maximum HR, search time, configuration info,
 #'   and filtering statistics.
 #'
 #' @importFrom data.table data.table setorder
 #' @importFrom survival coxph Surv survfit
 #' @importFrom utils combn
+#' @examples
+#' \dontrun{
+#' library(survival)
+#' df <- survival::gbsg
+#' df$grade3 <- as.integer(df$grade == "3")
+#' Z <- df[, c("age", "meno", "size", "grade3", "nodes", "pgr", "er")]
+#' res <- subgroup.search(Y = df$rfstime, Event = df$status,
+#'                        Treat = df$hormon, Z = Z,
+#'                        hr.threshold = 1.25)
+#' }
+#' @export
 
 subgroup.search <- function(Y, Event, Treat, ID = NULL, Z,
                             n.min = 30, d0.min = 15, d1.min = 15,
                             hr.threshold = 1.0, max.minutes = 30,
                             minp = 0.05, rmin = 5,
                             details = FALSE, maxk = 2,
-                            parallel_workers = parallel::detectCores()) {
+                            parallel_workers = parallel::detectCores(),
+                            estimator_fn = NULL,
+                            df_analysis = NULL,
+                            effect_threshold = NULL,
+                            effect_measure = NULL,
+                            outcome_type = NULL,
+                            adjust_covariates = NULL,
+                            disable_effect_floor = FALSE) {
 
   # =========================================================================
   # SECTION 1: DATA PREPARATION AND VALIDATION
@@ -52,6 +120,28 @@ subgroup.search <- function(Y, Event, Treat, ID = NULL, Z,
 
   n <- length(yy)
   L <- ncol(zz)
+
+  # For GLM path: align df_analysis with the NA-cleaned vectors.  Also built
+  # for the survival path when adjust_covariates is supplied, so the adjusted
+  # Cox scorer can source the raw covariate columns.
+  df_clean <- NULL
+  if ((!is.null(estimator_fn) || !is.null(adjust_covariates)) &&
+      !is.null(df_analysis)) {
+    complete_rows <- stats::complete.cases(cbind(Y, Event, Treat, Z))
+    df_clean <- df_analysis[complete_rows, , drop = FALSE]
+    if (nrow(df_clean) != n) {
+      warning("df_analysis row count mismatch after NA removal: ",
+              nrow(df_clean), " vs ", n, ". Using vector-based path.")
+      df_clean <- NULL
+    }
+  }
+
+  # Resolve screening threshold for GLM outcomes
+  screen_threshold <- if (!is.null(effect_threshold)) {
+    effect_threshold
+  } else {
+    hr.threshold
+  }
 
   # =========================================================================
   # SECTION 2: GENERATE COMBINATION INDICES
@@ -77,9 +167,14 @@ subgroup.search <- function(Y, Event, Treat, ID = NULL, Z,
     yy = yy, dd = dd, tt = tt, zz = zz,
     combo_info = combo_info,
     n.min = n.min, d0.min = d0.min, d1.min = d1.min,
-    hr.threshold = hr.threshold, minp = minp, rmin = rmin,
+    hr.threshold = screen_threshold, minp = minp, rmin = rmin,
     max.minutes = max.minutes, t.start = t.start,
-    maxk = maxk, L = L
+    maxk = maxk, L = L,
+    estimator_fn = estimator_fn,
+    df_clean = df_clean,
+    outcome_type = outcome_type,
+    adjust_covariates = adjust_covariates,
+    disable_effect_floor = disable_effect_floor
   )
 
   # Reset to sequential plan
@@ -97,9 +192,29 @@ subgroup.search <- function(Y, Event, Treat, ID = NULL, Z,
   t.sofar <- t.min
 
   if (details) {
-    cat("Events criteria: control >=", d0.min, ", treatment >=", d1.min, "\n")
+    is_glm <- !is.null(estimator_fn)
+    is_ratio <- !is.null(effect_measure) &&
+      effect_measure %in% c("OR", "RR", "IRR", "HR")
+    is_binary <- !is.null(outcome_type) && outcome_type == "binary"
+
+    # d0/d1 label: "events" for survival and binary; "subjects" for continuous
+    d_label <- if (is_binary) "events" else if (is_glm) "subjects" else "events"
+    cat(sprintf("Per-arm %s criteria: control >= %d, treatment >= %d\n",
+        d_label, d0.min, d1.min))
     cat("Sample size criteria: n >=", n.min, "\n")
     cat("Subgroup search completed in", round(t.min, 2), "minutes\n")
+
+    # Threshold display: natural scale for ratio measures, raw for identity
+    if (is_ratio && hr.threshold > 0) {
+      thresh_display <- sprintf("%s >= %.3f",
+          if (!is.null(effect_measure)) effect_measure else "HR",
+          exp(hr.threshold))
+    } else {
+      thresh_display <- sprintf("effect >= %.4f", hr.threshold)
+    }
+
+    # Model label
+    model_label <- if (is_glm) "GLM" else "Cox"
 
     # Print filter counts
     cat("\n--- Filtering Summary ---\n")
@@ -107,11 +222,22 @@ subgroup.search <- function(Y, Event, Treat, ID = NULL, Z,
     cat("  Passed variance check:", filter_counts$n_passed_variance, "\n")
     cat("  Passed prevalence (>=", minp, "):", filter_counts$n_passed_prevalence, "\n")
     cat("  Passed redundancy check:", filter_counts$n_passed_redundancy, "\n")
-    cat("  Passed event counts (d0>=", d0.min, ", d1>=", d1.min, "):",
-        filter_counts$n_passed_events, "\n")
+    cat(sprintf("  Passed %s counts (d0>= %d, d1>= %d): %d\n",
+        d_label, d0.min, d1.min, filter_counts$n_passed_events))
     cat("  Passed sample size (n>=", n.min, "):", filter_counts$n_passed_sample_size, "\n")
-    cat("  Cox model fit successfully:", filter_counts$n_passed_cox, "\n")
-    cat("  Passed HR threshold (>=", hr.threshold, "):", filter_counts$n_passed_hr, "\n")
+    if (isTRUE(filter_counts$n_nonestimable > 0L)) {
+      tab <- sort(table(filter_counts$nonestimable_reasons), decreasing = TRUE)
+      cat(sprintf("  Non-estimable (estimand does not exist): %d\n",
+                  filter_counts$n_nonestimable))
+      for (i in seq_along(tab)) {
+        cat(sprintf("    %s: %d\n",
+                    sub("^non-estimable: ", "", names(tab)[i]), tab[[i]]))
+      }
+    }
+    cat(sprintf("  %s model fit successfully: %d\n",
+        model_label, filter_counts$n_passed_cox))
+    cat(sprintf("  Passed effect threshold (%s): %d\n",
+        thresh_display, filter_counts$n_passed_hr))
     cat("-------------------------\n\n")
   }
 
@@ -136,7 +262,12 @@ subgroup.search <- function(Y, Event, Treat, ID = NULL, Z,
 search_combinations_parallel <- function(yy, dd, tt, zz, combo_info,
                                          n.min, d0.min, d1.min, hr.threshold,
                                          minp, rmin, max.minutes, t.start,
-                                         maxk, L) {
+                                         maxk, L,
+                                         estimator_fn = NULL,
+                                         df_clean = NULL,
+                                         outcome_type = NULL,
+                                         adjust_covariates = NULL,
+                                         disable_effect_floor = FALSE) {
 
   tot_counts <- combo_info$max_count
 
@@ -155,7 +286,12 @@ search_combinations_parallel <- function(yy, dd, tt, zz, combo_info,
       yy = yy, dd = dd, tt = tt, zz = zz,
       n.min = n.min, d0.min = d0.min, d1.min = d1.min,
       hr.threshold = hr.threshold, minp = minp, rmin = rmin,
-      kk = kk
+      kk = kk,
+      estimator_fn = estimator_fn,
+      df_clean = df_clean,
+      outcome_type = outcome_type,
+      adjust_covariates = adjust_covariates,
+      disable_effect_floor = disable_effect_floor
     )
   })
 
@@ -168,7 +304,9 @@ search_combinations_parallel <- function(yy, dd, tt, zz, combo_info,
     n_passed_events = 0L,
     n_passed_sample_size = 0L,
     n_passed_cox = 0L,
-    n_passed_hr = 0L
+    n_passed_hr = 0L,
+    n_nonestimable = 0L,
+    nonestimable_reasons = character(0)
   )
 
   results_list <- list()
@@ -184,6 +322,11 @@ search_combinations_parallel <- function(yy, dd, tt, zz, combo_info,
     if (res$status >= 5) filter_counts$n_passed_sample_size <- filter_counts$n_passed_sample_size + 1L
     if (res$status >= 6) filter_counts$n_passed_cox <- filter_counts$n_passed_cox + 1L
     if (res$status >= 7) filter_counts$n_passed_hr <- filter_counts$n_passed_hr + 1L
+    if (!is.null(res$reason)) {
+      filter_counts$n_nonestimable <- filter_counts$n_nonestimable + 1L
+      filter_counts$nonestimable_reasons <-
+        c(filter_counts$nonestimable_reasons, res$reason)
+    }
     if (!is.null(res$result)) {
       n_results <- n_results + 1
       results_list[[n_results]] <- res$result
@@ -269,9 +412,14 @@ calculate_max_combinations <- function(L, maxk) {
 #'
 #' @param L Integer. Number of subgroup factors.
 #' @param maxk Integer. Maximum number of factors in a combination.
-#' @keywords internal
 #' @return List with \code{max_count} (total combinations) and \code{indices_list} (indices for each k).
 #' @importFrom utils combn
+#' @examples
+#' # L=6 single-factor subgroups, combinations up to 2 factors
+#' info <- get_combinations_info(L = 6, maxk = 2)
+#' info$max_count   # total number of combinations
+#' length(info$indices_list)
+#' @export
 
 get_combinations_info <- function(L, maxk) {
   # Calculate max_count
@@ -297,8 +445,13 @@ get_combinations_info <- function(L, maxk) {
 #'
 #' @param zz Matrix or data frame of subgroup factor indicators.
 #' @param covs.in Numeric vector indicating which factors are selected (1 = included).
-#' @keywords internal
 #' @return Numeric vector of subgroup membership (1/0).
+#' @examples
+#' zz <- matrix(c(1, 0, 1, 1, 0, 1), nrow = 3,
+#'              dimnames = list(NULL, c("er_le0", "grade3")))
+#' get_subgroup_membership(zz, covs.in = c(1, 1))  # both factors required
+#' get_subgroup_membership(zz, covs.in = c(1, 0))  # first factor only
+#' @export
 
 get_subgroup_membership <- function(zz, covs.in) {
   selected_cols <- which(covs.in == 1)
@@ -320,8 +473,19 @@ get_subgroup_membership <- function(zz, covs.in) {
 #' @param index_2factor Matrix of indices for two-factor combinations.
 #' @param counts_3factor Integer. Number of three-factor combinations.
 #' @param index_3factor Matrix of indices for three-factor combinations.
-#' @keywords internal
 #' @return Numeric vector indicating selected factors (1 = included, 0 = not included).
+#' @examples
+#' # Build index matrices directly (L=4, maxk=2)
+#' L <- 4
+#' idx1 <- matrix(seq_len(L), ncol = 1)          # single-factor indices
+#' idx2 <- t(utils::combn(L, 2))                 # two-factor indices
+#' # Combination 3 falls in the single-factor block (kk=3 -> factor 3)
+#' get_covs_in(kk = 3, maxk = 2, L = L,
+#'             counts_1factor = nrow(idx1),
+#'             index_1factor  = idx1,
+#'             counts_2factor = nrow(idx2),
+#'             index_2factor  = idx2)
+#' @export
 
 get_covs_in <- function(kk, maxk, L,
                         counts_1factor, index_1factor,
@@ -390,12 +554,19 @@ extract_idx_flagredundancy <- function(x, rmin) {
 #' @param tt Numeric vector. Treatment indicators.
 #' @param zz Matrix. Factor indicators.
 #' @param n.min Integer. Minimum sample size.
-#' @param d0.min Integer. Minimum control events.
-#' @param d1.min Integer. Minimum treatment events.
-#' @param hr.threshold Numeric. HR threshold.
+#' @param d0.min Integer. Minimum control events (binary/survival) or ignored
+#'   (continuous).
+#' @param d1.min Integer. Minimum treatment events (binary/survival) or ignored
+#'   (continuous).
+#' @param hr.threshold Numeric. Effect threshold, on the scale this function
+#'   compares on: the natural hazard-ratio scale on the survival path, and
+#'   the resolved comparison scale (link for OR/RR/IRR, identity for
+#'   RD/IRD/MD) on the GLM paths.  See \code{\link{subgroup.search}}.
 #' @param minp Numeric. Minimum prevalence.
 #' @param rmin Integer. Minimum size reduction.
 #' @param kk Integer. Combination index.
+#' @param adjust_covariates Character vector or \code{NULL}. Cox adjustment
+#'   terms passed to \code{fit_cox_for_subgroup} on the survival path.
 #'
 #' @return List with:
 #'   \describe{
@@ -403,10 +574,10 @@ extract_idx_flagredundancy <- function(x, rmin) {
 #'       0 = failed variance check,
 #'       1 = passed variance, failed prevalence,
 #'       2 = passed prevalence, failed redundancy,
-#'       3 = passed redundancy, failed events,
-#'       4 = passed events, failed sample size,
-#'       5 = passed sample size, failed Cox fit,
-#'       6 = passed Cox fit, failed HR threshold,
+#'       3 = passed redundancy, failed per-arm filter,
+#'       4 = passed per-arm filter, failed sample size,
+#'       5 = passed sample size, failed model fit,
+#'       6 = passed model fit, failed effect threshold,
 #'       7 = passed all criteria (success)}
 #'     \item{result}{Result row if successful, NULL otherwise}
 #'   }
@@ -414,7 +585,12 @@ extract_idx_flagredundancy <- function(x, rmin) {
 #' @keywords internal
 evaluate_combination_with_status <- function(covs.in, yy, dd, tt, zz,
                                              n.min, d0.min, d1.min, hr.threshold,
-                                             minp, rmin, kk) {
+                                             minp, rmin, kk,
+                                             estimator_fn = NULL,
+                                             df_clean = NULL,
+                                             outcome_type = NULL,
+                                             adjust_covariates = NULL,
+                                             disable_effect_floor = FALSE) {
 
   # Extract selected factors
   selected_cols <- which(covs.in == 1)
@@ -438,6 +614,77 @@ evaluate_combination_with_status <- function(covs.in, yy, dd, tt, zz,
 
   id.x <- redundancy_check$id.x
 
+  # ---------- GLM path ----------
+  if (!is.null(estimator_fn) && !is.null(df_clean)) {
+
+    is_binary <- !is.null(outcome_type) && outcome_type == "binary"
+    is_continuous <- !is.null(outcome_type) &&
+      outcome_type %in% c("continuous", "count")
+
+    # Status 3: Per-arm filter
+    #   Binary:     minimum EVENTS (Y=1) per arm — analogous to survival
+    #   Continuous:  d0.min/d1.min not meaningful — skip, rely on n.min
+    if (is_binary) {
+      # Events per arm: sum of binary outcome within each arm of the subgroup
+      d0_sg <- sum(yy[id.x == 1 & tt == 0])
+      d1_sg <- sum(yy[id.x == 1 & tt == 1])
+      if (d0_sg < d0.min || d1_sg < d1.min) {
+        return(list(status = 3L, result = NULL))
+      }
+    } else if (!is_continuous) {
+      # Unknown GLM type: fall back to per-arm sample size check
+      n0_sg <- sum(tt[id.x == 1] == 0)
+      n1_sg <- sum(tt[id.x == 1] == 1)
+      if (n0_sg < d0.min || n1_sg < d1.min) {
+        return(list(status = 3L, result = NULL))
+      }
+    }
+    # Continuous: skip Status 3 entirely — d0.min/d1.min do not apply
+
+    # Status 4: Check total subgroup size
+    nx <- sum(id.x)
+    if (nx <= n.min) {
+      return(list(status = 4L, result = NULL))
+    }
+
+    # Status 5: Fit GLM via estimator closure.  When the construction-time
+    # routing predicate tagged the closure (unadjusted continuous case), take
+    # the vector path: no per-candidate data-frame slice -- the profiled
+    # 58.7% of the fit bucket (REPORT_bootstrap_reprofile_2026-09-01.md,
+    # section 4a).  Both paths return the identical contract.
+    if (isTRUE(attr(estimator_fn, "fs_fast_unadjusted"))) {
+      glm_result <- fit_glm_for_subgroup_fast(yy, tt, id.x, estimator_fn)
+    } else {
+      glm_result <- fit_glm_for_subgroup(df_clean, id.x, estimator_fn)
+    }
+    if (!is.null(glm_result) && isTRUE(glm_result$nonestimable)) {
+      return(list(status = 5L, result = NULL, reason = glm_result$reason))
+    }
+    if (is.null(glm_result)) {
+      return(list(status = 5L, result = NULL))
+    }
+
+    # Status 6: Check effect threshold.  Skipped when the effect floor is
+    # disabled (sg_focus = "maxeff" retains the full estimable family so the
+    # argmax is unconditional -- see forestsearch() search_overrides).
+    if (!disable_effect_floor && glm_result$hr <= hr.threshold) {
+      return(list(status = 6L, result = NULL))
+    }
+
+    # Status 7: Passed
+    if (is_binary) {
+      event_counts <- list(d0 = d0_sg, d1 = d1_sg, total = d0_sg + d1_sg)
+    } else {
+      n0_sg <- sum(tt[id.x == 1] == 0)
+      n1_sg <- sum(tt[id.x == 1] == 1)
+      event_counts <- list(d0 = n0_sg, d1 = n1_sg, total = n0_sg + n1_sg)
+    }
+    result_row <- create_result_row(kk, covs.in, nx, event_counts, glm_result)
+    return(list(status = 7L, result = result_row))
+  }
+
+  # ---------- Survival path (existing, unchanged) ----------
+
   # Status 3: Check event counts
   event_counts <- calculate_event_counts(dd, tt, id.x)
   if (!meets_event_criteria(event_counts, d0.min, d1.min)) {
@@ -450,18 +697,58 @@ evaluate_combination_with_status <- function(covs.in, yy, dd, tt, zz,
     return(list(status = 4L, result = NULL))
   }
 
-  # Status 5: Fit Cox model
-  cox_result <- fit_cox_for_subgroup(yy, dd, tt, id.x)
+  # Status 5: Fit Cox model.  The log-HR needs an event in each arm; with
+  # d1.min = 0 (which several committed campaign templates pass) a zero-event
+  # arm reaches coxph(), which returns a finite divergent coefficient rather
+  # than an error.  No admission floor is added here -- the candidate simply
+  # takes the existing fit-failure status, with its reason recorded.
+  why <- .fs_existence_reason("HR",
+    c(e0  = sum(dd[id.x == 1] == 1 & tt[id.x == 1] == 0, na.rm = TRUE),
+      ne0 = NA_integer_,
+      e1  = sum(dd[id.x == 1] == 1 & tt[id.x == 1] == 1, na.rm = TRUE),
+      ne1 = NA_integer_))
+  if (!is.null(why)) {
+    return(list(status = 5L, result = NULL, reason = why))
+  }
+
+  cox_result <- fit_cox_for_subgroup(yy, dd, tt, id.x,
+                                     df_clean = df_clean,
+                                     adjust_covariates = adjust_covariates)
   if (is.null(cox_result)) {
     return(list(status = 5L, result = NULL))
   }
 
-  # Status 6: Check HR threshold
-  if (cox_result$hr <= hr.threshold) {
+  # Status 6: Check HR threshold.  Skipped when the effect floor is disabled
+  # (sg_focus = "maxeff" retains the full estimable family so the argmax is
+  # unconditional -- see forestsearch() search_overrides).
+  if (!disable_effect_floor && cox_result$hr <= hr.threshold) {
     return(list(status = 6L, result = NULL))
   }
 
-  # Status 7: Passed all criteria - return result
+  # Status 7: passed all criteria.  Compute median survival for this
+  # effect-screen survivor before building the row (0.3.4): the survfit call
+  # and extraction relocated from fit_cox_for_subgroup() operation for
+  # operation, on a rebuilt frame with the same column names so the
+  # "Treat=0"/"Treat=1" strata labels (and hence the extraction) are
+  # identical.  Non-passers never produce a row, so no output surface
+  # consumed their medians -- computing them only here elides ~11.7x
+  # redundant survfit calls on the gbsg application without changing any
+  # output value (REPORT_bootstrap_reprofile_2026-09-01.md, section 4b).
+  idx <- id.x == 1
+  med_df <- data.frame(Y = yy[idx], E = dd[idx], Treat = tt[idx])
+  meds <- try(
+    summary(survival::survfit(survival::Surv(Y, E) ~ Treat, data = med_df))$table[, "median"],
+    silent = TRUE
+  )
+  # Pre-move contract, replicated: a survfit failure inside
+  # fit_cox_for_subgroup() made it return NULL, i.e. status 5 (failed
+  # model fit).
+  if (inherits(meds, "try-error")) {
+    return(list(status = 5L, result = NULL))
+  }
+  cox_result$med0 <- meds[1]
+  cox_result$med1 <- meds[2]
+
   result_row <- create_result_row(kk, covs.in, nx, event_counts, cox_result)
   return(list(status = 7L, result = result_row))
 }
@@ -503,36 +790,215 @@ meets_event_criteria <- function(event_counts, d0.min, d1.min) {
 
 #' Fit Cox Model for Subgroup
 #'
+#' @param yy,dd,tt,id.x Numeric vectors: outcome, event, treatment, and the
+#'   subgroup membership indicator (1 = in subgroup).
+#' @param df_clean Data frame or `NULL`. Cleaned analysis frame row-aligned
+#'   with the vectors, used only to source raw `adjust_covariates` columns.
+#' @param adjust_covariates Character vector or `NULL`. Additional Cox terms
+#'   (e.g. `"strata(x1)"`) appended after `Treat`.  `NULL` (default) fits the
+#'   treatment-only model.
 #' @keywords internal
 #' @importFrom survival coxph Surv survfit
-fit_cox_for_subgroup <- function(yy, dd, tt, id.x) {
+fit_cox_for_subgroup <- function(yy, dd, tt, id.x, df_clean = NULL,
+                                 adjust_covariates = NULL) {
 
-  # Create subgroup data
-  data.x <- data.table::data.table(Y = yy, E = dd, Treat = tt, id.x = id.x)
-  df.x <- data.x[id.x == 1]
+  adj <- .fs_adjust_terms(adjust_covariates)
+  idx <- id.x == 1
 
-  # Fit Cox model
-  hr.cox <- try(
-    summary(survival::coxph(survival::Surv(Y, E) ~ Treat, data = df.x, robust = FALSE))$conf.int,
-    silent = TRUE
-  )
+  # Fit Cox model (treatment-only or adjusted)
+  if (length(adj) == 0L) {
+    # Unadjusted fast branch (0.3.3): same coxph() fit, but the consumed
+    # $conf.int row is computed directly instead of through summary.coxph(),
+    # whose full summary table cost 40.3% of the fit bucket for one CI row
+    # (REPORT_bootstrap_reprofile_2026-09-01.md, section 4a).  The
+    # arithmetic replicates survival 3.8.9 summary.coxph() operation for
+    # operation, non-robust branch, conf.int = 0.95, scale = 1 (the
+    # `* scale` multiplications are omitted: x * 1 is exact in IEEE-754):
+    #   beta <- cox$coefficients * scale
+    #   se <- sqrt(diag(cox$var)) * scale
+    #   z <- qnorm((1 + conf.int)/2, 0, 1)
+    #   tmp <- cbind(exp(beta), exp(-beta), exp(beta - z*se), exp(beta + z*se))
+    #   dimnames(tmp) <- list(names(beta), c("exp(coef)", "exp(-coef)",
+    #     paste("lower .", round(100*conf.int, 2), sep = ""), ...))  # ".95"
+    # The try() wrapper and its NULL-on-error contract are unchanged; a
+    # degenerate fit (monotone likelihood) warns from coxph() exactly as
+    # before and produces the identical row.  The fit runs on the three
+    # subset locals below, resolved from the function environment (0.3.5):
+    # the medians move (0.3.4) left the two coxph() calls as the frame's
+    # only consumers, so the per-candidate frame is now built only for
+    # adjusted fits.  Same values, same row order, same variable names --
+    # the coefficient is named "Treat" exactly as with the frame-based fit.
+    Y <- yy[idx]
+    E <- dd[idx]
+    Treat <- tt[idx]
+    hr.cox <- try({
+      fit.cox <- survival::coxph(survival::Surv(Y, E) ~ Treat, robust = FALSE)
+      beta <- fit.cox$coefficients
+      se_beta <- sqrt(diag(fit.cox$var))
+      z_ci <- stats::qnorm((1 + 0.95) / 2, 0, 1)
+      ci <- cbind(exp(beta), exp(-beta),
+                  exp(beta - z_ci * se_beta), exp(beta + z_ci * se_beta))
+      dimnames(ci) <- list(names(beta),
+                           c("exp(coef)", "exp(-coef)",
+                             "lower .95", "upper .95"))
+      ci
+    }, silent = TRUE)
+  } else {
+    # Adjusted arm: the only arm that still needs a frame (covariate
+    # columns).  The df.x assembly relocated here verbatim (0.3.5).
+
+    # Create subgroup data
+    data.x <- data.table::data.table(Y = yy, E = dd, Treat = tt, id.x = id.x)
+
+    # Attach raw adjustment columns (row-aligned with the vectors) when present
+    rhs <- "Treat"
+    if (!is.null(df_clean)) {
+      adj_vars <- intersect(.fs_adjust_vars(adjust_covariates), names(df_clean))
+      if (length(adj_vars) > 0L) {
+        adj_cols <- as.data.frame(df_clean)[, adj_vars, drop = FALSE]
+        data.x <- cbind(data.x, adj_cols)
+      }
+      rhs <- paste(c("Treat", adj), collapse = " + ")
+    }
+
+    df.x <- data.x[id.x == 1]
+
+    cox_fmla <- stats::as.formula(paste0("survival::Surv(Y, E) ~ ", rhs))
+    hr.cox <- try(
+      summary(survival::coxph(cox_fmla, data = df.x, robust = FALSE))$conf.int,
+      silent = TRUE
+    )
+  }
 
   if (inherits(hr.cox, "try-error")) return(NULL)
 
-  # Get median survival times
-  meds <- try(
-    summary(survival::survfit(survival::Surv(Y, E) ~ Treat, data = df.x))$table[, "median"],
-    silent = TRUE
+  # Extract the treatment row.  conf.int is a matrix with one row per
+  # coefficient; the adjusted fit has several, so index by name.
+  if (is.null(dim(hr.cox))) {
+    hr.cox <- matrix(hr.cox, nrow = 1L,
+                     dimnames = list("Treat", names(hr.cox)))
+  }
+  trow <- if ("Treat" %in% rownames(hr.cox)) hr.cox["Treat", ] else hr.cox[1, ]
+
+  # Median survival times are no longer computed here (0.3.4): the survfit
+  # call moved to the post-screen point of the per-candidate iteration in
+  # evaluate_combination_with_status(), so only effect-screen survivors pay
+  # for it.  The return contract is unchanged; med0/med1 are patched there
+  # for passing candidates before the row is built.
+  list(
+    hr = trow[1],
+    lower = trow[3],
+    upper = trow[4],
+    med0 = NA_real_,
+    med1 = NA_real_
+  )
+}
+
+
+#' Fit GLM for Subgroup via Estimator Closure
+#'
+#' Subsets the analysis data frame to the candidate subgroup and calls the
+#' pre-built estimator closure.  Returns a list compatible with
+#' \code{\link{create_result_row}} so the downstream pipeline is unchanged.
+#'
+#' For binary outcomes with `effect_measure = "RD"`, the `hr` slot contains
+#' the risk difference (not a hazard ratio) -- the name is retained for
+#' pipeline compatibility.  Similarly, `lower`/`upper` are Wald-type CI
+#' bounds and `med0`/`med1` are `NA`.
+#'
+#' @param df_clean Data frame.  The analysis data, row-aligned with the
+#'   cleaned vectors.
+#' @param id.x Integer vector.  1 = subject in this subgroup, 0 = not.
+#' @param estimator_fn Closure from \code{\link{make_effect_estimator}}.
+#'
+#' @return A list with components `hr`, `lower`, `upper`, `med0`, `med1`,
+#'   or `NULL` on failure.
+#'
+#' @keywords internal
+fit_glm_for_subgroup <- function(df_clean, id.x, estimator_fn) {
+  df_sg <- df_clean[id.x == 1, , drop = FALSE]
+
+  if (nrow(df_sg) < 6L) return(NULL)
+
+  res <- tryCatch(
+    estimator_fn(df_sg),
+    error = function(e) NULL
   )
 
-  if (inherits(meds, "try-error")) return(NULL)
+  if (is.null(res)) return(NULL)
+
+  # A non-estimable candidate carries a reason from the estimator boundary.
+  # It still fails the fit (status 5, as any NA estimate always has), but the
+  # reason travels so the run can say how many candidates were non-estimable
+  # and why, rather than dropping them silently.
+  if (is.na(res$estimate)) {
+    if (!is.null(res$reason)) {
+      return(list(nonestimable = TRUE, reason = res$reason))
+    }
+    return(NULL)
+  }
+
+  # Wald CI: estimate +/- 1.96 * SE
+  z_crit <- 1.96
+  lower  <- res$estimate - z_crit * res$se
+  upper  <- res$estimate + z_crit * res$se
 
   list(
-    hr = hr.cox[1],
-    lower = hr.cox[3],
-    upper = hr.cox[4],
-    med0 = meds[1],
-    med1 = meds[2]
+    hr    = res$estimate,    # effect estimate (RD, log-OR, etc.)
+    lower = lower,
+    upper = upper,
+    med0  = NA_real_,        # no median survival for GLM outcomes
+    med1  = NA_real_
+  )
+}
+
+#' Fast Vector-Path GLM Fit for Subgroup
+#'
+#' Vector twin of \code{fit_glm_for_subgroup()} for the tagged unadjusted
+#' continuous closure: subsets the outcome and treatment VECTORS (no
+#' data-frame slice) and runs the bit-identical two-group OLS core
+#' \code{.fs_lm_two_group()}.  Contract identical to
+#' \code{fit_glm_for_subgroup()}: \code{NULL} when the slice has fewer than
+#' 6 rows, when the fit errors, or when the estimate is \code{NA} (the
+#' rank-deficient single-arm slice); otherwise the
+#' \code{hr/lower/upper/med0/med1} list with the same Wald CI arithmetic.
+#' The sign convention and treatment column name are read from the tagged
+#' closure's environment (\code{adverse_outcome}, \code{treat.name} are
+#' \code{force()}d there), so no signature beyond the vectors changes.
+#'
+#' @param yy,tt Numeric vectors: cleaned outcome and treatment, full length.
+#' @param id.x Integer vector. 1 = subject in this subgroup, 0 = not.
+#' @param estimator_fn The tagged fast closure (attribute
+#'   \code{fs_fast_unadjusted}).
+#' @keywords internal
+#' @noRd
+fit_glm_for_subgroup_fast <- function(yy, tt, id.x, estimator_fn) {
+  idx <- id.x == 1
+  if (sum(idx) < 6L) return(NULL)
+
+  fn_env <- environment(estimator_fn)
+  y <- yy[idx]
+  t <- tt[idx]
+  if (!isTRUE(fn_env$adverse_outcome)) y <- -y
+
+  res <- tryCatch(
+    .fs_lm_two_group(y, t, fn_env$treat.name),
+    error = function(e) NULL
+  )
+
+  if (is.null(res) || is.na(res$estimate)) return(NULL)
+
+  # Wald CI: estimate +/- 1.96 * SE (as in fit_glm_for_subgroup)
+  z_crit <- 1.96
+  lower  <- res$estimate - z_crit * res$se
+  upper  <- res$estimate + z_crit * res$se
+
+  list(
+    hr    = res$estimate,
+    lower = lower,
+    upper = upper,
+    med0  = NA_real_,
+    med1  = NA_real_
   )
 }
 

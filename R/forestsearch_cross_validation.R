@@ -12,6 +12,148 @@
 # ==============================================================================
 
 
+# Collect the per-unit result list returned by a cross-validation foreach loop
+# run with `.errorhandling = "pass"`, applying a FATAL-on-any-error policy.
+#
+# Unlike `.collect_bootstrap_results()` (which warns on partial failure and only
+# stops when every resample fails), CV treats ANY refit error as fatal: each
+# fold refit is essentially the same computation on n - 1 rows, so a single
+# genuine failure signals a code/data bug that would corrupt the whole run.  A
+# legitimate no-subgroup fold does NOT reach here as an error - the fold body
+# converts it to an ITT fallback and returns a normal result row.
+#
+# On the first captured error condition, re-raises its message verbatim (the
+# fold body has already formatted it with fold/sim context).  Otherwise, when
+# `combine = TRUE`, row-binds the successful results via `rbind` (matching the
+# former `.combine = "rbind"` semantics); when `combine = FALSE`, returns the
+# list invisibly (used purely as a fatal guard, e.g. in forestsearch_tenfold).
+# @noRd
+.collect_cv_results <- function(results, combine = TRUE) {
+  is_err <- vapply(results, inherits, logical(1), what = "error")
+  if (any(is_err)) {
+    first_err <- results[[which(is_err)[1L]]]
+    stop(conditionMessage(first_err), call. = FALSE)
+  }
+  if (combine) do.call(rbind, results) else invisible(results)
+}
+
+
+# Extract the column names referenced by `conf_force` forced-cut expressions.
+# Mirrors the label-stripping logic of .fs_gh_parse_label(): strip an optional
+# leading "!" (negation) and surrounding braces, then take the leading variable
+# token before the comparison operator.  Cuts are canonical "var <= value"
+# expressions (see get_fsdata.R), so the variable is the leading R identifier.
+# Returns a de-duplicated character vector (character(0) for NULL/empty input).
+# @noRd
+.fs_conf_force_vars <- function(conf_force) {
+  if (is.null(conf_force) || !length(conf_force)) return(character(0))
+  vars <- vapply(conf_force, function(expr) {
+    expr <- trimws(as.character(expr))
+    if (!nzchar(expr)) return(NA_character_)
+    expr <- sub("^!", "", trimws(expr))                       # strip leading "!"
+    expr <- trimws(sub("^\\{", "", sub("\\}$", "", expr)))    # strip braces
+    v <- regmatches(expr, regexpr("^[A-Za-z.][A-Za-z0-9._]*", expr))  # leading var
+    if (length(v)) v else NA_character_
+  }, character(1))
+  unique(vars[!is.na(vars) & nzchar(vars)])
+}
+
+
+# Build the base per-subject data frame both CV entry points work from,
+# uniformly whether or not the primary fit identified a subgroup.
+#
+# When a subgroup was found, fs.est$df.est is the processed analysis frame
+# carrying a treat.recommend column; the base frame is that frame with the
+# needed columns selected and treat.recommend renamed to
+# treat.recommend.original (the full-data subgroup assignment).  This path is
+# byte-identical to the former inline construction.
+#
+# When NO subgroup was found, the consistency path leaves fs.est$df.est (and
+# df.predict/df.test) NULL, while the DINA and GRF selection paths
+# (.forestsearch_dina_select / .forestsearch_grf_select) return df.est = df --
+# a NON-NULL working frame WITHOUT a treat.recommend column.  The no-subgroup
+# gate therefore keys on sg.harm (the actual "no subgroup identified"
+# contract, and a required fs.est component) as well as df.est; gating on
+# df.est alone sent no-subgroup DINA/GRF fits down the subgroup-found branch,
+# where selecting the absent treat.recommend column failed with the cryptic
+# "undefined columns selected".  Every fit with a subgroup (sg.harm non-NULL,
+# df.est populated) takes the found branch exactly as before.
+# On the no-subgroup fallback:
+# Fall back to the original analysis frame carried in args_call_all, set
+# treat.recommend.original = 1.0 (ITT -- recommend all, matching a no-subgroup
+# primary result), and synthesize the placeholder event column that
+# forestsearch() itself creates for continuous/count outcomes.  That column
+# (event.name == ".event_placeholder", value 1L; see forestsearch_main.R) lives
+# in df.est but NOT in the raw analysis frame, so without re-creating it every
+# downstream selection by event.name ("undefined columns selected") fails for
+# continuous/count.  The name and constant are taken from forestsearch()'s own
+# synthesis, not guessed: any resolved event.name absent from the fallback
+# frame is added as 1L.
+#
+# The offset / conf_force / adjust_covariates retention filters against the
+# SOURCE frame in use (df.est when populated -- identical to before; the
+# analysis frame on the no-subgroup fallback) so forced-cut and adjustment
+# columns survive into the CV data in both cases.
+# @noRd
+.fs_cv_base_frame <- function(fs.est) {
+  fs_args <- fs.est$args_call_all
+  confounders.name <- fs_args$confounders.name
+  outcome.name     <- fs_args$outcome.name
+  event.name       <- fs_args$event.name
+  id.name          <- fs_args$id.name
+  treat.name       <- fs_args$treat.name
+  offset.name      <- fs_args$offset.name
+
+  no_sg <- is.null(fs.est$sg.harm) || is.null(fs.est$df.est)
+  if (no_sg) {
+    src <- as.data.frame(fs_args$df.analysis)
+    # Mirror forestsearch()'s placeholder-event synthesis exactly.
+    if (!is.null(event.name) && !(event.name %in% names(src))) {
+      src[[event.name]] <- 1L
+    }
+  } else {
+    src <- fs.est$df.est
+  }
+
+  get_names <- c(confounders.name, outcome.name, event.name, id.name, treat.name)
+  if (!is.null(offset.name) && offset.name %in% names(src)) {
+    get_names <- unique(c(get_names, offset.name))
+  }
+  cf_cols <- .fs_conf_force_vars(fs_args$conf_force)
+  cf_cols <- cf_cols[cf_cols %in% names(src)]
+  if (length(cf_cols)) get_names <- unique(c(get_names, cf_cols))
+  adj_cols <- .fs_adjust_vars(fs_args$adjust_covariates)
+  adj_cols <- adj_cols[adj_cols %in% names(src)]
+  if (length(adj_cols)) get_names <- unique(c(get_names, adj_cols))
+
+  if (no_sg) {
+    dfa <- src[, get_names, drop = FALSE]
+    dfa$treat.recommend.original <- 1.0
+  } else {
+    dfa <- src[, c(get_names, "treat.recommend")]
+    names(dfa)[names(dfa) == "treat.recommend"] <- "treat.recommend.original"
+  }
+  as.data.frame(dfa)
+}
+
+
+# Number of subjects the CV runs over: rows of df.est when a subgroup was
+# found, else rows of the original analysis frame (no-subgroup fallback).
+# Used by forestsearch_Kfold for the LOO default and fold-size validation,
+# where nrow(fs.est$df.est) would be NULL for a no-subgroup fit.  The
+# no-subgroup gate matches .fs_cv_base_frame() (sg.harm OR df.est missing)
+# so the count is always taken from the same frame the base frame is built
+# from -- including no-subgroup DINA/GRF fits, whose df.est is non-NULL.
+# @noRd
+.fs_cv_nobs <- function(fs.est) {
+  if (is.null(fs.est$sg.harm) || is.null(fs.est$df.est)) {
+    nrow(as.data.frame(fs.est$args_call_all$df.analysis))
+  } else {
+    nrow(fs.est$df.est)
+  }
+}
+
+
 #' ForestSearch K-Fold Cross-Validation
 #'
 #' Performs K-fold cross-validation for ForestSearch, evaluating subgroup
@@ -53,9 +195,41 @@
 #'     \item \code{workers}: Integer. Number of parallel workers
 #'     \item \code{show_message}: Logical. Show parallel setup messages
 #'   }
+#'   \code{parallel_args} controls \strong{fold-level} parallelism only: the
+#'   fold loop is distributed across workers from this argument, while each
+#'   fold's inner \code{\link{forestsearch}} refit is pinned to
+#'   \code{plan = "sequential"} (deliberate nested-parallelism avoidance, so
+#'   fold-level workers are not oversubscribed by inner-search workers).  The
+#'   plan is taken from \code{parallel_args}, not from any ambient
+#'   \code{future::plan()} set by the caller (which is saved and restored on
+#'   exit).  For example, to run the folds on four workers:
+#'   \code{parallel_args = list(plan = "multisession", workers = 4)}.
 #' @param sg0.name Character. Label for subgroup 0 (default: "Not recommend").
 #' @param sg1.name Character. Label for subgroup 1 (default: "Recommend").
 #' @param details Logical. Print progress details (default: FALSE).
+#' @param mr_in_replicates Logical.  Whether multiplier resampling (MR) runs
+#'   \emph{inside} each CV fold.  \strong{Default \code{FALSE}}.
+#'
+#'   \code{mr_inference} reaches each fold through the reconstructed call in
+#'   \code{fs.est$args_call_all}, so an analysis fitted with
+#'   \code{mr_inference = TRUE} would otherwise run MR in every fold -- and
+#'   nothing consumes the result.  Under the default the flag is stripped from
+#'   the per-fold call, so that work is not done at all.  The top-level
+#'   analysis on \code{fs.est} is unaffected.
+#'
+#'   \code{TRUE} lets \code{mr_inference} propagate unchanged into each fold
+#'   \emph{and} retains the result, returned as \code{$mr_replicates} -- a list
+#'   of length \code{Kfolds} whose \code{k}-th element is fold \code{k}'s
+#'   \code{mr_inference} object, or \code{NULL} where that fold identified no
+#'   subgroup.  MR therefore runs in the folds only if the original analysis
+#'   set \code{mr_inference = TRUE}.
+#'
+#'   \strong{The retained objects are not aggregable into an estimate for the
+#'   original analysis.}  Each fold re-runs the search on its training split,
+#'   selects its own subgroup, and de-biases \emph{that} subgroup -- so the
+#'   collection describes MR's behaviour across fold-specific selections, not a
+#'   better estimate of the original quantity.  Averaging them, or pooling
+#'   their intervals, is an error.
 #'
 #' @return List with components:
 #' \describe{
@@ -68,6 +242,35 @@
 #'   \item{Kfolds}{Number of folds used}
 #'   \item{sens_summary}{Named vector of sensitivity metrics (sens_H, sens_Hc, ppv_H, ppv_Hc)}
 #'   \item{find_summary}{Named vector of subgroup-finding metrics (Any, Exact, etc.)}
+#'   \item{mr_replicates}{\code{NULL} under the default
+#'     \code{mr_in_replicates = FALSE}.  Otherwise a list of length
+#'     \code{Kfolds}, element \code{k} holding fold \code{k}'s
+#'     \code{mr_inference} object (or \code{NULL}), each computed against
+#'     \emph{that fold's} candidate family and selected subgroup.  Not
+#'     aggregable -- see the \code{mr_in_replicates} parameter.}
+#' }
+#'
+#' @examples
+#' \dontrun{
+#' # Run initial ForestSearch
+#' fs_result <- forestsearch(
+#'   df.analysis = trial_data,
+#'   outcome.name = "time",
+#'   event.name = "status",
+#'   treat.name = "treatment",
+#'   confounders.name = c("age", "biomarker")
+#' )
+#'
+#' # Run 10-fold cross-validation
+#' cv_results <- forestsearch_Kfold(
+#'   fs.est = fs_result,
+#'   Kfolds = 10,
+#'   parallel_args = list(plan = "multisession", workers = 4),
+#'   details = TRUE
+#' )
+#'
+#' # Summarize results
+#' cv_summary <- forestsearch_KfoldOut(cv_results, outall = TRUE)
 #' }
 #'
 #' @seealso
@@ -83,12 +286,13 @@
 
 forestsearch_Kfold <- function(
     fs.est,
-    Kfolds = nrow(fs.est$df.est),
+    Kfolds = .fs_cv_nobs(fs.est),
     seedit = 8316951L,
     parallel_args = list(plan = "multisession", workers = 6, show_message = TRUE),
     sg0.name = "Not recommend",
     sg1.name = "Recommend",
-    details = FALSE
+    details = FALSE,
+    mr_in_replicates = FALSE
 ) {
 
   # ===========================================================================
@@ -105,16 +309,20 @@ forestsearch_Kfold <- function(
     stop("fs.est missing required components: ", paste(missing, collapse = ", "))
   }
 
-  if (is.null(fs.est$df.est) || !is.data.frame(fs.est$df.est) || nrow(fs.est$df.est) == 0) {
-    stop("fs.est$df.est must be a non-empty data frame")
+  # A no-subgroup primary fit carries df.est == NULL; .fs_cv_base_frame()
+  # rebuilds an ITT base frame from args_call_all in that case, so NULL is
+  # allowed.  A non-NULL df.est must still be a non-empty data frame.
+  if (!is.null(fs.est$df.est) &&
+      (!is.data.frame(fs.est$df.est) || nrow(fs.est$df.est) == 0)) {
+    stop("fs.est$df.est must be NULL (no subgroup) or a non-empty data frame")
   }
 
   if (!is.numeric(Kfolds) || length(Kfolds) != 1 || Kfolds < 2) {
     stop("Kfolds must be an integer >= 2")
   }
 
-  if (Kfolds > nrow(fs.est$df.est)) {
-    stop("Kfolds cannot exceed number of observations (", nrow(fs.est$df.est), ")")
+  if (Kfolds > .fs_cv_nobs(fs.est)) {
+    stop("Kfolds cannot exceed number of observations (", .fs_cv_nobs(fs.est), ")")
   }
 
   # ===========================================================================
@@ -142,14 +350,13 @@ forestsearch_Kfold <- function(
   treat.name <- fs_args$treat.name
   id.name <- fs_args$id.name
   est.scale <- fs_args$est.scale
-  confounders.name <- fs_args$confounders.name
 
-  get_names <- c(confounders.name, outcome.name, event.name, id.name, treat.name)
-
-  # Prepare analysis data
-  dfa <- fs.est$df.est[, c(get_names, "treat.recommend")]
-  names(dfa)[names(dfa) == "treat.recommend"] <- "treat.recommend.original"
-  dfnew <- as.data.frame(dfa)
+  # Prepare base data.  .fs_cv_base_frame() builds the per-subject frame
+  # uniformly: the processed df.est when a subgroup was found (byte-identical
+  # to the former inline selection + rename), or an ITT fallback from the
+  # original analysis frame -- with the placeholder event column re-created --
+  # when the primary fit identified no subgroup (df.est NULL).
+  dfnew <- .fs_cv_base_frame(fs.est)
 
   # ===========================================================================
   # SECTION 4: FOLD ASSIGNMENT
@@ -158,7 +365,7 @@ forestsearch_Kfold <- function(
   df_scrambled <- data.table::copy(dfnew)
 
   # Scramble only if not doing LOO
-  if (Kfolds < nrow(fs.est$df.est)) {
+  if (Kfolds < .fs_cv_nobs(fs.est)) {
     set.seed(seedit)
     id_sample <- sample(seq_len(nrow(df_scrambled)), replace = FALSE)
     df_scrambled <- df_scrambled[id_sample, ]
@@ -180,14 +387,75 @@ forestsearch_Kfold <- function(
   cv_args <- fs_args
   cv_args$parallel_args <- list(plan = "sequential", workers = 1, show_message = FALSE)
   cv_args$details <- FALSE
+  cv_args$quiet <- TRUE
   cv_args$plot.sg <- FALSE
 
+  # PS must be re-estimated on each training fold -- NULL out any
+  # user-supplied ps_hat (wrong length for training fold).
+  # ps_method and ps_adjust_method carry through via args_call_all.
+  cv_args$ps_hat <- NULL
+
+  # CATEGORY 2: VARIABLE RE-SELECTION.  Identical to the bootstrap's block at
+  # bootstrap_analysis_dofuture.R:573-582, and stated as such here because the
+  # ABSENCE of this note is what let the two drift: the bootstrap nulled these
+  # four, CV nulled ps_hat on the same reasoning and left them, and nothing
+  # recorded that the difference was unintended.
+  cv_args$grf_res <- NULL
+  cv_args$grf_cuts <- NULL
+  # DINA inputs must also be nulled so each fold re-fits DINA and re-runs its
+  # selection from scratch -- otherwise a supplied/cached DINA fit (use_dina
+  # screening or subgroup_method = "dina") would be reused on every fold,
+  # defeating the out-of-sample estimate the cross-validation exists to
+  # provide.  These arrive via args_call_all's bulk mget() of forestsearch()'s
+  # formals, so they are present in cv_args whenever the original call supplied
+  # them; a cached fit would otherwise be estimated on ALL the data, including
+  # the held-out fold, making sensCV / ppvCV / exact-match optimistic by
+  # construction.
+  cv_args$dina_res <- NULL
+  cv_args$dina_cuts <- NULL
+
+  # Post-selection inference inside the folds.  Same contract as the bootstrap:
+  # mr_inference arrives via args_call_all, nothing downstream consumes a
+  # fold's MR object, so under the default it is stripped rather than computed
+  # and discarded.  The top-level analysis on fs.est is untouched.
+  if (!isTRUE(mr_in_replicates)) {
+    cv_args$mr_inference <- FALSE
+  } else {
+    # MR alignment guard.  Structurally identical to the bootstrap path: with
+    # mr_in_replicates = TRUE, mr_inference propagates unchanged into every
+    # fold, so a misaligned identifier would run a misaligned re-selection
+    # Kfolds times.
+    .validate_mr_configuration(
+      fs_args,
+      context = "forestsearch_Kfold(mr_in_replicates = TRUE)")
+
+    # C.3 -- ONE message before the fold loop, never one per fold.  `quiet` is
+    # not a formal here, so the original analysis's setting governs.
+    .mr_msg(isTRUE(fs_args$quiet), sprintf(
+      paste0("Multiplier resampling (MR) will run inside each of the %d ",
+             "CV folds and the results will be retained in $mr_replicates.\n",
+             "  These are not aggregable into an estimate for the original ",
+             "analysis: each fold corrects a different selected subgroup."),
+      Kfolds))
+    if (!isTRUE(fs_args$mr_inference))
+      .mr_msg(isTRUE(fs_args$quiet),
+        paste0("  Note: the original analysis was fitted with ",
+               "mr_inference = FALSE, so no fold will produce an MR object ",
+               "and $mr_replicates will be all NULL."))
+  }
 
   # ===========================================================================
   # SECTION 5.1: VERIFY CV FORESTSEARCH PARAMETERS (when details = TRUE)
   # ===========================================================================
 
   if(details) print_cv_params(cv_args)
+
+  # Covariate-adjustment columns to carry into the CV prediction frame, so the
+  # downstream CV summary tables can fit the SAME adjusted outcome model used in
+  # the main analysis.  .fs_adjust_vars() unwraps strata()/pspline() to bare
+  # column names; returns character(0) when adjust_covariates is NULL, in which
+  # case the carried column set is unchanged (unadjusted behaviour preserved).
+  cv_adjust_cols <- .fs_adjust_vars(cv_args$adjust_covariates)
 
   # ===========================================================================
   # SECTION 6: RUN CROSS-VALIDATION (PARALLEL)
@@ -196,7 +464,6 @@ forestsearch_Kfold <- function(
   resCV <- suppressWarnings({foreach::foreach(
     cv_index = seq_len(Kfolds),
     .options.future = list(seed = TRUE),
-    .combine = "rbind",
     .errorhandling = "pass"
   ) %dofuture% {
 
@@ -211,8 +478,27 @@ forestsearch_Kfold <- function(
     # Run ForestSearch on training fold
     fs.train <- suppressWarnings(try(do.call(forestsearch, cv_args), TRUE))
 
-    # Process results
-    if (!inherits(fs.train, "try-error") && !is.null(fs.train$sg.harm)) {
+    # A genuine refit ERROR (as opposed to a clean no-subgroup result) is
+    # fatal: re-raise with fold context.  `.errorhandling = "pass"` on the
+    # foreach captures this condition; `.collect_cv_results()` re-raises it in
+    # the parent so the CV halts loudly instead of silently degrading to ITT.
+    if (inherits(fs.train, "try-error")) {
+      stop(
+        sprintf(
+          paste0(
+            "forestsearch CV halted: training refit FAILED on fold %d of %d.\n",
+            "  This is a refit ERROR, not a legitimate no-subgroup fold - ",
+            "CV cannot continue.\n",
+            "  Verbatim error from forestsearch(): %s"
+          ),
+          cv_index, Kfolds, conditionMessage(attr(fs.train, "condition"))
+        ),
+        call. = FALSE
+      )
+    }
+
+    # Process results (fs.train is guaranteed non-error here)
+    if (!is.null(fs.train$sg.harm)) {
       # Subgroup found - apply to test data
       sg1 <- fs.train$sg.harm[1]
       sg2 <- if (length(fs.train$sg.harm) > 1) fs.train$sg.harm[2] else NA
@@ -231,14 +517,38 @@ forestsearch_Kfold <- function(
       df.test$treat.recommend <- 1.0
     }
 
-    # Return standardized columns
-    data.table::data.table(
-      df.test[, c(id.name, outcome.name, event.name, treat.name,
-                  "treat.recommend", "treat.recommend.original",
-                  "cvindex", "sg1", "sg2")]
+    # Return standardized columns (plus any covariate-adjustment columns, so
+    # the CV summary tables can re-fit the adjusted outcome model).  Coerce to
+    # data.frame first to avoid data.table character-vector NSE on column
+    # selection.
+    keep_cols <- unique(c(id.name, outcome.name, event.name, treat.name,
+                          "treat.recommend", "treat.recommend.original",
+                          "cvindex", "sg1", "sg2",
+                          intersect(cv_adjust_cols, names(df.test))))
+    fold_dt <- data.table::data.table(
+      as.data.frame(df.test)[, keep_cols, drop = FALSE]
     )
+    # Carry this fold's MR object out as an attribute: the collector rbinds the
+    # per-fold tables, which does not preserve per-element attributes, so the
+    # raw foreach list is harvested first (below).
+    if (isTRUE(mr_in_replicates))
+      attr(fold_dt, "mr_rep") <- fs.train$mr_inference
+    fold_dt
   }
 })
+
+  # Convert the per-fold result list into a single data.table, halting on the
+  # FIRST fold that re-raised a refit error above.  On the all-success path
+  # this is do.call(rbind, .) over the fold data.tables, matching the former
+  # `.combine = "rbind"` behaviour.
+  # Harvest per-fold MR objects BEFORE collection, for the same reason as the
+  # bootstrap arm: rbind returns a new table and drops per-element attributes.
+  mr_replicates <- if (isTRUE(mr_in_replicates))
+    lapply(resCV, function(x)
+      if (inherits(x, "condition")) NULL else attr(x, "mr_rep")) else NULL
+
+  resCV <- .collect_cv_results(resCV)
+
   # ===========================================================================
   # SECTION 7: POST-PROCESSING AND VALIDATION
   # ===========================================================================
@@ -326,7 +636,11 @@ forestsearch_Kfold <- function(
     Kfolds = Kfolds,
     # Add summary outputs to align with forestsearch_tenfold
     sens_summary = sens_summary,
-    find_summary = find_summary
+    find_summary = find_summary,
+    # NULL under the default; a list of length Kfolds when retention was
+    # requested.  See the mr_in_replicates @param for why these must not be
+    # averaged.
+    mr_replicates = mr_replicates
   )
 
   class(result) <- c("fs_kfold", "list")
@@ -360,7 +674,52 @@ forestsearch_Kfold <- function(
 #'   Each simulation uses seed + 1000 * ksim for reproducibility.
 #' @param Kfolds Integer. Number of folds per simulation (default: 10).
 #' @param details Logical. Print progress details (default: TRUE).
-#' @param parallel_args List. Parallelization configuration.
+#' @param parallel_args List. Parallelization configuration (elements
+#'   \code{plan} / \code{workers} / \code{show_message}; see \strong{Parallelization
+#'   Strategy}).  Here \code{parallel_args} controls \strong{simulation-level}
+#'   parallelism: the \code{sims} repetitions are distributed across workers,
+#'   while each simulation runs its K-fold CV -- and every inner
+#'   \code{\link{forestsearch}} refit -- sequentially (so workers are not
+#'   oversubscribed by nested parallelism).  As in
+#'   \code{\link{forestsearch_Kfold}}, the plan is taken from
+#'   \code{parallel_args}, not from any ambient \code{future::plan()} set by the
+#'   caller (which is saved and restored on exit).  For example, to run the
+#'   simulations on four workers:
+#'   \code{parallel_args = list(plan = "multisession", workers = 4)}.
+#' @param keep_resCV Logical. If \code{TRUE}, preserve the full per-subject
+#'   cross-validation prediction data frame for every simulation in the
+#'   returned \code{resCV_all} slot.  Useful for post-hoc metric computation,
+#'   reproducibility debugging, or auditing which subjects landed in which
+#'   fold.  Memory cost scales as \code{sims * nrow(df.est) * ~9 columns}
+#'   (for a 686-subject trial with 200 sims, ~10 MB; for a 10,000-subject
+#'   trial with 1,000 sims, ~1 GB).  Default: \code{FALSE}.  Regardless of
+#'   this flag, a compact \code{fold_summary} (one row per sim x fold) is
+#'   always returned; see Return.
+#' @param mr_in_replicates Logical.  Whether multiplier resampling (MR) runs
+#'   \emph{inside} each CV fold.  \strong{Default \code{FALSE}}.
+#'
+#'   \code{mr_inference} reaches each fold through the reconstructed call in
+#'   \code{fs.est$args_call_all}, so an analysis fitted with
+#'   \code{mr_inference = TRUE} would otherwise run MR in every fold of every
+#'   simulation -- \code{sims * Kfolds} runs -- and nothing consumes the
+#'   result.  Under the default the flag is stripped from the per-fold call, so
+#'   that work is not done at all.  The top-level analysis on \code{fs.est} is
+#'   unaffected.
+#'
+#'   \code{TRUE} lets \code{mr_inference} propagate unchanged into each fold
+#'   \emph{and} retains the results, returned as \code{$mr_replicates} -- a
+#'   list with one element per successful simulation (named \code{sim<k>} after
+#'   its \code{sim_id}, so a dropped simulation shows as a gap rather than a
+#'   silent re-index), each itself a list of length \code{Kfolds} holding that
+#'   fold's \code{mr_inference} object or \code{NULL}.  MR therefore runs in
+#'   the folds only if the original analysis set \code{mr_inference = TRUE}.
+#'
+#'   \strong{The retained objects are not aggregable into an estimate for the
+#'   original analysis.}  Each fold re-runs the search on its training split,
+#'   selects its own subgroup, and de-biases \emph{that} subgroup -- so the
+#'   collection describes MR's behaviour across fold-specific selections, not a
+#'   better estimate of the original quantity.  Averaging them, or pooling
+#'   their intervals, is an error.
 #'
 #' @return List with components:
 #' \describe{
@@ -368,9 +727,67 @@ forestsearch_Kfold <- function(
 #'   \item{find_summary}{Named vector of median subgroup-finding metrics}
 #'   \item{sens_out}{Matrix of sensitivity metrics (sims x metrics)}
 #'   \item{find_out}{Matrix of finding metrics (sims x metrics)}
+#'   \item{fold_summary}{Data frame with one row per (sim, fold) combination.
+#'     Columns: \code{sim}, \code{fold}, \code{n_test}, \code{sg1}, \code{sg2},
+#'     \code{grf_cuts}, \code{pconsistency}, \code{training_fs_hr},
+#'     \code{n_candidates_evaluated}, \code{any_found}.  The
+#'     \code{grf_cuts} column records the GRF policy-tree cut
+#'     expressions returned for each training fold (collapsed with
+#'     " | " when multiple cuts are returned; \code{NA} when GRF was
+#'     not used, failed, or returned no cuts).  The \code{pconsistency}
+#'     column records the consistency probability (\code{Pcons})
+#'     achieved by the identified subgroup on each fold (\code{NA_real_}
+#'     when no subgroup was identified or the training ForestSearch
+#'     call errored).  The \code{training_fs_hr} column records the
+#'     in-sample effect estimate for the identified subgroup on the
+#'     training fold, on its NATURAL SCALE regardless of outcome type
+#'     (hazard ratio for survival; odds ratio, rate ratio, or risk
+#'     ratio for GLM ratio measures after internal exponentiation;
+#'     mean/risk difference for GLM additive measures); optimistically
+#'     biased relative to any independent estimate and surfaced for
+#'     diagnostic comparison only, with \code{NA_real_} when no
+#'     subgroup was identified.  The \code{n_candidates_evaluated}
+#'     column records the integer count of candidate subgroups
+#'     actually evaluated for consistency on this training fold
+#'     (populated whenever the consistency stage ran, even if zero
+#'     candidates met the threshold and thus no subgroup was
+#'     identified; \code{NA_integer_} when the training call errored
+#'     or consistency evaluation did not run).  Always returned
+#'     (compact; cheap).  Lets you tabulate, for example, which
+#'     subgroup was identified in each fold of each simulation, the
+#'     empirical distribution of GRF cut choices across the full
+#'     sim x fold grid, the relationship between GRF's cut and the
+#'     final identified subgroup, or the near-miss consistency values
+#'     among folds that did not surface a subgroup.}
+#'   \item{resCV_all}{List of length \code{sims}; element \emph{i} is the
+#'     per-subject \code{resCV} data frame from simulation \emph{i}.  Only
+#'     populated when \code{keep_resCV = TRUE}; otherwise \code{NULL}.}
 #'   \item{timing_minutes}{Total execution time}
 #'   \item{sims}{Number of simulations run}
 #'   \item{Kfolds}{Number of folds per simulation}
+#'   \item{mr_replicates}{\code{NULL} under the default
+#'     \code{mr_in_replicates = FALSE}.  Otherwise a nested list: one element
+#'     per successful simulation (named \code{sim<k>}), each a list of length
+#'     \code{Kfolds} holding that fold's \code{mr_inference} object (or
+#'     \code{NULL}), computed against \emph{that fold's} candidate family and
+#'     selected subgroup.  Not aggregable -- see the \code{mr_in_replicates}
+#'     parameter.}
+#' }
+#'
+#' @examples
+#' \dontrun{
+#' # Run 100 repetitions of 10-fold CV
+#' tenfold_results <- forestsearch_tenfold(
+#'   fs.est = fs_result,
+#'   sims = 100,
+#'   Kfolds = 10,
+#'   parallel_args = list(plan = "multisession", workers = 6),
+#'   details = TRUE
+#' )
+#'
+#' # View summary
+#' print(tenfold_results$sens_summary)
+#' print(tenfold_results$find_summary)
 #' }
 #'
 #' @seealso
@@ -389,7 +806,9 @@ forestsearch_tenfold <- function(
     Kfolds = 10,
     details = TRUE,
     seed = 8316951L,
-    parallel_args = list(plan = "multisession", workers = 6, show_message = TRUE)
+    parallel_args = list(plan = "multisession", workers = 6, show_message = TRUE),
+    keep_resCV = FALSE,
+    mr_in_replicates = FALSE
 ) {
 
   # ===========================================================================
@@ -446,18 +865,77 @@ forestsearch_tenfold <- function(
   id.name <- fs_args$id.name
   confounders.name <- fs_args$confounders.name
 
-  get_names <- c(confounders.name, outcome.name, event.name, id.name, treat.name)
-
-  # Prepare base data
-  dfa <- fs.est$df.est[, c(get_names, "treat.recommend")]
-  names(dfa)[names(dfa) == "treat.recommend"] <- "treat.recommend.original"
-  dfnew <- as.data.frame(dfa)
+  # Prepare base data.  .fs_cv_base_frame() builds the per-subject frame
+  # uniformly: the processed df.est when a subgroup was found (byte-identical
+  # to the former inline selection + rename), or an ITT fallback from the
+  # original analysis frame -- with the placeholder event column re-created so
+  # continuous/count selections by event.name do not fail -- when the primary
+  # fit identified no subgroup (df.est NULL).
+  dfnew <- .fs_cv_base_frame(fs.est)
 
   # Configure CV arguments (sequential within each simulation)
   cv_args <- fs_args
   cv_args$parallel_args <- list(plan = "sequential", workers = 1, show_message = FALSE)
   cv_args$details <- FALSE
+  cv_args$quiet <- TRUE
   cv_args$plot.sg <- FALSE
+
+  # PS must be re-estimated on each training fold -- NULL out any
+  # user-supplied ps_hat (wrong length for training fold).
+  # ps_method and ps_adjust_method carry through via args_call_all.
+  cv_args$ps_hat <- NULL
+
+  # CATEGORY 2: VARIABLE RE-SELECTION.  Identical to the bootstrap's block at
+  # bootstrap_analysis_dofuture.R:573-582, and stated as such here because the
+  # ABSENCE of this note is what let the two drift: the bootstrap nulled these
+  # four, CV nulled ps_hat on the same reasoning and left them, and nothing
+  # recorded that the difference was unintended.
+  cv_args$grf_res <- NULL
+  cv_args$grf_cuts <- NULL
+  # DINA inputs must also be nulled so each fold re-fits DINA and re-runs its
+  # selection from scratch -- otherwise a supplied/cached DINA fit (use_dina
+  # screening or subgroup_method = "dina") would be reused on every fold,
+  # defeating the out-of-sample estimate the cross-validation exists to
+  # provide.  These arrive via args_call_all's bulk mget() of forestsearch()'s
+  # formals, so they are present in cv_args whenever the original call supplied
+  # them; a cached fit would otherwise be estimated on ALL the data, including
+  # the held-out fold, making sensCV / ppvCV / exact-match optimistic by
+  # construction.
+  cv_args$dina_res <- NULL
+  cv_args$dina_cuts <- NULL
+
+  # Post-selection inference inside the folds.  Same contract as
+  # forestsearch_Kfold() and the bootstrap: mr_inference arrives via
+  # args_call_all, nothing downstream consumes a fold's MR object, so under the
+  # default it is stripped rather than computed and discarded.  Here the waste
+  # is sims * Kfolds MR runs, not Kfolds.  The top-level analysis is untouched.
+  if (!isTRUE(mr_in_replicates)) {
+    cv_args$mr_inference <- FALSE
+  } else {
+    # MR alignment guard.  Same check and same message as forestsearch_Kfold()
+    # and the bootstrap: with mr_in_replicates = TRUE, mr_inference propagates
+    # unchanged into every fold, so a misaligned identifier would run a
+    # misaligned re-selection sims * Kfolds times.
+    .validate_mr_configuration(
+      fs_args,
+      context = "forestsearch_tenfold(mr_in_replicates = TRUE)")
+
+    # C.3 -- ONE message before the simulation loop, never one per fold and
+    # never one per simulation.  `quiet` is not a formal here, so the original
+    # analysis's setting governs.
+    .mr_msg(isTRUE(fs_args$quiet), sprintf(
+      paste0("Multiplier resampling (MR) will run inside each of the %d folds ",
+             "in each of the %d simulations (%d runs) and the results will be ",
+             "retained in $mr_replicates.\n  These are not aggregable into an ",
+             "estimate for the original analysis: each fold corrects a ",
+             "different selected subgroup."),
+      Kfolds, sims, Kfolds * sims))
+    if (!isTRUE(fs_args$mr_inference))
+      .mr_msg(isTRUE(fs_args$quiet),
+        paste0("  Note: the original analysis was fitted with ",
+               "mr_inference = FALSE, so no fold will produce an MR object ",
+               "and $mr_replicates will be all NULL."))
+  }
 
   # ===========================================================================
   # SECTION 3.1: VERIFY CV FORESTSEARCH PARAMETERS (when details = TRUE)
@@ -487,6 +965,32 @@ forestsearch_tenfold <- function(
     # Run K-fold CV sequentially within this simulation
     resCV_list <- vector("list", Kfolds)
 
+    # Per-fold MR objects, populated only when retention was requested.  Stays
+    # a list of NULLs otherwise, and is dropped from the sim's return value.
+    mr_list <- vector("list", Kfolds)
+
+    grf_cuts_list <- vector("list", Kfolds)
+
+    # Per-fold Pcons capture (Phase B).  NA_real_ when no subgroup was
+    # identified or the training FS call errored; otherwise the Pcons
+    # value carried on the top-ranked result row (same access path as
+    # bootstrap_analysis_dofuture.R).
+    pconsistency_list <- rep(NA_real_, Kfolds)
+
+    # Per-fold training-subgroup HR.  Captured from the same top-ranked
+    # result row as pconsistency.  This is the IN-SAMPLE (training-fold)
+    # HR and will be optimistically biased relative to any independent
+    # estimate; it is surfaced for diagnostic comparison only, not
+    # inference.  NA_real_ when no subgroup was identified.
+    training_fs_hr_list <- rep(NA_real_, Kfolds)
+
+    # Per-fold candidate count.  Integer number of candidate subgroups
+    # actually evaluated for consistency on this training fold.
+    # Populated whenever the consistency stage ran (even if zero
+    # candidates passed the threshold); NA_integer_ when the training
+    # FS call errored or consistency evaluation did not run at all.
+    n_candidates_list <- rep(NA_integer_, Kfolds)
+
     for (cv_index in seq_len(Kfolds)) {
       testIndexes <- which(folds == cv_index, arr.ind = TRUE)
       x.test <- df_scrambled[testIndexes, ]
@@ -496,7 +1000,29 @@ forestsearch_tenfold <- function(
 
       fs.train <- suppressWarnings(try(do.call(forestsearch, cv_args), TRUE))
 
-      if (!inherits(fs.train, "try-error") && !is.null(fs.train$sg.harm)) {
+      # A genuine refit ERROR is fatal (see forestsearch_Kfold for rationale).
+      # The inner fold loop is sequential, so this propagates to the sim-level
+      # foreach; `.collect_cv_results()` (called after the foreach, before the
+      # valid-results Filter) re-raises it so a refit crash aborts the whole
+      # run rather than being silently dropped as a failed simulation.
+      if (inherits(fs.train, "try-error")) {
+        stop(
+          sprintf(
+            paste0(
+              "forestsearch CV halted: training refit FAILED on sim %d, ",
+              "fold %d of %d.\n",
+              "  This is a refit ERROR, not a legitimate no-subgroup fold - ",
+              "CV cannot continue.\n",
+              "  Verbatim error from forestsearch(): %s"
+            ),
+            ksim, cv_index, Kfolds,
+            conditionMessage(attr(fs.train, "condition"))
+          ),
+          call. = FALSE
+        )
+      }
+
+      if (!is.null(fs.train$sg.harm)) {
         sg1 <- fs.train$sg.harm[1]
         sg2 <- if (length(fs.train$sg.harm) > 1) fs.train$sg.harm[2] else NA
 
@@ -505,21 +1031,119 @@ forestsearch_tenfold <- function(
         df.test$sg1 <- sg1
         df.test$sg2 <- sg2
 
+        # Capture Pcons and training-fold subgroup effect estimate
+        # (top-ranked result row).  Same access pattern as
+        # bootstrap_results() uses for the bootstrap
+        # grp.consistency$out_sg$result slot.
+        #
+        # Phase B note on scale: the "hr" column in sg_result stores
+        # the effect estimate on the scale that forestsearch()'s
+        # internal search used.  For survival this is HR on natural
+        # scale.  For GLM with ratio-measure effect_measure (OR, IRR,
+        # RR), the stored value is log-scale; we exponentiate at
+        # capture so the training_fs_hr column is ALWAYS on natural
+        # scale regardless of outcome type.  For additive GLM measures
+        # (RD, IRD, MD) the value is already identity-scale and we
+        # leave it alone.
+        sg_result <- fs.train$grp.consistency$out_sg$result
+        if (!is.null(sg_result) && is.data.frame(sg_result) &&
+            nrow(sg_result) > 0L) {
+          if ("Pcons" %in% names(sg_result)) {
+            pconsistency_list[cv_index] <- as.numeric(
+              sg_result[1L, "Pcons"]
+            )
+          }
+          if ("hr" %in% names(sg_result)) {
+            raw_val <- as.numeric(sg_result[1L, "hr"])
+
+            # Detect whether the stored value is on log scale.  Survival
+            # stores HR on natural scale; GLM ratio measures store log
+            # values; GLM additive measures store identity values.
+            otype_tr <- fs.train$outcome_type
+            emeas_tr <- fs.train$effect_measure
+            is_glm_tr     <- !is.null(otype_tr) && otype_tr != "survival"
+            is_log_scale  <- is_glm_tr &&
+              !is.null(emeas_tr) &&
+              emeas_tr %in% c("OR", "IRR", "RR")
+
+            training_fs_hr_list[cv_index] <- if (is_log_scale) {
+              exp(raw_val)
+            } else {
+              raw_val
+            }
+          }
+        }
+
       } else {
         df.test <- x.test
         df.test$cvindex <- cv_index
-        df.test$sg1 <- NA
-        df.test$sg2 <- NA
+        df.test$sg1 <- NA_character_      # typed NA: avoids logical -> character
+        df.test$sg2 <- NA_character_      # coercion surprises in downstream rbind
         df.test$treat.recommend <- 1.0
       }
 
-      resCV_list[[cv_index]] <- df.test[, c(id.name, outcome.name, event.name, treat.name,
-                                            "treat.recommend", "treat.recommend.original",
-                                            "cvindex", "sg1", "sg2")]
+      # Capture candidate count independently of subgroup identification.
+      # The consistency stage may have run and evaluated N candidates
+      # even when zero candidates met the threshold (and thus sg.harm
+      # is NULL).
+      if (!inherits(fs.train, "try-error") &&
+          !is.null(fs.train$grp.consistency) &&
+          !is.null(fs.train$grp.consistency$n_candidates_evaluated)) {
+        n_candidates_list[cv_index] <- as.integer(
+          fs.train$grp.consistency$n_candidates_evaluated
+        )
+      }
+
+      # Capture training-fold GRF cuts (may be NULL, character(), or vector).
+      # Collapse to a single string for compact storage in fold_summary.
+      if (!inherits(fs.train, "try-error") &&
+          !is.null(fs.train$grf_cuts) &&
+          length(fs.train$grf_cuts) > 0L) {
+        grf_cuts_list[[cv_index]] <- paste(fs.train$grf_cuts, collapse = " | ")
+      } else {
+        grf_cuts_list[[cv_index]] <- NA_character_
+      }
+
+      .keep <- unique(c(id.name, outcome.name, event.name, treat.name,
+                        "treat.recommend", "treat.recommend.original",
+                        "cvindex", "sg1", "sg2",
+                        intersect(.fs_adjust_vars(cv_args$adjust_covariates),
+                                  names(df.test))))
+      resCV_list[[cv_index]] <- as.data.frame(df.test)[, .keep, drop = FALSE]
+
+      # Retain this fold's MR object.  No attribute round-trip is needed here
+      # (unlike the Kfold/bootstrap arms): the simulation returns a named list,
+      # so the per-fold objects can be carried directly.
+      if (isTRUE(mr_in_replicates)) mr_list[[cv_index]] <- fs.train$mr_inference
     }
 
     resCV <- do.call(rbind, resCV_list)
     resCV <- as.data.frame(resCV)
+
+    # Compact per-fold summary (always preserved; ~6 * Kfolds bytes).
+    # Use as.character() to defend against any logical-NA columns that
+    # slip through the rbind type coercion above.
+    fold_summary_i <- data.frame(
+      sim                    = ksim,
+      fold                   = seq_len(Kfolds),
+      n_test                 = vapply(resCV_list, nrow, integer(1)),
+      sg1                    = vapply(resCV_list,
+                                      function(x) as.character(x$sg1[1]),
+                                      character(1)),
+      sg2                    = vapply(resCV_list,
+                                      function(x) as.character(x$sg2[1]),
+                                      character(1)),
+      grf_cuts               = vapply(grf_cuts_list,
+                                      function(x) if (is.null(x)) NA_character_ else x,
+                                      character(1)),
+      pconsistency           = pconsistency_list,
+      training_fs_hr         = training_fs_hr_list,
+      n_candidates_evaluated = n_candidates_list,
+      stringsAsFactors = FALSE
+    )
+    fold_summary_i$any_found <- as.integer(
+      !is.na(fold_summary_i$sg1) | !is.na(fold_summary_i$sg2)
+    )
 
     # Summarize this simulation
     res <- list(
@@ -536,12 +1160,20 @@ forestsearch_tenfold <- function(
       sg1.name = "Recommend"
     )
 
+    # sg_analysis is optional in forestsearch_KfoldOut(): when the primary fit
+    # identified no subgroup (fs.est$sg.harm NULL) it returns the zero/NA
+    # metric shape directly, so the no-subgroup case needs no special-casing
+    # here.  Fold-level identification is still recorded independently in
+    # fold_summary_i.
     out <- forestsearch_KfoldOut(res = res, outall = FALSE, details = FALSE)
 
     list(
       sens_metrics_original = out$sens_metrics_original,
-      find_metrics = out$find_metrics,
-      sim_id = ksim
+      find_metrics          = out$find_metrics,
+      sim_id                = ksim,
+      fold_summary          = fold_summary_i,
+      resCV                 = if (isTRUE(keep_resCV)) resCV else NULL,
+      mr_replicates         = if (isTRUE(mr_in_replicates)) mr_list else NULL
     )
   }
 })
@@ -549,6 +1181,11 @@ forestsearch_tenfold <- function(
   # ===========================================================================
   # SECTION 5: COMBINE AND SUMMARIZE RESULTS
   # ===========================================================================
+
+  # A refit failure in any fold re-raises as a sim-level error condition (see
+  # the fold loop above).  Halt loudly on the FIRST such error before the
+  # Filter below would silently drop it and complete with fewer simulations.
+  .collect_cv_results(simulation_results, combine = FALSE)
 
   # Extract metrics from successful simulations
   valid_results <- Filter(function(x) !inherits(x, "error") && is.list(x), simulation_results)
@@ -563,6 +1200,30 @@ forestsearch_tenfold <- function(
 
   sens_out <- do.call(rbind, lapply(valid_results, `[[`, "sens_metrics_original"))
   find_out <- do.call(rbind, lapply(valid_results, `[[`, "find_metrics"))
+
+  # Stack fold-level summaries across simulations (always produced).
+  fold_summary_all <- do.call(
+    rbind, lapply(valid_results, `[[`, "fold_summary")
+  )
+  rownames(fold_summary_all) <- NULL
+
+  # Preserve full per-subject CV predictions only if requested.
+  resCV_all <- if (isTRUE(keep_resCV)) {
+    lapply(valid_results, `[[`, "resCV")
+  } else {
+    NULL
+  }
+
+  # Per-fold MR objects, nested one level: outer element per SUCCESSFUL
+  # simulation (named by its sim_id, so a dropped simulation is visible as a
+  # gap rather than a silent re-index), inner element per fold.
+  mr_replicates <- if (isTRUE(mr_in_replicates)) {
+    mrl <- lapply(valid_results, `[[`, "mr_replicates")
+    names(mrl) <- paste0("sim", vapply(valid_results, `[[`, numeric(1), "sim_id"))
+    mrl
+  } else {
+    NULL
+  }
 
   # Compute summaries
   sens_summary <- apply(sens_out, 2, median, na.rm = TRUE)
@@ -583,13 +1244,19 @@ forestsearch_tenfold <- function(
   # ===========================================================================
 
   result <- list(
-    sens_summary = sens_summary,
-    find_summary = find_summary,
-    sens_out = sens_out,
-    find_out = find_out,
+    sens_summary   = sens_summary,
+    find_summary   = find_summary,
+    sens_out       = sens_out,
+    find_out       = find_out,
+    fold_summary   = fold_summary_all,
+    resCV_all      = resCV_all,
     timing_minutes = t_min,
-    sims = length(valid_results),
-    Kfolds = Kfolds
+    sims           = length(valid_results),
+    Kfolds         = Kfolds,
+    # NULL under the default; nested sims x Kfolds when retention was
+    # requested.  See the mr_in_replicates @param for why these must not be
+    # averaged.
+    mr_replicates  = mr_replicates
   )
 
   class(result) <- c("fs_tenfold", "list")
@@ -608,27 +1275,42 @@ forestsearch_tenfold <- function(
 #' @param details Logical. Print details during execution (default: FALSE).
 #' @param outall Logical. If TRUE, returns all summary tables; if FALSE, returns
 #'   only metrics (default: FALSE).
+#' @param digits Integer. Decimal places for construction-time numeric
+#'   formatting in the per-fold summary tables built when
+#'   \code{outall = TRUE} (arm summaries, Diff, effect-estimate CI).
+#'   Default 4 to provide round-down headroom for downstream display
+#'   reformatting (e.g., \code{\link{cv_summary_tables}(digits = ...)}).
+#'   Threaded through \code{\link{SG_tab_estimates_glm}} for GLM
+#'   outcomes.  Ignored when \code{outall = FALSE}.
 #'
 #' @return If \code{outall=FALSE}, a list with \code{sens_metrics_original} and
 #'   \code{find_metrics}. If \code{outall=TRUE}, a list with summary tables and metrics.
 #'
-#' @importFrom stringr str_sub str_length
+
+#' @examples
+#' \dontrun{
+#' library(survival)
+#' df <- survival::gbsg
+#' df$grade3 <- as.integer(df$grade == "3")
+#' fs <- forestsearch(df,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+#' oob <- forestsearch_Kfold(fs.est = fs, Kfolds = nrow(df))
+#' result <- forestsearch_KfoldOut(oob, outall = TRUE)
+#' }
 #' @export
 
-forestsearch_KfoldOut <- function(res, details = FALSE, outall = FALSE) {
+forestsearch_KfoldOut <- function(res, details = FALSE, outall = FALSE,
+                                  digits = 4) {
 
   # ===========================================================================
   # INPUT VALIDATION
   # ===========================================================================
 
-  if (!requireNamespace("stringr", quietly = TRUE)) {
-    stop("Package 'stringr' required: If issues loading consider substituting
-         'stringr::str_sub(x,start,end)' with 'substr(x,start,end)' and
-         'stringr::str_length(x)' with 'nchar(x)'.")
-  }
-
   # List of required elements in res
-  required_elements <- c("cv_args", "sg_analysis", "sg0.name", "sg1.name", "Kfolds", "resCV")
+  # sg_analysis is OPTIONAL: NULL means the primary fit identified no subgroup,
+  # a valid 0%-identification input.  The remaining elements are required.
+  required_elements <- c("cv_args", "sg0.name", "sg1.name", "Kfolds", "resCV")
   missing_elements <- required_elements[!sapply(required_elements, function(x) !is.null(res[[x]]))]
   if (length(missing_elements) > 0) {
     stop("The following elements are missing in 'res': ", paste(missing_elements, collapse = ", "))
@@ -650,6 +1332,7 @@ forestsearch_KfoldOut <- function(res, details = FALSE, outall = FALSE) {
   event.name <- res$cv_args$event.name
   treat.name <- res$cv_args$treat.name
   sg_analysis <- res$sg_analysis
+  no_original_sg <- is.null(sg_analysis)   # primary fit identified no subgroup
   sg0.name <- res$sg0.name
   sg1.name <- res$sg1.name
   est.scale <- if (!is.null(res$cv_args$est.scale)) res$cv_args$est.scale else "hr"
@@ -675,62 +1358,74 @@ forestsearch_KfoldOut <- function(res, details = FALSE, outall = FALSE) {
   # COMPUTE CV SUMMARY METRICS
   # ===========================================================================
 
-  CV_summary <- CV_sgs(
-    sg1 = sg1,
-    sg2 = sg2,
-    confs = confounders.name,
-    sg_analysis = sg_analysis
-  )
-
-  if (details) {
-    cat("Any found:", mean(CV_summary$any_found), "\n")
-    cat("Exact match:", mean(CV_summary$exact_match), "\n")
-    cat("At least 1 match:", mean(CV_summary$one_match), "\n")
-    cat("Cov 1 any:", mean(CV_summary$cov1_any), "\n")
-    cat("Cov 2 any:", mean(CV_summary$cov2_any, na.rm = TRUE), "\n")
-    cat("Cov 1 and 2 any:", mean(ifelse(CV_summary$cov1_any & CV_summary$cov2_any, 1, 0), na.rm = TRUE), "\n")
-    cat("Cov 1 exact:", mean(CV_summary$cov1_exact), "\n")
-    cat("Cov 2 exact:", mean(CV_summary$cov2_exact, na.rm = TRUE), "\n")
-  }
-
-  find_metrics <- c(
-    mean(CV_summary$any_found),
-    mean(CV_summary$exact_match),
-    mean(CV_summary$one_match),
-    mean(CV_summary$cov1_any),
-    mean(CV_summary$cov2_any, na.rm = TRUE),
-    mean(ifelse(CV_summary$cov1_any & CV_summary$cov2_any, 1, 0), na.rm = TRUE),
-    mean(CV_summary$cov1_exact),
-    mean(CV_summary$cov2_exact, na.rm = TRUE)
-  )
-  names(find_metrics) <- c("Any", "Exact", "At least 1", "Cov1", "Cov2",
-                           "Cov 1 & 2", "Cov1 exact", "Cov2 exact")
-
-  # ===========================================================================
-  # COMPUTE SENSITIVITY/PPV METRICS
-  # ===========================================================================
-
+  # n_sgfound drives table assembly below; compute it regardless of whether an
+  # original subgroup exists.
   n_sgfound <- length(unique(df_CV$treat.recommend))
 
-  if (n_sgfound == 2) {
-    tabit <- with(df_CV, table(treat.recommend, treat.recommend.original))
-    sensH <- tabit[1, 1] / sum(tabit[, 1])
-    sensHc <- tabit[2, 2] / sum(tabit[, 2])
-    ppvH <- tabit[1, 1] / sum(tabit[1, ])
-    ppvHc <- tabit[2, 2] / sum(tabit[2, ])
+  if (no_original_sg) {
+    # No original subgroup to score CV agreement against: zero finding metrics
+    # and NA sensitivity/PPV (same 0/NA shape as the tenfold per-sim
+    # no-subgroup guard).  Any subgroups the folds did find are recorded
+    # separately in SGs_found.
+    CV_summary <- NULL
+    find_metrics <- stats::setNames(
+      rep(0, 8L),
+      c("Any", "Exact", "At least 1", "Cov1", "Cov2",
+        "Cov 1 & 2", "Cov1 exact", "Cov2 exact"))
+    sens_metrics_original <- stats::setNames(
+      rep(NA_real_, 4L), c("sens_H", "sens_Hc", "ppv_H", "ppv_Hc"))
   } else {
-    tabit <- with(df_CV, table(treat.recommend, treat.recommend.original))
-    sensH <- if (nrow(tabit) > 0 && ncol(tabit) > 0) tabit[1, 1] / sum(tabit[, 1]) else NA
-    sensHc <- NA
-    ppvH <- if (nrow(tabit) > 0) tabit[1, 1] / sum(tabit[1, ]) else NA
-    ppvHc <- NA
-  }
+    CV_summary <- CV_sgs(
+      sg1 = sg1,
+      sg2 = sg2,
+      confs = confounders.name,
+      sg_analysis = sg_analysis
+    )
 
-  sens_metrics_original <- c(sensH, sensHc, ppvH, ppvHc)
-  names(sens_metrics_original) <- c("sens_H", "sens_Hc", "ppv_H", "ppv_Hc")
+    if (details) {
+      cat("Any found:", mean(CV_summary$any_found), "\n")
+      cat("Exact match:", mean(CV_summary$exact_match), "\n")
+      cat("At least 1 match:", mean(CV_summary$one_match), "\n")
+      cat("Cov 1 any:", mean(CV_summary$cov1_any), "\n")
+      cat("Cov 2 any:", mean(CV_summary$cov2_any, na.rm = TRUE), "\n")
+      cat("Cov 1 and 2 any:", mean(ifelse(CV_summary$cov1_any & CV_summary$cov2_any, 1, 0), na.rm = TRUE), "\n")
+      cat("Cov 1 exact:", mean(CV_summary$cov1_exact), "\n")
+      cat("Cov 2 exact:", mean(CV_summary$cov2_exact, na.rm = TRUE), "\n")
+    }
 
-  if (details) {
-    cat("Agreement (sens, ppv) in H and Hc:", c(sensH, sensHc, ppvH, ppvHc), "\n")
+    find_metrics <- c(
+      mean(CV_summary$any_found),
+      mean(CV_summary$exact_match),
+      mean(CV_summary$one_match),
+      mean(CV_summary$cov1_any),
+      mean(CV_summary$cov2_any, na.rm = TRUE),
+      mean(ifelse(CV_summary$cov1_any & CV_summary$cov2_any, 1, 0), na.rm = TRUE),
+      mean(CV_summary$cov1_exact),
+      mean(CV_summary$cov2_exact, na.rm = TRUE)
+    )
+    names(find_metrics) <- c("Any", "Exact", "At least 1", "Cov1", "Cov2",
+                             "Cov 1 & 2", "Cov1 exact", "Cov2 exact")
+
+    if (n_sgfound == 2) {
+      tabit <- with(df_CV, table(treat.recommend, treat.recommend.original))
+      sensH <- tabit[1, 1] / sum(tabit[, 1])
+      sensHc <- tabit[2, 2] / sum(tabit[, 2])
+      ppvH <- tabit[1, 1] / sum(tabit[1, ])
+      ppvHc <- tabit[2, 2] / sum(tabit[2, ])
+    } else {
+      tabit <- with(df_CV, table(treat.recommend, treat.recommend.original))
+      sensH <- if (nrow(tabit) > 0 && ncol(tabit) > 0) tabit[1, 1] / sum(tabit[, 1]) else NA
+      sensHc <- NA
+      ppvH <- if (nrow(tabit) > 0) tabit[1, 1] / sum(tabit[1, ]) else NA
+      ppvHc <- NA
+    }
+
+    sens_metrics_original <- c(sensH, sensHc, ppvH, ppvHc)
+    names(sens_metrics_original) <- c("sens_H", "sens_Hc", "ppv_H", "ppv_Hc")
+
+    if (details) {
+      cat("Agreement (sens, ppv) in H and Hc:", c(sensH, sensHc, ppvH, ppvHc), "\n")
+    }
   }
 
   # ===========================================================================
@@ -738,7 +1433,226 @@ forestsearch_KfoldOut <- function(res, details = FALSE, outall = FALSE) {
   # ===========================================================================
 
   if (outall) {
-    # Generate detailed tables
+    # Detect GLM outcome type -- SG_tab_estimates() is survival-specific
+    outcome_type <- res$cv_args$outcome_type
+    is_glm <- !is.null(outcome_type) && outcome_type != "survival"
+
+    if (no_original_sg) {
+      # No original subgroup identified: return ITT-only tables.  There is no
+      # subgroup to tabulate, and the survival subgroup-table path would split
+      # an all-ITT sample into an empty complementary arm.  ITT is the whole
+      # sample, so its table is well defined for every outcome family.
+      if (is_glm) {
+        effect_measure <- res$cv_args$effect_measure
+        if (is.null(effect_measure)) {
+          effect_measure <- switch(outcome_type,
+            binary = "RD", continuous = "MD", count = "IRR", "RD")
+        }
+        estimator_fn_cv <- tryCatch(
+          make_effect_estimator(
+            outcome_type      = outcome_type,
+            treat.name        = treat.name,
+            outcome.name      = outcome.name,
+            offset.name       = res$cv_args$offset.name,
+            effect_measure    = effect_measure,
+            adjust_covariates = res$cv_args$adjust_covariates),
+          error = function(e) NULL)
+        itt_tab <- tryCatch(
+          SG_tab_estimates_glm(
+            df = as.data.frame(df_CV), SG_flag = "ITT",
+            outcome.name = outcome.name, treat.name = treat.name,
+            estimator_fn = estimator_fn_cv, effect_measure = effect_measure,
+            outcome_type = outcome_type, est.scale = est.scale, digits = digits),
+          error = function(e) {
+            if (details) cat("GLM ITT table failed:", e$message, "\n"); NULL })
+        out <- list(itt_tab = itt_tab, SG_tab_original = NULL,
+                    SG_tab_Kfold = NULL, CV_summary = CV_summary,
+                    sens_metrics_original = sens_metrics_original,
+                    find_metrics = find_metrics, SGs_found = SGs_found,
+                    tab_all = itt_tab, outcome_type = outcome_type,
+                    effect_measure = effect_measure)
+      } else {
+        itt_tab <- tryCatch(
+          SG_tab_estimates(
+            df = as.data.frame(df_CV), SG_flag = "ITT", draws = 0,
+            details = FALSE, outcome.name = outcome.name,
+            event.name = event.name, treat.name = treat.name,
+            strata.name = NULL, potentialOutcome.name = NULL,
+            est.scale = est.scale, sg0_name = "Questionable",
+            sg1_name = "Recommend"),
+          error = function(e) NULL)
+        out <- list(itt_tab = itt_tab, SG_tab_original = NULL,
+                    SG_tab_Kfold = NULL, CV_summary = CV_summary,
+                    sens_metrics_original = sens_metrics_original,
+                    find_metrics = find_metrics, SGs_found = SGs_found,
+                    tab_all = itt_tab)
+      }
+      return(out)
+    }
+
+    if (is_glm) {
+      # GLM outcomes: detailed tables via SG_tab_estimates_glm
+      effect_measure <- res$cv_args$effect_measure
+      if (is.null(effect_measure)) {
+        effect_measure <- switch(outcome_type,
+          binary     = "RD",
+          continuous = "MD",
+          count      = "IRR",
+          "RD"
+        )
+      }
+      offset.name <- res$cv_args$offset.name
+
+      # Build estimator closure for the table
+      estimator_fn_cv <- tryCatch(
+        make_effect_estimator(
+          outcome_type      = outcome_type,
+          treat.name        = treat.name,
+          outcome.name      = outcome.name,
+          offset.name       = offset.name,
+          effect_measure    = effect_measure,
+          adjust_covariates = res$cv_args$adjust_covariates
+        ),
+        error = function(e) NULL
+      )
+
+      # ITT table.
+      # Note: outcome_type MUST be passed explicitly.  SG_tab_estimates_glm()
+      # defaults to "binary", which mislabels columns ("Rate(C)/(T)" vs
+      # "Mean(C)/(T)") and percent-formats values for continuous/count
+      # outcomes.
+      itt_tab <- tryCatch(
+        SG_tab_estimates_glm(
+          df             = as.data.frame(df_CV),
+          SG_flag        = "ITT",
+          outcome.name   = outcome.name,
+          treat.name     = treat.name,
+          estimator_fn   = estimator_fn_cv,
+          effect_measure = effect_measure,
+          outcome_type   = outcome_type,
+          est.scale      = est.scale,
+          digits         = digits
+        ),
+        error = function(e) {
+          if (details) cat("GLM ITT table failed:", e$message, "\n")
+          NULL
+        }
+      )
+
+      # Original subgroup table (full-data assignments)
+      SG_tab_original <- tryCatch(
+        SG_tab_estimates_glm(
+          df             = as.data.frame(df_CV),
+          SG_flag        = "treat.recommend.original",
+          outcome.name   = outcome.name,
+          treat.name     = treat.name,
+          estimator_fn   = estimator_fn_cv,
+          effect_measure = effect_measure,
+          outcome_type   = outcome_type,
+          sg1_name       = sg1.name,
+          sg0_name       = sg0.name,
+          est.scale      = est.scale,
+          digits         = digits
+        ),
+        error = function(e) {
+          if (details) cat("GLM original SG table failed:", e$message, "\n")
+          NULL
+        }
+      )
+
+      # K-fold subgroup table
+      if (n_sgfound == 2) {
+        SG_tab_Kfold <- tryCatch(
+          SG_tab_estimates_glm(
+            df             = as.data.frame(df_CV),
+            SG_flag        = "treat.recommend",
+            outcome.name   = outcome.name,
+            treat.name     = treat.name,
+            estimator_fn   = estimator_fn_cv,
+            effect_measure = effect_measure,
+            outcome_type   = outcome_type,
+            sg1_name       = sg1.name,
+            sg0_name       = sg0.name,
+            est.scale      = est.scale,
+            digits         = digits
+          ),
+          error = function(e) {
+            if (details) cat("GLM Kfold SG table failed:", e$message, "\n")
+            NULL
+          }
+        )
+      } else {
+        SG_tab_Kfold <- itt_tab
+      }
+
+      # Combine tables.  Column names produced by SG_tab_estimates_glm()
+      # depend on outcome_type and effect_measure:
+      #   Binary:           Subgroup, n, n1, Rate(C), Rate(T), Diff,
+      #                     {effect_measure} (95% CI)
+      #   Continuous/Count: Subgroup, n, n1, Mean(C), Mean(T), Diff,
+      #                     {effect_measure} (95% CI)
+      # Branch the column whitelist on outcome_type (mirrors the
+      # is_proportion logic in summary_utility_functions.R:280) and
+      # include "Diff" so the combined table is complete for every GLM
+      # outcome type.
+      tab_all <- NULL
+      eff_label <- paste0(effect_measure, " (95% CI)")
+      is_proportion <- outcome_type %in% c("binary")
+      c_label <- if (is_proportion) "Rate(C)" else "Mean(C)"
+      t_label <- if (is_proportion) "Rate(T)" else "Mean(T)"
+      glm_cols <- c("Subgroup", "n", "n1", c_label, t_label, "Diff",
+                    eff_label)
+
+      if (!is.null(itt_tab) && !is.null(SG_tab_original)) {
+        # Only select columns that actually exist in the tables
+        glm_cols_avail <- intersect(glm_cols, colnames(itt_tab))
+
+        if (length(glm_cols_avail) > 0) {
+          if (n_sgfound == 2 && !is.null(SG_tab_Kfold)) {
+            temp1  <- itt_tab[glm_cols_avail]
+            temp2a <- SG_tab_original[1, glm_cols_avail]
+            temp2b <- SG_tab_original[2, glm_cols_avail]
+            temp3a <- SG_tab_Kfold[1, glm_cols_avail]
+            temp3b <- SG_tab_Kfold[2, glm_cols_avail]
+            tab_all <- rbind(temp1, temp2a, temp3a, temp2b, temp3b)
+            # Rename effect column to just the measure name
+            colnames(tab_all)[colnames(tab_all) == eff_label] <- effect_measure
+            rownames(tab_all) <- c("Overall", "FA_0", "KfA_0", "FA_1", "KfA_1")
+          } else {
+            temp1  <- itt_tab[glm_cols_avail]
+            temp2a <- SG_tab_original[1, glm_cols_avail]
+            temp2b <- if (nrow(SG_tab_original) > 1) {
+              SG_tab_original[2, glm_cols_avail]
+            } else {
+              NULL
+            }
+            tab_all <- rbind(temp1, temp2a, temp2b)
+            colnames(tab_all)[colnames(tab_all) == eff_label] <- effect_measure
+            rownames(tab_all) <- if (is.null(temp2b)) {
+              c("Overall", "FA_0")
+            } else {
+              c("Overall", "FA_0", "FA_1")
+            }
+          }
+
+          if (details) print(tab_all)
+        }
+      }
+
+      out <- list(
+        itt_tab = itt_tab,
+        SG_tab_original = SG_tab_original,
+        SG_tab_Kfold = SG_tab_Kfold,
+        CV_summary = CV_summary,
+        sens_metrics_original = sens_metrics_original,
+        find_metrics = find_metrics,
+        SGs_found = SGs_found,
+        tab_all = tab_all,
+        outcome_type = outcome_type,
+        effect_measure = effect_measure
+      )
+    } else {
+    # Generate detailed tables (survival outcomes)
     itt_tab <- SG_tab_estimates(
       df = as.data.frame(df_CV),
       SG_flag = "ITT",
@@ -817,6 +1731,7 @@ forestsearch_KfoldOut <- function(res, details = FALSE, outall = FALSE) {
       SGs_found = SGs_found,
       tab_all = tab_all
     )
+    }  # end else (survival outall path)
   } else {
     out <- list(
       sens_metrics_original = sens_metrics_original,
@@ -837,17 +1752,18 @@ forestsearch_KfoldOut <- function(res, details = FALSE, outall = FALSE) {
 #' @param confs Character vector. Confounder names.
 #' @param sg_analysis Character vector. Subgroup analysis labels.
 #'
-#' @keywords internal
 #' @return List with indicators for any match, exact match, one match, and
 #'   covariate-specific matches.
 #'
-#' @importFrom stringr str_sub str_length
+
+#' @examples
+#' \dontrun{
+#' # CV_sgs() is called internally by forestsearch_KfoldOut().
+#' # See forestsearch_Kfold() and forestsearch_KfoldOut() for the entry points.
+#' }
+#' @export
 
 CV_sgs <- function(sg1, sg2, confs, sg_analysis) {
-
-  if (!requireNamespace("stringr", quietly = TRUE)) {
-    stop("Package 'stringr' required.")
-  }
 
   any_found <- ifelse(!is.na(sg1) | !is.na(sg2), 1, 0)
   sg_depth <- length(sg_analysis)
@@ -966,11 +1882,11 @@ find_covariate_any_match <- function(sg_target, sg1, sg2, confs) {
   # Handle case where multiple confounders match (e.g., "z1" and "z11")
   if (length(index_name) > 1) {
     confs2 <- confs[index_name]
-    lc <- stringr::str_length(confs2)
+    lc <- nchar(confs2)
     if (dda == 1) {
-      ctoget <- stringr::str_sub(sg_target, 2, max(lc))
+      ctoget <- substr(sg_target, 2, max(lc))
     } else {
-      ctoget <- stringr::str_sub(sg_target, 3, max(lc))
+      ctoget <- substr(sg_target, 3, max(lc))
     }
     itoget <- which(confs == ctoget)
     cfs <- confs[itoget]
@@ -1055,7 +1971,16 @@ resolve_cv_parallel_args <- function(parallel_args, fs_args, details = FALSE) {
 #'
 #' @param x An fs_kfold object
 #' @param ... Additional arguments (ignored)
-#' @return Invisibly returns \code{x}.
+#' @return `x`, invisibly. Called for its side effect of printing the
+#'   K-fold summary.
+#' @examples
+#' \dontrun{
+#' fs <- forestsearch(gbsg,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+#' oob <- forestsearch_Kfold(fs.est = fs)
+#' print(oob)
+#' }
 #' @export
 
 print.fs_kfold <- function(x, ...) {
@@ -1075,7 +2000,16 @@ print.fs_kfold <- function(x, ...) {
 #'
 #' @param x An fs_tenfold object
 #' @param ... Additional arguments (ignored)
-#' @return Invisibly returns \code{x}.
+#' @return `x`, invisibly. Called for its side effect of printing the
+#'   repeated K-fold summary.
+#' @examples
+#' \dontrun{
+#' fs <- forestsearch(gbsg,
+#'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
+#'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
+#' kfold <- forestsearch_tenfold(fs.est = fs, sims = 5)
+#' print(kfold)
+#' }
 #' @export
 
 print.fs_tenfold <- function(x, ...) {
@@ -1084,6 +2018,35 @@ print.fs_tenfold <- function(x, ...) {
   cat("Simulations:", x$sims, "\n")
   cat("Folds per simulation:", x$Kfolds, "\n")
   cat("Time:", round(x$timing_minutes, 2), "minutes\n")
+
+  # Fold-level summary (always present in objects created with
+  # forestsearch v0.3.0+; older objects may lack this field, so guard
+  # on its presence for forward/backward compatibility).
+  if (!is.null(x$fold_summary) && nrow(x$fold_summary) > 0) {
+    fs_any <- mean(x$fold_summary$any_found, na.rm = TRUE)
+    n_distinct_sg1 <- length(unique(
+      x$fold_summary$sg1[!is.na(x$fold_summary$sg1)]
+    ))
+    cat(sprintf(
+      "Folds with subgroup identified: %.1f%% (%d of %d sim x fold pairs)\n",
+      100 * fs_any,
+      sum(x$fold_summary$any_found, na.rm = TRUE),
+      nrow(x$fold_summary)
+    ))
+    cat(sprintf(
+      "Distinct leading subgroups across folds: %d\n", n_distinct_sg1
+    ))
+  }
+
+  # resCV_all preservation status
+  if (is.null(x$resCV_all)) {
+    cat("Per-subject resCV: not preserved",
+        "(set `keep_resCV = TRUE` to retain)\n")
+  } else {
+    cat(sprintf("Per-subject resCV: preserved for %d simulation(s)\n",
+                length(x$resCV_all)))
+  }
+
   cat("\nSensitivity Summary (median across simulations):\n")
   print(round(x$sens_summary, 3))
   cat("\nSubgroup Finding Summary (median across simulations):\n")
@@ -1100,8 +2063,10 @@ print_cv_params <- function(cv_args) {
   cat("  - fs.splits:", cv_args$fs.splits, "\n")
   cat("  - max_subgroups_search:", cv_args$max_subgroups_search, "\n")
   cat("  - hr.threshold:", cv_args$hr.threshold, "\n")
-  cat("  - hr.consistency:", cv_args$hr.consistency, "\n")
-  cat("  - pconsistency.threshold:", cv_args$pconsistency.threshold, "\n")
+  .c2_note <- .fs_c2_inert_note(cv_args$subgroup_method)
+  cat("  - hr.consistency:", cv_args$hr.consistency, .c2_note, "\n")
+  cat("  - pconsistency.threshold:", cv_args$pconsistency.threshold,
+      .c2_note, "\n")
   cat("  - n.min:", cv_args$n.min, "\n")
   cat("  - use_twostage:", cv_args$use_twostage, "\n")
   if (isTRUE(cv_args$use_twostage) && length(cv_args$twostage_args) > 0) {
@@ -1111,6 +2076,28 @@ print_cv_params <- function(cv_args) {
   }
   cat("  - use_lasso:", cv_args$use_lasso, "\n")
   cat("  - use_grf:", cv_args$use_grf, "\n")
+
+  # GLM extension parameters
+  outcome_type <- cv_args$outcome_type
+  if (!is.null(outcome_type) && outcome_type != "survival") {
+    cat("  - outcome_type:", outcome_type, "\n")
+    cat("  - effect_measure:", cv_args$effect_measure, "\n")
+    if (!is.null(cv_args$offset.name)) {
+      cat("  - offset.name:", cv_args$offset.name, "\n")
+    }
+    if (!is.null(cv_args$adverse_outcome)) {
+      cat("  - adverse_outcome:", cv_args$adverse_outcome, "\n")
+    }
+  }
+
+  # Propensity score parameters
+  ps_method <- cv_args$ps_method
+  if (!is.null(ps_method) && ps_method != "none") {
+    cat("  - ps_method:", ps_method, "\n")
+    cat("  - ps_adjust_method:", cv_args$ps_adjust_method, "\n")
+    cat("  - ps_hat: re-estimated on each fold\n")
+  }
+
   cat("  - (per-fold parallel: sequential)\n")
   cat("  - (per-fold details: FALSE)\n")
   cat("  - (per-fold plot.sg: FALSE)\n")
