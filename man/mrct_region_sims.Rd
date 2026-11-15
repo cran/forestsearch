@@ -23,7 +23,8 @@ mrct_region_sims(
   parallel_args = list(plan = "multisession", workers = NULL, show_message = TRUE),
   details = FALSE,
   verbose_n_sims = 2L,
-  seed = NULL
+  seed = NULL,
+  record = c("point", "full")
 )
 }
 \arguments{
@@ -59,10 +60,19 @@ Default: 0.80}
 Default: 0.90}
 
 \item{confounders.name}{Character vector. Confounder variable names for ForestSearch.
-If NULL, automatically extracted from dgm}
+If NULL, automatically extracted from dgm: the columns of
+\code{dgm$df_super} whose names start with \code{z_}, \code{ecog} or
+\code{strat}, except that, for a mechanism built with a spline
+(\code{dgm$model_params$spline_info}), the three internal columns of the
+spline variable \code{<var>} are left out by their exact names
+\code{<var>_treat}, \code{<var>_k} and \code{<var>_k_treat} (for
+\code{\link{create_dgm_for_mrct}}: \code{z_bm_treat}, \code{z_bm_k},
+\code{z_bm_k_treat}). A covariate such as \code{z_prior_treat} and the
+region indicator stay in the set.}
 
 \item{conf_force}{Character vector. Forced cuts to consider in ForestSearch.
-Default: c("z_age <= 65", "z_bm <= 0", "z_bm <= 1", "z_bm <= 2", "z_bm <= 5")}
+Default: NULL, which resolves to
+c("z_age <= 65", "z_bm <= 0", "z_bm <= 1", "z_bm <= 2", "z_bm <= 5")}
 
 \item{fs_args}{Named list. Additional arguments passed directly to
 \code{\link{forestsearch}} inside each simulation replicate. Use this to
@@ -78,7 +88,12 @@ Default: list() (uses forestsearch defaults)}
 
 \item{sim_args}{Named list. Additional arguments passed to
 \code{\link{simulate_from_dgm}} inside each replicate (e.g.,
-\code{rand_ratio}, \code{draw_treatment}).
+\code{rand_ratio}, \code{draw_treatment}, \code{max_entry}, or
+\code{entry_delay = list(var = "z_region", delay = a)} for a region
+enrolling \code{a} time units later, redrawn every replicate).
+If \code{dgm$df_super} has a column \code{entrytime}, it is passed as
+\code{entry_var = "entrytime"} (one fixed entry time per
+super-population row) and takes precedence over \code{entry_delay}.
 Parameters already in the \code{mrct_region_sims} signature
 (\code{analysis_time}, \code{cens_adjust}) take precedence.
 Default: list(rand_ratio = 1, draw_treatment = TRUE)}
@@ -104,6 +119,11 @@ ForestSearch diagnostics (including internal output) for only the first
 output, or \code{Inf} to print all. Default: 2}
 
 \item{seed}{Integer. Base random seed for reproducibility. Default: NULL}
+
+\item{record}{Character. \code{"point"} (default) returns the point
+estimates only, exactly as before this argument existed. \code{"full"}
+adds, from the same simulated trials (nothing is redrawn), the
+per-replicate record described under \emph{Full record} below.}
 }
 \value{
 A data.table with simulation results containing:
@@ -127,6 +147,17 @@ A data.table with simulation results containing:
 \item{POhr_sg_train}{Potential outcome hazard ratio in subgroup (training)}
 \item{hr_sg_null}{Subgroup HR when found, NA otherwise}
 }
+With \code{record = "full"}, the same table followed by the columns
+\code{TP_nonregion}, \code{FP_nonregion}, \code{FN_nonregion},
+\code{TN_nonregion}, \code{TP_region}, \code{FP_region},
+\code{FN_region}, \code{TN_region}, then the multiplier-resampling
+columns \code{mr_ci_method}, \code{mr_debiased_H}, \code{mr_ij_lower_H},
+\code{mr_ij_upper_H}, \code{mr_field_lower_1s_H}, \code{mr_debiased_Hc},
+\code{mr_ij_lower_Hc}, \code{mr_ij_upper_Hc},
+\code{mr_field_upper_1s_Hc}, \code{mr_field_upper_1s_s_Hc},
+\code{mr_bonf_lower_H}, \code{mr_bonf_upper_Hc}, \code{mr_p_hat_H},
+\code{mr_selection_rate}, and the attribute \code{"estimators"} (see
+\emph{Full record}).
 }
 \description{
 Simulates multi-regional clinical trials and evaluates ForestSearch subgroup
@@ -154,6 +185,79 @@ The region_var parameter is used ONLY for splitting data into training/testing
 populations. It does not imply any prognostic effect. To include prognostic
 confounder effects, specify them when creating the DGM using
 \code{\link{create_dgm_for_mrct}} or \code{\link{generate_aft_dgm_flex}}.
+}
+
+\subsection{Full record}{
+
+With \code{record = "full"} the returned table is the \code{"point"}
+table with twenty-two columns added (eight counts, then fourteen
+multiplier-resampling columns) and a second table attached as an
+attribute, \code{est <- attr(res, "estimators")}; \code{res$hr_itt},
+\code{nrow(res)} and every \code{"point"} column are unchanged. (A
+data.table subset such as \code{res[order(sim)]} drops the attribute:
+take it first.)
+
+\code{estimators} has one row per trial and patient set:
+\code{itt_all} (all patients), \code{itt_nonregion}
+(\code{region_var == 0}), \code{itt_region} (\code{region_var == 1}),
+\code{region_Ghat} (the region outside the declared harm subgroup
+\eqn{\hat H}; the whole region in an undeclared trial),
+\code{region_Gstar} (the region with \code{flag_harm == 0}) and
+\code{Hstar_nonregion} (the non-region patients with
+\code{flag_harm == 1}). Columns: \code{sim}, \code{estimator},
+\code{n}, \code{n_exp}, \code{events_exp}, \code{events_ctl}; the
+unadjusted two-sample Cox fit \code{Surv(y_sim, event_sim) ~ treat_sim}
+on the set, \code{hr}, \code{lo}, \code{hi} (Wald 95\\%) and
+\code{se_loghr} (a fit with an arm without events is kept; a fit that
+errors, e.g. on an empty set, gives \code{NA}); the targets on the same
+patients, \code{ahr} = \code{exp(mean(loghr_po))} and \code{cde} =
+\code{mean(exp(theta_1)) / mean(exp(theta_0))} (\code{NA} when the
+simulated trial lacks those columns); and \code{declared} (0/1, the
+trial's \code{any_found}). \code{itt_all} is unadjusted, so it equals
+\code{hr_itt} only when the trial has no \code{strat} column.
+
+The added columns of the per-trial table are the 2 x 2 counts of
+\eqn{\hat H} membership against \code{flag_harm == 1} over the
+non-region patients and over the region patients. \eqn{\hat H} is
+evaluated from the selected definition with \code{\link{get_dfpred}}
+(the route of \code{df.test}); it is empty in an undeclared trial, whose
+counts are kept.
+
+When the simulated trial has no \code{flag_harm} column, the
+\code{region_Gstar} and \code{Hstar_nonregion} rows are omitted and the
+counts are \code{NA}, with a message.
+
+After the counts come fourteen columns read from the trial's
+\code{forestsearch()} result \code{fs$mr_inference} (multiplier
+resampling, \code{fs_args = list(mr_inference = TRUE, ...)}; see
+\code{\link{fs_mr_inference}}), on the effect (HR) scale:
+\describe{
+\item{\code{mr_ci_method}}{\code{ci_method}.}
+\item{\code{mr_debiased_H}, \code{mr_ij_lower_H},
+\code{mr_ij_upper_H}}{\code{debiased$est}, \code{$lower},
+\code{$upper}: the de-biased estimate on \eqn{\hat H} and its
+interval (IJ SE under \code{"ij"} and \code{"field"}, robust SE under
+\code{"wald"}).}
+\item{\code{mr_field_lower_1s_H}}{\code{field$lower_1s}.}
+\item{\code{mr_debiased_Hc}, \code{mr_ij_lower_Hc},
+\code{mr_ij_upper_Hc}}{\code{complement$debiased$est},
+\code{$lower}, \code{$upper}.}
+\item{\code{mr_field_upper_1s_Hc},
+\code{mr_field_upper_1s_s_Hc}}{\code{field$complement$upper_1s} and
+its studentized companion \code{field$complement$upper_1s_s}.}
+\item{\code{mr_bonf_lower_H}, \code{mr_bonf_upper_Hc}}{
+\code{field$joint$bonf_lower_H}, \code{field$joint$bonf_upper_Hc}.}
+\item{\code{mr_p_hat_H}}{\code{reselection$p_hat[selected_index]}.}
+\item{\code{mr_selection_rate}}{\code{selection_rate}.}
+}
+Each is \code{NA} when its element is absent: every one in a trial
+without \code{mr_inference} or without a declared subgroup (nothing to
+de-bias), or with the short MR return; the
+complement columns without \code{include_complement = TRUE}; the field
+columns unless \code{ci_method = "field"}; the complement field and
+Bonferroni columns without \code{field_complement = TRUE};
+\code{mr_p_hat_H} without \code{return_reselection = TRUE}. Under
+\code{record = "point"} none of these columns is added.
 }
 }
 \examples{

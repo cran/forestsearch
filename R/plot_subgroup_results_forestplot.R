@@ -38,6 +38,9 @@
 #' @param xlog Logical. If TRUE (default), the x-axis is plotted on a
 #'   logarithmic scale. This is standard for hazard ratio forest plots
 #'   where equal distances represent equal relative effects.
+#'   Implemented through forestploter's \code{set_xaxis(x_trans = "log")}
+#'   since 0.4.0.9000; earlier versions documented the log axis but drew a
+#'   linear one (GitHub #7).
 #' @param title_text Character. Plot title (default: NULL).
 #' @param arrow_text Character vector of length 2. Arrow labels for forest plot
 #'   (default: c("Favors Experimental", "Favors Control")).
@@ -64,16 +67,21 @@
 #' @param theme An fs_forest_theme object from \code{create_forest_theme()}.
 #'   Use this to control plot sizing (fonts, row height, CI appearance,
 #'   CV annotation font size). Default: NULL (uses default theme).
-#' @param outcome_type Character or \code{NULL}. One of \code{"survival"}
-#'   (default), \code{"binary"}, or \code{"continuous"}.  If \code{NULL},
-#'   auto-detected from \code{fs_results$fs.est$outcome_type}.
+#' @param outcome_type Character or \code{NULL} (default). One of
+#'   \code{"survival"}, \code{"binary"}, or \code{"continuous"}.  If \code{NULL},
+#'   auto-detected from \code{fs_results$fs.est$outcome_type}, or
+#'   \code{"survival"} when that is absent.
 #' @param effect_measure Character or \code{NULL}. Effect measure for GLM
 #'   outcomes (e.g., \code{"OR"}, \code{"RR"}, \code{"IRR"}, \code{"RD"},
 #'   \code{"IRD"}, \code{"MD"}).  Auto-detected from
 #'   \code{fs_results$fs.est$effect_measure} if \code{NULL}.
 #' @param offset.name Character or \code{NULL}. Follow-up time column for
 #'   rate-based measures (IRR, IRD).
-#' @param adjust_covariates Character vector or \code{NULL}. Baseline
+#' @param adjust_covariates This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character vector or \code{NULL}. Baseline
 #'   covariates to adjust the GLM-row effect models for, matching the
 #'   adjustment used during search/estimation.  When \code{NULL}, resolved
 #'   from \code{fs_results$fs.est$args_call_all$adjust_covariates} so the
@@ -121,6 +129,30 @@
 #' \itemize{
 #'   \item Roles are reversed: H becomes the benefit group
 #' }
+#'
+#' ## Orientation of the GLM rows
+#'
+#' For a non-survival outcome every row estimated from the data (ITT,
+#' reference and post-hoc subgroups) is a GLM effect.  What follows is for
+#' the default \code{est.scale = "hr"}.  With a fit
+#' (\code{fs_results$fs.est}) its estimator is built with the fit's stored
+#' \code{adverse_outcome} or, when none is stored, with
+#' \code{\link{forestsearch}}'s rule (\code{TRUE} for binary and count
+#' outcomes, \code{FALSE} otherwise), so each row is on the scale of the
+#' fit's own estimates, sign included; without a fit the estimator's
+#' default (\code{adverse_outcome = TRUE}) is used.  The rows show the arm
+#' sizes, not the arm means; the arm means and their raw difference
+#' (\code{Diff} in \code{\link{sg_tables}} and
+#' \code{\link{mr_estimates_table}}) do not follow the orientation.  So for
+#' an unadjusted fit where a lower outcome is adverse
+#' (\code{adverse_outcome = FALSE}, the default for continuous outcomes) a
+#' row's effect and the raw treated-minus-control difference have opposite
+#' signs (for OR and RR, the log of the effect): an MD row is the control
+#' mean minus the treated mean.  Count outcomes and the rate measures (IRR,
+#' IRD) are not reoriented (see \code{\link{make_effect_estimator}}).
+#' Bias-corrected rows are taken from \code{fs_results$fs_bc}, whose
+#' estimator \code{\link{forestsearch_bootstrap_dofuture}} builds with the
+#' same rule.
 #'
 #' @examples
 #' \dontrun{
@@ -220,8 +252,10 @@ plot_subgroup_results_forestplot <- function(
   # Input Validation
   # ==========================================================================
 
-  if (!requireNamespace("forestploter", quietly = TRUE)) {
-    stop("Package 'forestploter' is required but not installed.", call. = FALSE)
+  if (!requireNamespace("forestploter", quietly = TRUE) ||
+      utils::packageVersion("forestploter") < "1.2.0") {
+    stop("plot_subgroup_results_forestplot() needs the 'forestploter' package, ",
+         "version 1.2.0 or later (install.packages(\"forestploter\")).", call. = FALSE)
   }
 
   if (!requireNamespace("grid", quietly = TRUE)) {
@@ -297,6 +331,18 @@ plot_subgroup_results_forestplot <- function(
   if (is.null(adjust_covariates) && !is.null(fs.est) &&
       !is.null(fs.est$args_call_all$adjust_covariates)) {
     adjust_covariates <- fs.est$args_call_all$adjust_covariates
+  }
+
+  # Orientation of the GLM rows: the fit's resolved adverse_outcome, so each
+  # row's effect is on the fit's own scale, sign included.  NULL only on an
+  # object not built by forestsearch(); resolved by forestsearch()'s rule.
+  # Without a fit (fs.est = NULL) the estimator's default (TRUE) is kept.
+  adverse_outcome <- TRUE
+  if (!is.null(fs.est)) {
+    adverse_outcome <- fs.est$args_call_all$adverse_outcome
+    if (is.null(adverse_outcome)) {
+      adverse_outcome <- outcome_type %in% c("binary", "count")
+    }
   }
 
   is_glm <- outcome_type != "survival"
@@ -425,6 +471,7 @@ plot_subgroup_results_forestplot <- function(
       outcome.name   = outcome.name,
       offset.name    = offset.name,
       effect_measure = effect_measure,
+      adverse_outcome = adverse_outcome,
       adjust_covariates = adjust_covariates,
       ps_adjust_method = "none"
     )
@@ -1101,9 +1148,7 @@ plot_subgroup_results_forestplot <- function(
     ci_col = ci_col,
     ci_lwd = ci_lwd,
     ci_Theight = ci_Theight,
-    refline_lwd = refline_lwd,
-    refline_lty = refline_lty,
-    refline_col = refline_col,
+    refline_gp = grid::gpar(lwd = refline_lwd, lty = refline_lty, col = refline_col),
     footnote_gp = grid::gpar(
       fontsize = footnote_fontsize,
       fontface = "italic",
@@ -1211,23 +1256,31 @@ plot_subgroup_results_forestplot <- function(
     }
   }
 
-  # Generate the forest plot
+  # Generate the forest plot (forestploter >= 1.2.0 API, 0.4.0.9000): forest()
+  # draws the table and the CIs; the axis, scale and labels are set with
+  # set_xaxis() / set_labs(), which must run BEFORE insert_text() below.
+  # `xlog` reaches the plot here as x_trans -- until 0.4.0.9000 it was
+  # passed to forest() under a name forest() never had and was dropped, so
+  # the axis was linear whatever the documentation said (GitHub #7).
   p <- forestploter::forest(
     dt[, c("Subgroup", E.name, C.name, " ", ci_label)],
-    title = title_text,
     est = dt$est,
     lower = dt$low,
     upper = dt$hi,
     sizes = 0.4,
     ci_column = 4,
     ref_line = ref_line,
-    arrow_lab = arrow_text,
-    xlim = xlim,
-    ticks_at = ticks_at,
-    xlog = xlog,
-    footnote = footnote_text,
-    theme = tm
+    style = tm
   )
+  xaxis_args <- list(plot = p, x_trans = if (isTRUE(xlog)) "log" else "none")
+  if (!is.null(xlim))     xaxis_args$xlim     <- xlim
+  if (!is.null(ticks_at)) xaxis_args$ticks_at <- ticks_at
+  p <- do.call(forestploter::set_xaxis, xaxis_args)
+  labs_args <- list(plot = p)
+  if (!is.null(title_text))    labs_args$title    <- title_text
+  if (!is.null(arrow_text))    labs_args$arrow    <- arrow_text
+  if (!is.null(footnote_text)) labs_args$footnote <- footnote_text
+  if (length(labs_args) > 1L) p <- do.call(forestploter::set_labs, labs_args)
 
   # Add CV annotation text using insert_text (spans across first 3 columns)
   # Uses cv_fontsize from theme for proper sizing

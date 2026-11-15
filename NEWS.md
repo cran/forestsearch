@@ -1,3 +1,752 @@
+# forestsearch 0.5.0
+
+forestsearch 0.5.0 removes `create_gbsg_dgm()` and `simulate_from_gbsg_dgm()`
+(use `generate_aft_dgm_flex()` with `simulate_from_dgm()`; the superseded
+`setup_gbsg_dgm()` rebuilds the legacy mechanism), needs survival (>= 3.5-8) and
+adds observed-trial and analytic tools for MRCT regional consistency. Results
+can change where fixes apply: GLM bootstrap, table and plot effects (on the fit's
+`adverse_outcome`), consistency-path bias correction, logistic-tier RD SEs, the
+RD, RR and IRD scales and the detection, PPV, NPV and specificity of
+`run_simulation_analysis()`, `test_hte_from_forestsearch()`, and some GRF and DINA selections.
+
+### Breaking changes
+
+* `forestsearch_bootstrap_dofuture()` on GLM outcomes now builds the estimator
+  behind its bias correction with the parent fit's resolved `adverse_outcome`
+  and `ps_adjust_method` (it used `adverse_outcome = TRUE` and no propensity
+  weighting). For a continuous fit with `adverse_outcome` unset (it resolves to
+  `FALSE`), or any fit with `adverse_outcome = FALSE`, `H_estimates`,
+  `Hc_estimates`, `SG_CIs`, the `*_biasadj_*` columns and the effect columns of
+  `FSsg_tab` were on the raw outcome scale, the opposite sign to the fit; they
+  are now on the fit's scale (an exact sign change for MD, RD and log OR; for
+  RR the old values were the ratio of 1 - Y risks). With propensity adjustment
+  the bootstrap estimates are now weighted like the fit. Fits with
+  `adverse_outcome = TRUE` and no propensity adjustment, which include binary
+  and count fits at defaults, are unchanged. `forestsearch()` with propensity
+  adjustment on a GLM outcome also keeps `adverse_outcome` when it rebuilds its
+  estimator (it used `TRUE`). Scripts that negated the bootstrap output by
+  `adverse_outcome` should drop that step. (Code audit A-009.)
+
+* `forestsearch()` and the other exported functions that can reach the fixed
+  seed in `subgroup.consistency()` (`set.seed(8316951)`, which `forestsearch()`
+  does not expose) no longer leave the caller's random-number state changed.
+  These are `subgroup.consistency()` itself and the functions that call
+  `forestsearch()`: `forestsearch_bootstrap_dofuture()`, `bootstrap_results()`,
+  `forestsearch_Kfold()`, `forestsearch_tenfold()`, `run_simulation_analysis()`,
+  `mrct_region_sims()`, `mrct_case_study()`, `mrct_trial_analysis()`,
+  `compare_selection_rules()`, `fpr_calibration()`, `fpr_calibration_transfer()`,
+  `run_null_calibration()` and `fs_fdr_report()`. The outermost such call saves
+  `.Random.seed` on entry and restores it on exit (absent again if it was
+  absent), whatever seeds are set inside it. Their own results are unchanged:
+  every draw inside a call comes from the same stream as before. A later call
+  that draws random numbers without its own seed, straight after
+  `forestsearch()` (for example `sample()`, or `simulate_from_dgm()` with
+  `seed = NULL`), used to continue the stream `forestsearch()` had seeded and
+  now depends on the caller's seed, so set one. `forestsearch_bootstrap_dofuture()`
+  seeds itself (`seed = 8316951L`) and is not affected. Functions that only set a
+  seed passed to them (for example `simulate_from_dgm(seed = )`) still set it.
+
+* `fpr_calibration()` with neither `outcome_type_approx` nor
+  `fs_params$outcome_type` given now approximates `P1` for `"survival"`,
+  `forestsearch()`'s default (it used `"binary"`), so the printed `P1`,
+  `d_eff` and implied `L_eff` change; the simulated false-positive rate does
+  not. An outcome type other than `"survival"`, `"binary"`, `"continuous"` or
+  `"count"` now stops with an error naming it. (Code audit A-107.)
+
+* `create_gbsg_dgm()` and `simulate_from_gbsg_dgm()` are removed, with the
+  internal `.simulate_from_gbsg_dgm_()` and `get_dgm_with_output()`. Both
+  exported functions had warned that they were deprecated since before 0.1.0,
+  and nothing in the package, its tests, its vignettes and articles, or the
+  quarto analyses called any of the four. Use `generate_aft_dgm_flex()` with
+  `simulate_from_dgm()`; to reproduce the legacy GBSG mechanism exactly, use
+  `setup_gbsg_dgm()`, which builds it with the same internal builder. No
+  remaining function changes behaviour.
+
+* `survival (>= 3.5-8)` is now required: the lean unadjusted search-stage
+  Cox fit calls `survival::coxph.fit()` with the calling conventions
+  verified on survival 3.5-8 and later.
+
+### Bug fixes
+
+* `run_simulation_analysis()` with a count outcome (`fs_params$outcome_type =
+  "count"`, `effect_measure` `"IRR"` or `"IRD"`) now runs the GRF analysis. It
+  passed the simulation's effect measure to `grf.subg.harm.glm()`, which accepts
+  only `"log_IRR"` or `"log_RR"` for a count, so every count GRF row failed with
+  a warning and was scored as a no-find. It now passes `"log_IRR"`, which the
+  forest fit does not use; the simulation computes the GRF row's effects on its
+  own scale (IRR or IRD). Count GRF rows change, and so do the `agree.*.GRF` and
+  `kappa.*.GRF` columns of count replicates; other outcome types are unchanged.
+  Without `fs_params$offset.name` the count GRF row completes with
+  `grf.subg.harm.glm()`'s no-offset warning.
+
+* `mrct_region_sims()` now restores the caller's `progressr.handlers` option
+  when it returns or stops. It set the progress handler with
+  `progressr::handlers("progress")` and left that setting in the session. The
+  progress display during the call and the returned values are unchanged.
+
+* `forestsearch()` with a continuous outcome, DINA (`subgroup_method = "dina"`,
+  or `use_dina = TRUE`), and neither `effect.threshold` nor `hr.threshold`
+  supplied now uses the resolved screening threshold (0 for a mean difference)
+  as the DINA harm floor, the value the returned object records and that
+  bootstrap and cross-validation replays use. The fit used the raw survival
+  default 1.25. The selected subgroup and the DINA screening cut can change for
+  such analyses. A supplied threshold, and every non-gaussian DINA family, give
+  the same floor as before. (Code audit A-001.)
+
+* Survival GRF (`grf.subg.harm.survival()`, and `forestsearch()` with
+  `use_grf = TRUE` or `subgroup_method = "grf"`) now codes the covariate matrix
+  column by column as the GLM path does. When a confounder was a factor or
+  character column, every numeric column was rounded to 7 significant digits
+  and factor labels such as `"EU"`/`"US"` became `NA` (the GRF step then stopped,
+  or its cuts were dropped with a warning). Numeric columns now keep their exact
+  values, so the matrix GRF sees and the data a selected cut is evaluated on
+  agree. Results with only numeric confounders are unchanged. (Code audit
+  A-059.)
+
+* `run_simulation_analysis()` and `fs_mr_oc_summary()`: a replicate whose
+  identified subgroup is the whole sample has an empty estimated complement, and
+  its NPV (0/0) is now 0, by the same convention that gives PPV = 0 for an empty
+  identified subgroup. `run_simulation_analysis()` stored `NA` (dropped by later
+  averages) in both the ForestSearch and GRF rows; `fs_mr_oc_summary()`'s
+  unconditional NPV filled such a detected replicate with 1. Every other missing
+  NPV keeps its previous treatment, and stored payloads are not regenerated.
+  This affects simulation summaries in which a method can select everyone.
+
+* `generate_gbsg_bootstrap_general()` now takes its data from `survival::gbsg`.
+  `data("gbsg", package = "survival")` loads nothing under current survival, so
+  every call stopped with an error. (Code audit A-004.)
+
+* Functions that set a `future` plan for their own work now restore the
+  caller's plan on exit, including after an error: `subgroup.search()` (and so
+  `forestsearch()` and the functions that call it in the session),
+  `forestsearch_bootstrap_dofuture()`, `mrct_region_sims()`,
+  `fpr_calibration()` (with `n_workers > 1`) and `fs_fdr_report()`. They left
+  the session on a sequential plan, replacing a plan the user had set. Results
+  are unchanged. `setup_parallel_SGcons()` and `reset_workers()` still set the
+  plan, which is their purpose. (Code audit INV-2, plan half.)
+
+* `run_simulation_analysis()`: a replicate whose identified set is empty is now
+  scored as a no-find on every path (`any.H` = 0; `ppv` = 0 under an
+  alternative). The detection rate and the all-replicate PPV average can change
+  where such replicates occur.
+
+* `forestsearch_KfoldOut()`: when the folds identify no subgroup and the
+  full-data analysis has one, the agreement metrics (`sens_H`, `ppv_H`,
+  `sens_Hc`, `ppv_Hc`) are now 0, 0, 1 and the full-data complement share
+  (the sensitivity for H was reported as 1). When the folds put everyone in
+  the subgroup, `sens_Hc` and `ppv_Hc` are now 0 (they were NA).
+
+* `fs_mr_oc_summary()` and `build_classification_table()`: a replicate with no
+  identified subgroup now contributes NPV = |Hc|/N, the share of that
+  replicate's subjects truly in the complement (it was 1). Under the null this
+  is still 1. Specificity, sensitivity, PPV and detected-only summaries are
+  unchanged. Stored payloads are not regenerated.
+  - `fs_mr_oc_summary()` (unconditional convention) takes |Hc|/N as
+    `1 - n_true / meta$n_sample`. Its unconditional NPV is `NA` when that is
+    not available for every non-detected replicate (no numeric `n_true` or
+    usable `meta$n_sample`, or `n_true` missing on a non-detected row).
+  - `build_classification_table()` changes only rows stored with `npv = NA`
+    and `any.H == 0` under an alternative (output of an older package version
+    or another producer). It takes |Hc|/N from the row's `propHc_true`. A row
+    without it (no truth column) is still filled with 1.
+
+* `run_simulation_analysis()`: when no subgroup is identified under an
+  alternative, `spec` is now 1 and `npv` is |Hc|/N (the two were stored the
+  other way round). All-replicate averages of specificity and NPV from
+  `build_classification_table()`, `format_oc_results()` and
+  `summarize_single_analysis()` change accordingly. Replicates with a subgroup
+  found, null scenarios, `sens` and `ppv` are unchanged.
+
+* Bootstrap bias correction on the consistency path now evaluates the
+  bootstrap-selected subgroup on the original data and on the bootstrap sample
+  as Eq. 7 defines. Previously both terms were computed on the resample, through
+  a merge on repeated ids. Bias-corrected H/Hc estimates from
+  `forestsearch_bootstrap_dofuture()` after a consistency-path fit change.
+  Naive estimates, selection, DINA/GRF and multiplier resampling are unchanged
+  (A-002).
+
+* `expand_covariates()` (and so `inject_mrct_structure()`) now warns when
+  the latent correlation is not fitted by latentcor (package not installed,
+  or its call failed) and the normal-score correlation is used instead. The
+  computation is unchanged.
+
+* `summarize_bootstrap_subgroups()` (and so `summarize_bootstrap_results()`)
+  now counts a bootstrap consistency or subgroup size that lies exactly on a
+  bin edge in the bin whose label starts there: a consistency of 0.95 is in
+  ">=0.95" and a size of 50 in "50-99". Both were counted one bin lower.
+  Values off an edge are binned as before. (Code audit A-147.)
+
+* `forestsearch_KfoldOut()` no longer stops with "subscript out of bounds"
+  when the held-out assignments are one level plus `NA` (`{1, NA}` or
+  `{0, NA}`); the agreement values follow the existing single-level rule.
+  `forestsearch_tenfold()`, which stopped too, now completes, and
+  `forestsearch_Kfold()`, which caught the error and returned all-`NA`
+  agreement summaries, now returns the values. Assignments `{0, 1}` and
+  `{0, 1, NA}` give the same values as before.
+
+* Missing values in a covariate that defines the subgroup now say so; no
+  returned value changes. `run_simulation_analysis()` stops in the same
+  cases as before, but with "N of M subjects have no subgroup assignment: a
+  covariate that defines the identified subgroup ... has missing values"
+  instead of "missing value where TRUE/FALSE needed". The GRF route for
+  binary, continuous and count outcomes warns once with the count and the
+  defining covariates when the selected cut leaves subjects unassigned, and
+  `forestsearch_Kfold()` and `forestsearch_tenfold()` warn once per call with
+  the count of held-out assignments that are `NA`.
+
+* Cross-validation "Exact" (`find_metrics["Exact"]`, and `exact_match` of
+  `CV_sgs()`) for a one-factor full-data subgroup now counts a fold only when
+  its subgroup is that factor alone. A fold that adds a second factor still
+  counts for "At least 1" and "Cov1 exact", which keep their values. So the
+  Exact rate can fall for such analyses; two-factor subgroups are unchanged.
+  (Code audit A-103.)
+
+* `test_hte_from_forestsearch()` now uses the continuous covariates of the
+  fit: an evaluated cut label such as `"age <= 55"` is mapped to its column
+  `age`. Only labels that were exact column names were used before, so
+  continuous covariates were left out, and a fit with only continuous
+  confounders returned `NULL`. A label that cannot be resolved is named in a
+  warning, and when no covariate remains the function warns before returning
+  `NULL`. (Code audit A-151.)
+
+* `lasso_selection()` for binary, continuous and count outcomes no longer
+  lists `"(Intercept)"` in `selected` or `omitted` (it stays in
+  `coefficients`). When LASSO keeps no covariate, `forestsearch()` therefore
+  keeps the full candidate pool, as it already did for survival, instead of
+  failing at `get_FSdata` with "no candidate cut expressions could be
+  constructed". With `details = TRUE` the printed line names the model by
+  outcome type ("Logistic-LASSO", "Linear-LASSO", "Poisson-LASSO") and its
+  counts no longer include the intercept. (Code audit A-042.)
+
+* `get_FSdata()`, and so `forestsearch()` with GRF or DINA cuts, drops a cut
+  as a duplicate only when its variable is exactly a categorical confounder or
+  the whole cut is already in the pool. A cut on `bmi` is no longer dropped
+  because a categorical confounder `bm` exists, and `x <= 25.3` is kept when
+  the pool holds `x <= 2`. A median cut is removed only for a variable GRF cut
+  exactly. (Code audit A-047.)
+
+* `mrct_region_sims()` and `mrct_case_study()` without a `confounders.name`
+  and with a mechanism built with a spline no longer include the three internal
+  spline columns in the default confounders (`z_bm_treat`, `z_bm_k`,
+  `z_bm_k_treat` for `create_dgm_for_mrct()`). Covariates such as
+  `z_prior_treat`, and the region indicator, stay. (Code audit A-125.)
+
+* `grf.subg.harm.glm()` with a count outcome and `adverse_outcome = TRUE` (the
+  value `forestsearch()` and `run_simulation_analysis()` resolve for counts),
+  and so `forestsearch()` with `use_grf = TRUE` or
+  `subgroup_method = "grf"` and the GRF arm of `run_simulation_analysis()`,
+  now looks for the region where treatment raises the count. It looked for
+  the region where treatment lowers it. (Code audit A-064.)
+
+* `forestsearch()` with `use_dina = TRUE` now orients the DINA screening cut
+  as `subgroup_method = "dina"` does. For a continuous outcome with the
+  default orientation, or a binary outcome with `adverse_outcome = FALSE`, the
+  proposed cut was on the benefit side; it now points at the harm region, so
+  the candidate pool and the selected subgroup can change. Survival, count and
+  `adverse_outcome = TRUE` fits are unchanged.
+
+* `plot_sg_glm_outcomes()`, `plot_subgroup_results_forestplot()` and
+  `mr_estimates_table()` without `boot_results` now show a GLM fit's effect
+  on the fit's own orientation (its `adverse_outcome`). For a continuous fit
+  with the default orientation the displayed effect had the opposite sign of
+  the fit's estimate. The raw arm means and their difference in the summary
+  table are unchanged.
+
+* Change of method: the risk-difference standard error of
+  `make_effect_estimator(outcome_type = "binary", effect_measure = "RD")`
+  without adjustment covariates is now the two-sample binomial form
+  `sqrt(p1 (1 - p1) / n1 + p0 (1 - p0) / n0)` when the logistic tier is used.
+  With 40 patients per arm, control 30% and treated 100%, it is 0.0725 (it was
+  about 5e-06, giving a zero-width interval); with control 0% and treated
+  80%, 0.0632 (it was 448.5). The estimate is unchanged, and so is the
+  covariate-adjusted case, except a direct call with `adjust_covariates` and
+  `ps_adjust_method = "dr_gcomp"` (or `"iptw"` without an `sw` column), whose
+  covariates are dropped before the fit and which now gets the new form.
+  (Code audit A-055.)
+
+* `forestsearch()` with a binary risk difference or a count rate difference,
+  `dina_args = list(family = "gaussian")` and a supplied ratio-scale
+  threshold that is remapped with a warning (for example 1.5 to 0.05) now
+  uses the remapped value as the DINA floor in the fit, the value the object
+  records and the bootstrap and cross-validation replay. The fit used the
+  supplied 1.5 and so usually found no subgroup. This narrows the A-001 entry
+  above: every other supplied threshold gives the same floor as before.
+
+* `sg_tables()` now builds the effect column of its GLM tables with the fit's
+  own orientation: the `adverse_outcome` that `forestsearch()` stored (for a
+  `grf.subg.harm.glm()` result, the value stored on it, `FALSE` by default),
+  or `forestsearch()`'s rule when none is stored; it used `TRUE`. For a
+  continuous fit with `adverse_outcome = FALSE` (the default) the MD column
+  changes sign: in one example the selected subgroup read MD -1.094 and now
+  reads 1.094, the fit's own estimate. Binary OR, RR and RD tables with
+  `adverse_outcome = FALSE` (including a `grf.subg.harm.glm()` result at its
+  default) now show the effect for the non-event, as the fit does. The arm
+  columns and `Diff` stay raw. Survival tables, count and rate-measure (IRR,
+  IRD) tables, and fits with `adverse_outcome = TRUE` are unchanged.
+
+* `forestsearch_KfoldOut(outall = TRUE)` on a `forestsearch_Kfold()` result
+  now builds the effect column of its GLM tables (ITT, full-data and fold
+  subgroups) with the fit's own `adverse_outcome`, or `forestsearch()`'s rule
+  when none is stored; it used `TRUE`. For a continuous fit with
+  `adverse_outcome = FALSE` (the default) the MD column changes sign: in one
+  example the full-data subgroup read MD -1.0941 and now reads 1.0941, the
+  sign of the fit's own estimate. Binary OR, RR and RD tables with
+  `adverse_outcome = FALSE` now show the effect for the non-event. The arm
+  columns and `Diff` stay raw. Survival tables, count and rate-measure (IRR,
+  IRD) tables, and fits with `adverse_outcome = TRUE` are unchanged.
+
+* `compute_frontier_cis()` on a fit object that stores no `adverse_outcome`
+  now orients the effect by `forestsearch()`'s rule (`TRUE` for binary and
+  count outcomes, `FALSE` for continuous); it used `TRUE`. For a continuous
+  outcome every estimate and limit changes sign (the limits swap), so the
+  table has the orientation of a fit made at the default; in one example the
+  selected subgroup's row went from -1.0941 to 1.0941, the fit's own
+  estimate. A stored value is used as before; objects returned by
+  `forestsearch()` store it and are unchanged.
+
+* Change of method: the risk-difference standard error of
+  `make_effect_estimator(outcome_type = "binary", effect_measure = "RD")` with
+  `adjust_covariates`, when the logistic g-computation tier is used
+  (`method_used = "logistic_gcomp_adj"`), is now the full delta-method SE
+  `sqrt(g' V g)` of the averaged predictions over every estimable coefficient
+  of the logistic fit. It was the treatment coefficient's SE scaled by the
+  average derivative, which left out the other coefficients and degenerated
+  when an arm had 0% or 100% events: near 0 with the treated arm there
+  (control 14/40, treated 40/40, one covariate: 6.8e-06, an interval printed
+  as (0.6125, 0.6125); now 0.0775) and in the hundreds with only the control
+  arm there (control 0%, treated 80%, 40 per arm, adjusted for age: the
+  interval around 0.8044 was (-830.78, 832.39); now (0.6838, 0.9251)); with
+  both arms there it stays near 0, as before. If the new value is not a
+  finite, non-negative number, or a column that treatment changes is aliased,
+  the previous value is kept. The estimate, the unadjusted risk difference,
+  the identity-link tier and every other measure are unchanged. The SE reaches
+  the confidence limits of `forestsearch()`'s candidate table (which also
+  serve as near-duplicate keys), the bootstrap's observed-estimate interval,
+  the GLM tables and plots of a fit with `adjust_covariates`, and the upper
+  bound `subgroup_glm()` returns; no default call reaches this tier.
+
+* The internal `format_subgroup_summary_tables()` now highlights the
+  `">=0.95"` row of the bootstrap consistency distribution, as its footnote
+  says. The label was written `">= 0.95"`, which matched no row.
+
+* `forestsearch()` with `effect_measure = "IRD"` and an `effect.threshold`
+  above 1: the validator warning now speaks of a rate-difference threshold
+  and suggests `effect_measure = 'IRR'` (it said "A risk difference cannot
+  exceed 1.0" and suggested 'OR'), and the remap warning suggests the IRR
+  scale, prints the 0.01 it assigns and gives a rate-difference example (it
+  suggested the OR scale, printed "Remapping to default: 0.05" and gave a
+  7 pct-point example). The risk-difference messages and every remapped
+  value are unchanged.
+
+* `sg_tables()` on a `grf.subg.harm.glm()` result with a count outcome no
+  longer labels the GRF CATE note "(risk-difference scale)". It names the
+  scale of the count outcome given to the forest (before the negation for
+  `adverse_outcome = TRUE`), "(log(Y + 0.5) scale, Y = count)" or "(count
+  scale)", adding ", not offset-adjusted" when the fit has an offset; the
+  sign convention of the printed CATEs is unchanged. Binary and continuous
+  results print the same note as before.
+
+* `run_simulation_analysis()` with a GLM outcome now reports the risk
+  difference (`fs_params$effect_measure = "RD"`), the risk ratio (`"RR"`) and
+  the rate difference (`"IRD"`) in `hr.itt`, `hr.H.hat`, `hr.Hc.hat`,
+  `hr.H.true` and `hr.Hc.true` on their own scales: the difference and the
+  ratio of the two fitted arm proportions, and the difference of the two
+  fitted arm rates, treatment against control. They were the log odds ratio,
+  the odds ratio and the log rate ratio. Tables and plots built from these
+  columns change accordingly. With an offset (the column named by
+  `fs_params$offset.name`, when it is in the data) the rate difference is per
+  unit of exposure, the convention of the rate ratio, while the IRD truth in
+  the `ahr.*` columns and the DGM's IRD are per patient, so the two are not on
+  the same scale. Odds-ratio, rate-ratio, mean-difference and survival results
+  are unchanged, and stored payloads are not regenerated. (Code audit A-138,
+  in part.)
+
+* `xlog` in `plot_subgroup_results_forestplot()` never reached forestploter
+  (it was passed to `forestploter::forest()`, which has no such argument),
+  so the HR/OR axis was linear despite the documentation. It is now a real
+  log axis via `set_xaxis(x_trans = "log")`. The call uses the forestploter
+  1.2.0 API (`set_xaxis()`, `set_labs()`, `style`, `refline_gp`), which
+  removes the "will be deprecated" and "Unknown arguments ignored" messages;
+  `Suggests: forestploter (>= 1.2.0)`. Reported by adayim (#7).
+
+* `ps_adjust_method = "iptw"` with a continuous outcome: the weighted
+  least-squares fit failed for every candidate, because the `weights`
+  argument did not resolve inside the estimator closure, so the search
+  returned no candidates without an error. The weights now resolve from the
+  data slice. The unadjusted and covariate-adjusted continuous fits, and the
+  binary, count and survival paths, are unchanged; no committed analysis
+  used this path (all are randomized-trial analyses with `is.RCT = TRUE`).
+  Regression test `tests/testthat/test-iptw-continuous.R`.
+
+### New features
+
+* Wrappers for the analyses the articles write by hand. Each returns a plain data
+  frame and no existing function changes:
+  - `mrct_core_summary()`: the core operating characteristics of an
+    `mrct_region_sims(record = "full")` campaign.
+  - `ahr_truths_table()`, `ahr_design_table()`: the analytic layer's truths and design
+    probabilities over cells and sets, with the seven consistency rows.
+  - `mr_method_comparison()`, `mr_cost_table()`: naive, full-bootstrap and multiplier
+    estimates side by side, method by method, and what the two corrections cost.
+  - `fs_declaration_table()`: the declaration calibration at protected levels and the
+    claim threshold, from one fit.
+  - `mrct_record()`, `fs_in_subgroup()`, `mrct_build_dgm()`: small helpers for the
+    shipped records, the declared subgroup's membership, and a DGM build that keeps its
+    warnings.
+
+* `mrct_trial_analysis()`: the regional-consistency pipeline on an observed trial,
+  the counterpart of `mrct_case_study()` for real data: the all-patient and region
+  Cox fits and the trigger; `forestsearch()` on the non-region patients with the
+  region as the test set; the declared subgroup applied; the four-set Cox summary;
+  and multiplier-resampling inference. `$stage` reports how far it went
+  (`not_positive`, `no_trigger`, `no_declaration`, `complete`), and none of these
+  is an error. A column of the true subgroup is optional, as in simulation.
+
+* `mrct_four_sets()`: the four-set Cox summary from columns you name, with
+  `print()`, `plot(which = c("forest", "km"))` and `as.data.frame()` methods, so
+  these no longer need an `mrct_case_study` object.
+
+* `mrct_case_study()` now runs on the same analysis code as `mrct_trial_analysis()`.
+  Its arguments, result, printed output and plots are unchanged.
+
+* `mr_values()`: a new tidy accessor for the multiplier-resampling (MR) results of
+  a `forestsearch()` fit or a bare `fs_mr_inference()` result. It returns a data
+  frame with one row per region (`"H"`, and `"Hc"` when the complement was
+  computed) and a fixed set of columns: the naive estimate, the two-term de-biased
+  estimate with its IJ interval and SE, the field and field-s one-sided bounds, the
+  Bonferroni pairs, and the fit-level diagnostics (selection bias, `p_hat`, family
+  size, timing). A quantity the fit did not compute is `NA`. Pure extraction:
+  nothing is recomputed, apart from the optional `log()` of `scale = "log"`, and
+  no existing function changes.
+
+* The analytic layer of the MRCT regional-consistency work, moved from the
+  mrct-consistency repository (`docs/theory/scripts/sk_limit.R`,
+  `ahr_setup.R`, `sims/regional_entry_design.R`) in its per-patient-entry
+  form. For any patient set of a Weibull AFT DGM built by
+  `inject_mrct_structure()`, analysed at a calendar time with uniform
+  staggered entry and administrative censoring only, it computes by
+  quadrature (nothing is drawn) the exact limit of the two-sample Cox
+  estimate, its information and robust variance, the expected events, the
+  exact correlation between nested sets' estimates, the set's AHR and CDE,
+  and the normal-approximation trigger probabilities at a trial size:
+  * `ahr_population()`: the population of a DGM, with an optional
+    per-patient or per-group entry delay (`entry_delay`);
+  * `ahr_limit()`: the limit and its companions for a named or logical set;
+  * `ahr_design()`: SEs, events, correlations and `p_itt_ub_lt1`,
+    `p_region_itt_gt1`, `p_region_Gstar_lt1`, `p_trigger`,
+    `p_trigger_and_Gstar_lt1` at a trial size `n`;
+  * `ahr_solve()`: the scan-and-`uniroot()` solve of P(trigger) = target in
+    one free parameter, returning every bracketed root.
+  With no delay the layer reproduces the committed mrct-consistency records
+  to below 1e-14.
+
+* `scale_dgm_hazard(dgm, m)`: multiplies every hazard of a DGM by `m`
+  (`mu <- mu_fitted - tau * log(m)`, hazard ratios unchanged), recording `m`
+  in `dgm$mrct$hazard_multiplier` and `attr(dgm, "m")`.
+
+* `simulate_from_dgm()` gains `entry_delay` (default `NULL`, the current
+  behaviour): `list(var = <column>, delay = a)` makes patients with
+  `var == 1` enter at `a + U(0, max_entry)`, redrawn every call; a numeric
+  vector gives each sampled patient's delay. `entry_var` keeps precedence.
+  `mrct_region_sims()` passes it through `sim_args`; its documentation now
+  states the `entrytime` column convention.
+
+* `expand_covariates()` and `inject_mrct_structure()` gain `latent_R`
+  (default `NULL`, the current behaviour): a supplied latent correlation
+  matrix is validated and used as given, with no latentcor fit, so a DGM can
+  be rebuilt identically on any platform from a stored `dgm$mrct$latent_R`.
+
+* `mrct_region_sims()` gains `record = c("point", "full")`. `"point"` (the
+  default) returns exactly the current table. `"full"` keeps the
+  per-replicate record of the same trials (nothing is redrawn): the table
+  gains the 2 x 2 counts of Ĥ membership against `flag_harm` over the
+  non-region and the region patients (`TP_nonregion`, ..., `TN_region`), and
+  carries `attr(res, "estimators")`, one row per trial and patient set
+  (`itt_all`, `itt_nonregion`, `itt_region`, `region_Ghat`, `region_Gstar`,
+  `Hstar_nonregion`) with the unadjusted Cox fit (`hr`, Wald `lo`/`hi`,
+  `se_loghr`), patients and events by arm, the set's `ahr` and `cde`, and
+  `declared`. It reproduces the redraw-based records of mrct-consistency
+  (`sims/123_ident_rlog4_full_records.R`) exactly.
+
+* `mrct_region_sims(record = "full")` adds, after the counts, the trial's
+  multiplier-resampling bounds from `fs$mr_inference` when `fs_args`
+  carries `mr_inference = TRUE`: `mr_ci_method`, `mr_debiased_H`,
+  `mr_ij_lower_H`, `mr_ij_upper_H`, `mr_field_lower_1s_H`,
+  `mr_debiased_Hc`, `mr_ij_lower_Hc`, `mr_ij_upper_Hc`,
+  `mr_field_upper_1s_Hc`, `mr_field_upper_1s_s_Hc`, `mr_bonf_lower_H`,
+  `mr_bonf_upper_Hc`, `mr_p_hat_H`, `mr_selection_rate`; `NA` where the
+  element was not computed (no MR, no declaration, complement or field
+  options off, `return_reselection = FALSE` for `mr_p_hat_H`).
+  `record = "point"` is unchanged.
+
+* `fs_attach_betaHhat()`, `fs_betaHhat_table()` and `fs_betaHhat_one()`
+  gain `method = c("frame", "exact")` (with `dgm`, `analysis_time`,
+  `max_entry`, `cens_adjust`). `"frame"` (the default) is the current route.
+  `"exact"` (survival only) computes beta(Ĥ) and beta(Ĥᶜ) without a draw,
+  from `ahr_population()` / `ahr_limit()` on the realised membership in
+  `dgm$df_super`: the same population quantity as the frame route, without
+  the Monte Carlo error of its single evaluation draw. It covers
+  administrative censoring only and stops when `cens_adjust` leaves the
+  DGM's random censoring in place (as `0` and the frame default `log(1.5)`
+  do; `50` or `Inf` remove it).
+
+* Two helpers find and examine a case-study trial of an MRCT simulation:
+  * `mrct_select_case(res)`: on a `mrct_region_sims(record = "full")`
+    result, flags each trial for the trigger (ITT upper 95% limit <
+    `itt_ub` and region HR > `region_itt`), a declared subgroup, and
+    region(Ĝ) < 1.0, and returns the first trial meeting the chosen
+    conditions (`which = "first"`, the rule that chose replicate 5 of S2 in
+    the mrct-consistency report) or all of them, with the trial's hazard
+    ratios. A missing HR never satisfies a condition.
+  * `mrct_case_study(dgm, seed, k, ...)`: redraws trial `k` exactly as
+    `mrct_region_sims()` drew it (`simulate_from_dgm(seed = seed + k)` under
+    L'Ecuyer-CMRG, the caller's generator restored), runs `forestsearch()`
+    on the non-region patients with the run's arguments and multiplier
+    resampling (seeded `seed + k`), and returns the four sets (all, region,
+    region(G*), region(Ĝ)) with their Cox fits, Ĥ membership, the 2 × 2
+    tables of Ĥ against H* and the MR result. `print()` and `plot()`
+    (forest plot; Kaplan–Meier panels with weightedsurv) methods;
+    `mr_estimates_table(x$fs)` gives the inference table.
+
+* `inject_mrct_structure()` has an observed-region mode:
+  `region = list(observed = "<col>")` takes the region from a 0/1 column of
+  `seed_data`, expands it with the covariates (no region model is fitted or
+  drawn), and estimates its prognostic log-HR by the AFT fit unless
+  `region$loghr` fixes it. The planted-model elements (`prevalence`,
+  `or_pred`, `x1_vars`, `or_x1`, `scale`, `band`) are errors in this mode;
+  `dgm$mrct$region$observed` records the mode. Defaults are unchanged.
+
+* Region-dependent treatment effect. `inject_mrct_structure()` gains
+  `region_loghr_shift` and `region_harm_loghr_shift` (default `0`, the
+  current build exactly): the treated log hazard of region patients is
+  shifted by γ_R, plus γ_H\*R for region patients in
+  H\* (the `x3` subgroup), so with a base effect of `b` outside H\* and `h`
+  inside it the region hazard ratios are b_R = b·exp(γ_R) and
+  h_R = h·exp(γ_R + γ_H\*R). The shift is applied to
+  `theta_1`, `lin_pred_1`, `loghr_po` and treated `lin_pred_obs`; the control
+  arm is unchanged; non-zero shifts are recorded in `dgm$mrct$region_effect`.
+  `ahr_limit()` and `ahr_design()` gain `b_R` and `h_R` (default `b`, `h`):
+  the four-cell (H\* × region) parametric effect, so the analytic layer's
+  (`b`, `h`) route matches the extended DGM. `ahr_design()` returns `b_R`
+  and `h_R`.
+
+* `mr_estimates_table()` no longer needs a bootstrap template:
+  `boot_results` now defaults to `NULL`, and the table is then built from
+  the `forestsearch(mr_inference = TRUE)` result alone. The descriptive
+  columns come from `fs$df.est` (by `SG_tab_estimates()`, as the bootstrap
+  lays them out), the naive effect is `fs$mr_inference$naive` with its
+  robust limits (the header says "robust"), followed by the MR de-biased
+  estimate with its IJ interval and, when the field quantities exist, the
+  field one-sided 95% bound (lower for the selected subgroup, upper for its
+  complement) and the Bonferroni pair; complement cells carry MR values only
+  under `include_complement = TRUE`. The returned table carries the numbers
+  it displays as `attr(, "mr_values")`. A call that supplies
+  `boot_results` returns the same numbers; its bias-corrected footnote now
+  names the method used (the MR de-biased estimate with the number of
+  draws, and its interval from the IJ variance on the multiplier draws, or
+  the robust SE under `ci_method = "wald"`) instead of the bootstrap's
+  "infinitesimal jackknife method (draws iterations)". `format_bootstrap_table()`
+  gains `bc_footnote` (default `NULL`, the bootstrap footnote) for this.
+
+* The lean unadjusted Cox fit lives in the internal helper
+  `.fs_cox_two_group()` and is guarded by a once-per-session probe: if
+  `coxph.fit()` does not reproduce `coxph()` on a near-tie fixture (for
+  example after a change in a future survival), the search-stage fit falls
+  back to the formula interface for the session, with one message. Results
+  are identical either way (`tests/testthat/test-lean-fits.R`; record
+  `dev/reports/REPORT_robustness_041_2026-10-28.md`).
+
+* Two per-candidate search-stage fits now call the fitting engines directly
+  instead of going through the formula interface: the unadjusted survival
+  fit in `fit_cox_for_subgroup()` calls `survival::coxph.fit()` with exactly
+  the arguments `coxph()` passes, and the unadjusted binary odds-ratio fit
+  runs `stats::glm.fit()` through a tagged closure and vector path (the twin
+  of the continuous fast path). Results are bit-identical (identity tests in
+  `tests/testthat/test-lean-fits.R`; verification record
+  `dev/reports/REPORT_lean_fits_2026-10-26.md`).
+
+* Measured per-replicate time of a sequential `nb_boots = 20` bootstrap on
+  the committed applications: survival (gbsg) 3.60 s -> 2.02 s (-44%),
+  binary OR (ACTG175) 5.93 s -> 2.75 s (-54%), continuous (ACTG175)
+  unchanged (1.87 s -> 1.84 s).
+
+* Nothing changes for adjusted, weighted (propensity), RD or RR fits: they
+  keep their formula paths.
+
+### Superseded and deprecated
+
+* `setup_gbsg_dgm()`, `calibrate_k_inter()` and
+  `generate_gbsg_bootstrap_general()` are now documented as superseded (a
+  "Superseded" section on each help page; no run-time message). They are kept
+  so that published simulations reproduce and will be deprecated in a future
+  release. Replacements: `generate_aft_dgm_flex()` with `simulate_from_dgm()`,
+  `find_k_inter_for_target_hr()`, and `generate_bootstrap_synthetic()`
+  (whose first example returns the same data as
+  `generate_gbsg_bootstrap_general()` with the same `n`, `seed` and
+  `noise_level`).
+
+* The censoring step of the legacy GBSG wrapper is documented on
+  `setup_gbsg_dgm()`, with a note on `fs_fdr_report()` and
+  `validate_k_inter_effect()`: the Weibull censoring model is fitted to the
+  resampled super-population with the arm assigned for simulation, and its
+  covariate term is the fitted term multiplied by the ratio of the event-model
+  scale to the censoring-model scale. `generate_aft_dgm_flex()` uses the
+  censoring fit's own term. The true hazard ratios and the `k_inter`
+  calibration do not depend on it; simulated censoring times do. The step is
+  unchanged so that published simulations reproduce.
+
+* `vi.grf.min` and `max_n_confounders` in `forestsearch()` are deprecated.
+  Both formals are kept (same positions, same defaults), so no existing call
+  breaks, but a non-default value now emits one deprecation warning and has
+  no effect. The GRF variable-importance screening/ordering of the candidate
+  cut columns is removed. The candidate family is now the cut grid alone,
+  and no model is fitted in the forest-search path unless `use_lasso`,
+  `use_grf` or `use_dina` is `TRUE`.
+
+* `max.minutes` in `forestsearch()` and `subgroup.search()` is deprecated.
+  It was documented as inert ("scheduled for deprecation in v0.3.0") and
+  that was never actioned. Both formals are kept (same positions, same
+  defaults); the argument has no effect. `forestsearch()` emits one
+  deprecation warning for a non-default value, and `subgroup.search()` one
+  warning whenever it is passed. The formals are removed in a later release.
+
+* What changes for callers who passed a non-NULL `vi.grf.min`: at values
+  `<= 0` the screen never filtered anything, so the selected subgroup's
+  membership is unchanged. The clause order of the `sg.harm` label (and the
+  redundancy column-walk) can still differ. A binding value `> 0` no longer
+  screens.
+
+* `run_simulation_analysis()`'s default argument list, the test helper
+  `.fs_args_for()` and the `forestsearch` vignette no longer pass either
+  argument. `fs_family_report()` reports both on a single
+  `"GRF variable-importance screening (deprecated)"` row with status
+  `inert`, echoing the values that were passed.
+
+* Both formals will be removed in a later release.
+
+* The internal helper `fit_causal_forest_glm()` is removed (unused since
+  the `vi.grf.min` deprecation).
+
+### Documentation
+
+* Help pages corrected to say what the code does (no behaviour change):
+  - `generate_bootstrap_with_noise()`: by default every numeric column except
+    `id_var` is treated as continuous (by design), so a numeric-coded category
+    such as a 0/1 indicator gets noise, rounded back to its value at a small
+    `noise_level`, unless `continuous_vars` is given without it; the
+    `cat_vars` auto-detection and the `grade` special case are stated
+    exactly.
+  - `generate_bootstrap_synthetic()`: `ordinal_vars` only marks which of the
+    `cat_vars` are ordinal; a variable listed only there is kept as
+    resampled; a factor listed in both becomes NA at a changed row unless its
+    levels are "1", "2", ...; and at the lowest or highest level of a
+    numeric-coded variable the new value is not always the adjacent level.
+  - `generate_gbsg_bootstrap_general()`: `grade` is resampled, not perturbed.
+  - `forestsearch()`, `dina_subgroup()`, `dina_subgroup_refit()`: DINA's
+    Poisson quantity is the log mean-count ratio (DINA takes no exposure
+    offset), which equals log(IRR) only when mean follow-up does not depend
+    on arm. The printed `"log-IRR"` label is unchanged.
+  - `forestsearch()`: `dmin.grf` is a harm threshold on GRF's doubly robust
+    scale, not a number of events; under `grf_select_statistic = "effect"` it
+    is an existence gate and is then not applied per candidate.
+  - `forestsearch()` and `subgroup.consistency()`: a sequential and a
+    parallel plan can give different consistency proportions, and possibly a
+    different selection, whenever literal splitting runs
+    (`consistency_method = "split"`, an IRD effect under `"resample"`, or a
+    candidate whose closed form is not available), except under
+    `sg_focus = "maxeff"`.
+  - `fs_fdr_report()`: `k_inter` is calibrated on the builder's default
+    super-population size, not on `n_super`; the calibrated value does not
+    depend on that size beyond the root-finding tolerance.
+  - `setup_gbsg_dgm()` documents its own arguments (they were inherited from
+    the removed `create_gbsg_dgm()`), and the examples that called
+    `create_gbsg_dgm()` now call `setup_gbsg_dgm()`.
+  - Examples load `survival::gbsg` directly instead of
+    `data(gbsg, package = "survival")`, which loads nothing.
+
+* Documentation pass (part 5 of the CRAN preparation; no behaviour change):
+  - The display help pages (`sg_tables()`, `forestsearch_KfoldOut()`,
+    `cv_summary_tables()`, `plot_sg_glm_outcomes()`,
+    `plot_subgroup_results_forestplot()`, `mr_estimates_table()`) say that the
+    effect column follows the fit's orientation while the raw arm columns
+    (and `Diff`, where shown) do not, so for an unadjusted fit where a lower
+    outcome is adverse the effect and the raw difference can have opposite
+    signs. `?make_effect_estimator` says what `adverse_outcome` does for each
+    outcome type.
+  - `?forestsearch`: a supplied risk- or rate-difference threshold above 1
+    is remapped, with two warnings for `effect.threshold` (one for
+    `consistency.threshold`), and the remapped
+    effect threshold is also the DINA floor where DINA selects a cut; under
+    the default `dina_select_statistic = "effect"` the `use_dina` screening
+    cut can differ from the one `subgroup_method = "dina"` would select; what
+    `consistency_method` does under propensity adjustment.
+  - `CV_sgs()` defines "Exact" for a one-factor subgroup;
+    `summarize_bootstrap_subgroups()` says its bins are closed on the left;
+    `test_hte_from_forestsearch()` describes how cut labels map to columns and
+    its warnings; `calibrate_k_treat()`, `find_k_inter_for_target_hr()`,
+    `compute_dgm_cde()` and `generate_bootstrap_with_noise()` are corrected to
+    the code; `setup_gbsg_dgm()` carries the model description of the removed
+    `create_gbsg_dgm()` page.
+  - Sixteen `\dontrun{}` examples are corrected so that they run as written
+    after `library(forestsearch)`; fifteen were run to the end, and
+    `fs_fdr_report()`'s, a long simulation, was not. They used, among other
+    defects, a bare `gbsg`, the missing `grade3` and id columns, objects or
+    list elements that do not exist, a wrong or placeholder call or one
+    missing a required argument, a nonexistent `nsim` argument, or
+    `n_workers = 100`.
+  - The "Biomarker Treatment Effects" article names `setup_gbsg_dgm()`. The
+    simulation article no longer calls its `generate_aft_dgm_flex()` block
+    equivalent to `setup_gbsg_dgm()`, says how the two differ, and says that
+    `setup_gbsg_dgm()` is used there to reproduce the published simulations
+    and is superseded for new work.
+  - Nine test files of part 4's fixes carry the comments their verifiers
+    asked for (how expected values are derived, and which checks pass before
+    and after the fix); comments only.
+
+* New test file `test-synthetic-data-documented-behaviour.R` pins what the
+  synthetic-data help pages now say: `grade` is resampled but not perturbed by
+  `generate_gbsg_bootstrap_general()`, which returns the data of
+  `generate_bootstrap_synthetic()`'s first example call; under auto-detection
+  `generate_bootstrap_with_noise()` leaves a numeric 0/1 column as resampled and
+  perturbs a factor; named in `cat_vars` with `continuous_vars` given, the 0/1
+  column is perturbed.
+
+* Test-suite reconciliation of the estimability-boundary invariant with
+  `glm_effect_estimators` behaviour; no functional change. The source-level
+  test in `test-estimability-boundary.R` counted exactly one
+  non-convergence catch. A second, verbatim catch was added with the
+  OR-only fast closure `.make_glm_or_estimator_fast()` (the lean binary OR
+  fit), and the test now asserts that structure: one OR/RR-scoped catch in
+  the slow closure, one in the fast closure, and neither reachable by RD.
+
+* New article on the package website, *Interpretable subgroup identification with forestsearch* (`articles/gbsg-table1`): the German Breast Cancer Study Group analysis of
+  León and Anderson (2026b), Table 1, run end to end — the three identifiers (forest search, DINA, GRF) and
+  the selection-adjusted estimates and bounds of León and Anderson (2026a) — at the manuscript's settings,
+  with the declaration calibration at a protected level.
+
+* The package vignette is now a short introduction: identification by forest search on the GBSG trial,
+  with the inference call shown. The complete analysis it used to run (Table 1 of León and Anderson 2026b:
+  the three identifiers, the selection-adjusted bounds and the declaration calibration) is the website
+  article *Interpretable subgroup identification with forestsearch* (`articles/gbsg-table1`).
+
+* The previous getting-started vignette, which documents the workflow of León et al. (2024), is now the
+  pkgdown article "Exploratory subgroup identification with forestsearch (the 2024 workflow)" and is no
+  longer built on CRAN.
+
+* The post-selection analysis is now an article on the package website rather than a CRAN vignette, because the full analysis takes a few minutes to run: <https://larry-leon.github.io/forestsearch/articles/survival-post-selection.html>. It reproduces the GBSG analysis of León and Anderson (2026a), illustrates the full bootstrap at a small number of replicates, and shows `mr_estimates_table()`.
+
+* The methodology and simulation articles on the package website keep their text as the record of the 2024 workflow, with the deprecated arguments removed from their listings and a dated note at each point where the current method differs. The articles on treatment-effect definitions, biomarker effects and the causal interpretation of hazard ratios now state the estimand the package reports for an identified subgroup, as in León and Anderson (2026a, 2026b). All five articles are now Quarto documents.
+
+* New article on the package website, "Post-selection bounds on a nested continuum: the Guo and He (2021) design": Section S4 of León and Anderson (2026b), with the complete code, a small default run, and the paper's results beside it.
+
+* New article on the package website, "Binary and continuous outcomes: the ACTG 175 analyses": Section S3 of León and Anderson (2026b) — forest search on the binary and continuous endpoints, with the selection-adjusted bounds and the declaration calibration — and Table S3 of León and Anderson (2026a), the three identifiers on the binary endpoint with the full bootstrap, at a small number of replicates, beside multiplier resampling.
+
+* The README describes the current method and shows the analysis of the website article *Interpretable subgroup identification with forestsearch* (`articles/gbsg-table1`).
+
+* `?forestsearch`: Example 1 passes a bootstrap result to `mr_estimates_table()`, which needs one as its template (the example called it without one); Example 2 names the analysis it runs, León and Anderson (2026a, Table S3); a section reference is corrected.
+
+* The `run_null_calibration()` example runs at an illustrative size (two trial sizes, ten simulations, no LASSO/GRF screening); a calibration for use takes more simulations, as the example now says.
+
 # forestsearch 0.4.0
 
 ## Changes since the last CRAN release (0.1.0)

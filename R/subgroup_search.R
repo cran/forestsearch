@@ -36,14 +36,12 @@
 #'   threshold (`c2`, \code{hr.consistency}) and not the consistency rate
 #'   (`p*`, \code{pconsistency.threshold}); neither is applied here -- this
 #'   function performs the screening stage only.
-#' @param max.minutes Numeric. \strong{Currently inert; scheduled for
-#'   deprecation in v0.3.0.} Previously intended as a wall-clock budget for
-#'   the combination search, it is threaded to
-#'   \code{search_combinations_parallel()} and no path consults it, so it has
-#'   no effect on behaviour. Search scope is governed by \code{maxk} and the
-#'   candidate-factor controls. Retained because it is part of a public
-#'   signature; this description now matches \code{\link{forestsearch}}'s,
-#'   which has documented it as inert for some time.
+#' @param max.minutes \strong{Deprecated} (0.4.0.9000): accepted and
+#'   ignored. It was documented as a wall-clock budget for the
+#'   combination search but was never enforced in the parallel search
+#'   path. Passing it emits one warning. Search scope is governed by
+#'   \code{maxk} and the candidate-factor controls.
+#'   The formal will be removed in a later release; drop it from calls.
 #' @param minp Numeric. Minimum prevalence rate for each factor.
 #' @param rmin Integer. Minimum required reduction in sample size when adding a factor.
 #' @param details Logical. Print details during execution.
@@ -64,7 +62,11 @@
 #'   d0.min/d1.min interpretation: events per arm for binary/survival,
 #'   ignored for continuous.  Default \code{NULL} (inferred from
 #'   \code{estimator_fn} presence).
-#' @param adjust_covariates Character vector or \code{NULL}. Additional Cox
+#' @param adjust_covariates This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character vector or \code{NULL}. Additional Cox
 #'   model terms (e.g. \code{"strata(x1)"} or \code{"x2"}) used to adjust the
 #'   candidate-search Cox scorer on the survival path.  Referenced columns are
 #'   sourced from \code{df_analysis}.  Ignored on the GLM path.  Default
@@ -106,6 +108,14 @@ subgroup.search <- function(Y, Event, Treat, ID = NULL, Z,
                             outcome_type = NULL,
                             adjust_covariates = NULL,
                             disable_effect_floor = FALSE) {
+
+  if (!missing(max.minutes)) {
+    warning("subgroup.search(): 'max.minutes' is deprecated and ignored. ",
+            "The wall-clock budget was never enforced in the parallel ",
+            "search; scope is governed by maxk and the candidate-factor ",
+            "controls. The argument will be removed in a future release -- ",
+            "drop it from the call.", call. = FALSE)
+  }
 
   # =========================================================================
   # SECTION 1: DATA PREPARATION AND VALIDATION
@@ -161,6 +171,8 @@ subgroup.search <- function(Y, Event, Treat, ID = NULL, Z,
   t.start <- proc.time()[3]
 
   # Set up parallel plan
+  old_plan <- future::plan()
+  on.exit(future::plan(old_plan), add = TRUE)
   future::plan(future::multisession, workers = parallel_workers)
 
   search_result <- search_combinations_parallel(
@@ -788,6 +800,121 @@ meets_event_criteria <- function(event_counts, d0.min, d1.min) {
   return(event_counts$d0 >= d0.min && event_counts$d1 >= d1.min)
 }
 
+# ---------------------------------------------------------------------------
+# Lean unadjusted Cox core (0.4.0.9000)
+# ---------------------------------------------------------------------------
+
+# Per-session state for the lean core: the probe verdict and the calling
+# conventions read from coxph().  One environment per R process, so every
+# worker probes once.
+.fs_cox_lean_state <- new.env(parent = emptyenv())
+
+#' Calling conventions of `coxph()` that the lean core reproduces
+#'
+#' `coxph()` passes `method = match.arg(ties)` and its own `nocenter` default
+#' to `coxph.fit()`.  Both are read from `coxph()`'s formals once per session,
+#' so the lean core follows survival if either default moves; the literal
+#' values of survival 3.5-8 .. 3.8.x (`"efron"`, `c(-1, 0, 1)`) are the
+#' fallback when the formals cannot be read.  Whatever is read here is
+#' checked against `coxph()` by `.fs_cox_lean_ok()` before the lean core is
+#' used.
+#'
+#' @return List with `ties` (character scalar) and `nocenter` (numeric).
+#' @keywords internal
+#' @noRd
+.fs_cox_lean_conventions <- function() {
+  cv <- .fs_cox_lean_state$conventions
+  if (!is.null(cv)) return(cv)
+  f <- formals(survival::coxph)
+  ties <- tryCatch(eval(f$ties)[1L], error = function(e) NULL)
+  if (!is.character(ties) || length(ties) != 1L || is.na(ties)) ties <- "efron"
+  nocenter <- tryCatch(eval(f$nocenter), error = function(e) NULL)
+  if (!is.numeric(nocenter) || length(nocenter) == 0L) nocenter <- c(-1, 0, 1)
+  cv <- list(ties = ties, nocenter = nocenter)
+  .fs_cox_lean_state$conventions <- cv
+  cv
+}
+
+#' Two-group Cox fit through `survival::coxph.fit()`, bit-identical to `coxph()`
+#'
+#' The fitting-engine call `coxph()` makes for `Surv(Y, E) ~ Treat`
+#' (survival 3.5-8 .. 3.8.x): the one-column model matrix without intercept,
+#' the response through `aeqSurv()` when `control$timefix`, no strata, a zero
+#' offset, `init = NULL`, the default control, no weights, `coxph()`'s ties
+#' method and `nocenter` (so the 0/1 treatment column is not centred, exactly
+#' as in the formula fit), the model-frame row names, residuals on.
+#' `coxph()` additionally builds the model frame, the full `coxph` object and
+#' the concordance, none of which the search reads; `coefficients` and `var`
+#' are returned by `coxph.fit()` unchanged, and the same warnings are raised
+#' (monotone likelihood, non-convergence) -- nothing is suppressed.  Verified
+#' bit-identical on every candidate of the gbsg application
+#' (`dev/reports/REPORT_bootstrap_stage0_2026-10-26.md`, 1410/1410) and in
+#' `tests/testthat/test-lean-fits.R`.  Guarded by `.fs_cox_lean_ok()`.
+#'
+#' @param Y,E,Treat Numeric vectors: time, event indicator and 0/1 treatment,
+#'   already restricted to the candidate subgroup.
+#' @return The `coxph.fit()` result (a list with `coefficients`, `var`, ...).
+#' @keywords internal
+#' @noRd
+.fs_cox_two_group <- function(Y, E, Treat) {
+  n_sg <- length(Y)
+  cv   <- .fs_cox_lean_conventions()
+  ctl  <- survival::coxph.control()
+  ys   <- survival::Surv(Y, E)
+  if (isTRUE(ctl$timefix)) ys <- survival::aeqSurv(ys)
+  survival::coxph.fit(
+    x        = matrix(as.double(Treat), ncol = 1L,
+                      dimnames = list(NULL, "Treat")),
+    y        = ys,
+    strata   = NULL,
+    offset   = rep(0, n_sg),
+    init     = NULL,
+    control  = ctl,
+    weights  = NULL,
+    method   = cv$ties,
+    rownames = as.character(seq_len(n_sg)),
+    resid    = TRUE,
+    nocenter = cv$nocenter
+  )
+}
+
+#' Once-per-session probe: does the lean core reproduce `coxph()`?
+#'
+#' Fits a fixed 30-row fixture both ways -- ten clusters of three near-tied
+#' times that `aeqSurv()` collapses to exact ties (the tripwire for the
+#' `timefix` convention), both arms present, events in both arms -- and
+#' compares `coefficients` and `var` with `identical()`.  An error (for
+#' example a changed `coxph.fit()` signature in a future survival) or any
+#' difference turns the lean core off for the session: the search-stage fit
+#' then goes through the formula interface, which is the same estimator, and
+#' one message says so.  The verdict is cached in `.fs_cox_lean_state`.
+#'
+#' @return `TRUE` if the lean core may be used in this session.
+#' @keywords internal
+#' @noRd
+.fs_cox_lean_ok <- function() {
+  ok <- .fs_cox_lean_state$ok
+  if (!is.null(ok)) return(ok)
+  ok <- isTRUE(tryCatch({
+    Y <- rep(seq(5, 50, by = 5), each = 3) + rep(c(0, 1e-9, 2e-9), 10)
+    E <- rep(c(1L, 1L, 0L), 10)
+    Treat <- rep(c(0, 1), 15)
+    lean <- .fs_cox_two_group(Y, E, Treat)
+    ref  <- survival::coxph(survival::Surv(Y, E) ~ Treat, robust = FALSE)
+    identical(unname(lean$coefficients), unname(ref$coefficients)) &&
+      identical(unname(as.vector(lean$var)), unname(as.vector(ref$var)))
+  }, error = function(e) FALSE))
+  if (!ok) {
+    message("forestsearch: survival::coxph.fit() did not reproduce coxph() ",
+            "on the probe fixture (survival ",
+            as.character(utils::packageVersion("survival")),
+            "); the unadjusted search-stage Cox fit uses the formula ",
+            "interface in this session.")
+  }
+  .fs_cox_lean_state$ok <- ok
+  ok
+}
+
 #' Fit Cox Model for Subgroup
 #'
 #' @param yy,dd,tt,id.x Numeric vectors: outcome, event, treatment, and the
@@ -807,8 +934,9 @@ fit_cox_for_subgroup <- function(yy, dd, tt, id.x, df_clean = NULL,
 
   # Fit Cox model (treatment-only or adjusted)
   if (length(adj) == 0L) {
-    # Unadjusted fast branch (0.3.3): same coxph() fit, but the consumed
-    # $conf.int row is computed directly instead of through summary.coxph(),
+    # Unadjusted fast branch (0.3.3): the same Cox fit (through coxph.fit()
+    # since 0.4.0.9000, see below), but the consumed $conf.int row is
+    # computed directly instead of through summary.coxph(),
     # whose full summary table cost 40.3% of the fit bucket for one CI row
     # (REPORT_bootstrap_reprofile_2026-09-01.md, section 4a).  The
     # arithmetic replicates survival 3.8.9 summary.coxph() operation for
@@ -832,8 +960,19 @@ fit_cox_for_subgroup <- function(yy, dd, tt, id.x, df_clean = NULL,
     E <- dd[idx]
     Treat <- tt[idx]
     hr.cox <- try({
-      fit.cox <- survival::coxph(survival::Surv(Y, E) ~ Treat, robust = FALSE)
+      # Unadjusted fit (0.4.0.9000): the lean core .fs_cox_two_group() --
+      # survival::coxph.fit() with exactly the arguments coxph() passes for
+      # Surv(Y, E) ~ Treat -- once the per-session probe .fs_cox_lean_ok()
+      # has confirmed it reproduces coxph(); otherwise the 0.4.0 formula
+      # fit.  The same estimator either way; coefficients and var are the
+      # only fields consumed below.  Identity: tests/testthat/test-lean-fits.R.
+      fit.cox <- if (.fs_cox_lean_ok()) {
+        .fs_cox_two_group(Y, E, Treat)
+      } else {
+        survival::coxph(survival::Surv(Y, E) ~ Treat, robust = FALSE)
+      }
       beta <- fit.cox$coefficients
+      names(beta) <- "Treat"
       se_beta <- sqrt(diag(fit.cox$var))
       z_ci <- stats::qnorm((1 + 0.95) / 2, 0, 1)
       ci <- cbind(exp(beta), exp(-beta),
@@ -966,6 +1105,11 @@ fit_glm_for_subgroup <- function(df_clean, id.x, estimator_fn) {
 #' closure's environment (\code{adverse_outcome}, \code{treat.name} are
 #' \code{force()}d there), so no signature beyond the vectors changes.
 #'
+#' The tagged unadjusted binary OR closure
+#' (\code{.make_glm_or_estimator_fast()}) is routed here too; its environment
+#' carries \code{fs_fast_core = "logit_or"}, on which the OR vector path
+#' \code{.fit_or_for_subgroup_vector()} is taken instead of the OLS core.
+#'
 #' @param yy,tt Numeric vectors: cleaned outcome and treatment, full length.
 #' @param id.x Integer vector. 1 = subject in this subgroup, 0 = not.
 #' @param estimator_fn The tagged fast closure (attribute
@@ -979,6 +1123,12 @@ fit_glm_for_subgroup_fast <- function(yy, tt, id.x, estimator_fn) {
   fn_env <- environment(estimator_fn)
   y <- yy[idx]
   t <- tt[idx]
+  # Binary OR core (0.4.0.9000): the tagged fast OR closure marks its
+  # environment; the OLS closure carries no marker and takes the path below.
+  if (identical(fn_env$fs_fast_core, "logit_or")) {
+    return(.fit_or_for_subgroup_vector(y, t, fn_env))
+  }
+
   if (!isTRUE(fn_env$adverse_outcome)) y <- -y
 
   res <- tryCatch(
@@ -997,6 +1147,47 @@ fit_glm_for_subgroup_fast <- function(yy, tt, id.x, estimator_fn) {
     hr    = res$estimate,
     lower = lower,
     upper = upper,
+    med0  = NA_real_,
+    med1  = NA_real_
+  )
+}
+
+#' Vector-path binary OR fit for a candidate subgroup
+#'
+#' The vector twin of `fit_glm_for_subgroup()` with the unadjusted OR
+#' closure: the same sign flip, the same existence check
+#' (`.fs_existence_reason()` on the 2x2 cells), the same non-convergence
+#' rule and the same `NULL` / `nonestimable` contract, with the fit done by
+#' `.fs_logit_two_group()` on the already-sliced vectors instead of
+#' `stats::glm()` on a data-frame slice.  Called by
+#' `fit_glm_for_subgroup_fast()` after its `< 6 rows -> NULL` check.
+#'
+#' @param y,t Numeric vectors: outcome and treatment, already sliced.
+#' @param fn_env The tagged OR closure's environment (`adverse_outcome`,
+#'   `treat.name`).
+#' @keywords internal
+#' @noRd
+.fit_or_for_subgroup_vector <- function(y, t, fn_env) {
+  if (!isTRUE(fn_env$adverse_outcome)) y <- 1L - y
+
+  why <- .fs_existence_reason("OR", .fs_binary_cells(y, t))
+  if (!is.null(why)) return(list(nonestimable = TRUE, reason = why))
+
+  core <- tryCatch(.fs_logit_two_group(y, t, fn_env$treat.name),
+                   error = function(e) NULL)
+  # The slow chain's error branch: NA estimate with no reason -> NULL.
+  if (is.null(core)) return(NULL)
+  if (isFALSE(core$converged) && !is.na(core$estimate)) {
+    return(list(nonestimable = TRUE, reason = "non-convergent fit"))
+  }
+  if (is.na(core$estimate)) return(NULL)
+
+  # Wald CI: estimate +/- 1.96 * SE (as in fit_glm_for_subgroup)
+  z_crit <- 1.96
+  list(
+    hr    = core$estimate,
+    lower = core$estimate - z_crit * core$se,
+    upper = core$estimate + z_crit * core$se,
     med0  = NA_real_,
     med1  = NA_real_
   )

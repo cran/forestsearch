@@ -23,6 +23,21 @@
 #' are annotated with the effect estimate and optional bias-corrected
 #' estimate from the bootstrap.
 #'
+#' The effect annotation follows the fit's orientation: its estimator is
+#' built with the fit's stored \code{adverse_outcome}
+#' (\code{fs.est$args_call_all$adverse_outcome}) or, when none is stored,
+#' with \code{\link{forestsearch}}'s rule (\code{TRUE} for binary and count
+#' outcomes, \code{FALSE} otherwise), so it is on the scale of the fit's
+#' own estimates, sign included.  The plotted per-arm rates or means (and
+#' the returned \code{data}) are the raw outcome and do not follow it.  So
+#' for an unadjusted fit where a lower outcome is adverse
+#' (\code{adverse_outcome = FALSE}, the default for continuous outcomes)
+#' the annotated effect and the treated-minus-control difference of the
+#' plotted values have opposite signs (for OR and RR, the log of the
+#' effect): an MD annotation is the control mean minus the treated mean.
+#' Count outcomes and the rate measures (IRR, IRD) are not reoriented (see
+#' \code{\link{make_effect_estimator}}).
+#'
 #' @param fs.est A forestsearch object containing \code{df.est} with
 #'   \code{treat.recommend} column.
 #' @param fs_bc Optional. Bootstrap results from
@@ -37,7 +52,11 @@
 #' @param outcome_type Character or \code{NULL}. One of \code{"binary"},
 #'   \code{"continuous"}.  Auto-detected from \code{fs.est$outcome_type}
 #'   if \code{NULL}.
-#' @param adjust_covariates Character vector or \code{NULL}. Baseline
+#' @param adjust_covariates This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character vector or \code{NULL}. Baseline
 #'   covariates to adjust the plotted effect model for, matching the
 #'   adjustment used during search/estimation.  When \code{NULL}, resolved
 #'   from \code{fs.est$args_call_all$adjust_covariates} so the plot reflects
@@ -159,6 +178,14 @@ plot_sg_glm_outcomes <- function(
     adjust_covariates <- fs.est$args_call_all$adjust_covariates
   }
 
+  # Orientation: the fit's resolved adverse_outcome, so the annotated effect
+  # is the fit's own estimate, sign included.  NULL only on an object not
+  # built by forestsearch(); resolved by forestsearch()'s rule.
+  adverse_outcome <- fs.est$args_call_all$adverse_outcome
+  if (is.null(adverse_outcome)) {
+    adverse_outcome <- outcome_type %in% c("binary", "count")
+  }
+
   is_log_scale <- effect_measure %in% c("OR", "RR", "IRR")
   z_alpha <- qnorm(1 - (1 - conf.level) / 2)
 
@@ -253,6 +280,7 @@ plot_sg_glm_outcomes <- function(
       outcome.name = outcome.name,
       offset.name = offset.name,
       effect_measure = effect_measure,
+      adverse_outcome = adverse_outcome,
       adjust_covariates = adjust_covariates,
       ps_adjust_method = "none"
     )

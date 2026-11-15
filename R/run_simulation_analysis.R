@@ -3,8 +3,8 @@
 # =============================================================================
 #
 # Replaces oc_analyses_gbsg.R::run_simulation_analysis(), which was coupled
-# to simulate_from_gbsg_dgm() and hardcoded column names (y.sim, event.sim,
-# flag.harm, treat).
+# to the legacy GBSG simulator (since removed) and hardcoded column names
+# (y.sim, event.sim, flag.harm, treat).
 #
 # Design:
 #   - Calls simulate_from_dgm() (the general simulator).
@@ -60,12 +60,7 @@ default_sim_params <- function() {
     d0.min                   = 12,
     d1.min                   = 12,
     maxk                     = 2,
-    # Inert: no path consults max.minutes (see ?forestsearch).  Kept so this
-    # block still mirrors the documented call, but it imposes no time budget --
-    # reading it as one would be a mistake.
-    max.minutes              = 5,
     by.risk                  = 12,
-    vi.grf.min               = -0.2,
     use_twostage             = FALSE,
     twostage_args            = list(),
     # Run inner forestsearch() sequentially by default.  See function
@@ -200,8 +195,8 @@ default_grf_params_gen <- function() {
 #' Run One Simulation Replicate
 #'
 #' General replacement for the legacy \code{run_simulation_analysis()} that
-#' was coupled to \code{simulate_from_gbsg_dgm()} and GBSG-specific column
-#' names.  This version calls \code{\link{simulate_from_dgm}} and accepts
+#' was coupled to the legacy GBSG simulator (since removed) and GBSG-specific
+#' column names.  This version calls \code{\link{simulate_from_dgm}} and accepts
 #' explicit column-name parameters, making it applicable to any DGM built
 #' with \code{\link{generate_aft_dgm_flex}}.
 #'
@@ -307,7 +302,26 @@ default_grf_params_gen <- function() {
 #'   counterparts), classification metrics against the DGM-stored
 #'   subgroup (\code{sens}, \code{spec}, \code{ppv}, \code{npv}), and
 #'   pairwise concordance between methods (\code{agree.*.*},
-#'   \code{kappa.*.*}).  As of v0.2.0 the following ForestSearch
+#'   \code{kappa.*.*}).  For a GLM outcome (\code{fs_params$outcome_type}
+#'   set and not \code{"survival"}) \code{hr.itt}, \code{hr.H.hat},
+#'   \code{hr.Hc.hat}, \code{hr.H.true} and \code{hr.Hc.true} come from a
+#'   two-arm \code{glm()} in each set and are on the scale
+#'   \code{fs_params$effect_measure} names, treatment against control: the
+#'   odds ratio (\code{"OR"}) and rate ratio (\code{"IRR"}) are the
+#'   exponentiated treatment coefficient and the mean difference
+#'   (\code{"MD"}) the coefficient; the risk difference (\code{"RD"}) and
+#'   risk ratio (\code{"RR"}) are the difference and ratio of the two fitted
+#'   arm proportions, and the rate difference (\code{"IRD"}) the difference
+#'   of the two fitted arm rates, per unit of exposure when the column named
+#'   by \code{fs_params$offset.name} is in the data (the convention under
+#'   which the \code{"IRR"} value is their ratio).  The \code{ahr.*} truth
+#'   columns (\code{\link{compute_aor}}) use the same scales, with one
+#'   exception: with an offset (the DGM's \code{offset_var} in
+#'   \code{\link{generate_glm_dgm}}, and \code{fs_params$offset.name}),
+#'   the \code{"IRD"} truth is a difference in
+#'   expected counts per patient, over each patient's own exposure, not per
+#'   unit of exposure (for a constant rate difference it is the mean exposure
+#'   times the per-unit value).  As of v0.2.0 the following ForestSearch
 #'   diagnostic columns are also always populated (\code{NA} for GRF
 #'   rows):
 #'   \describe{
@@ -422,6 +436,7 @@ run_simulation_analysis <- function(
     keep             = character(0),
     keep_first_n     = Inf
 ) {
+  .fs_preserve_rng()
 
   show_verbose <- verbose && (is.null(verbose_n) || sim_id <= verbose_n)
 
@@ -919,6 +934,69 @@ run_simulation_analysis <- function(
 
 
 # =============================================================================
+# Internal: NA subgroup membership in the classification extractors
+# =============================================================================
+# A subject whose membership (sg_hat) is NA cannot be scored as in or out of
+# the identified subgroup.  In .extract_fs_estimates_gen() the confusion
+# counts then become NA and `if ((tp + fn) > 0)` / `if ((tn + fp) > 0)`
+# stopped with R's "missing value where TRUE/FALSE needed"; in
+# .extract_grf_estimates_gen() size.H becomes NA and `if (out$size.H > 10)`
+# stopped the same way.  .stop_na_membership() is called at those two points
+# only when membership has an NA, so exactly the same cases stop; it gives the
+# reason instead.  Membership is not dropped or recoded (no na.rm).
+# `sg_def` is the subgroup definition at hand (cut labels, cut expressions or
+# M.* factor names); the columns of `cols` it refers to are named, and the
+# count is given alone when none is found.
+.stop_na_membership <- function(sg_hat, sg_def = NULL, cols = character(0)) {
+  covs <- tryCatch(.sg_def_columns(sg_def, cols),
+                   error = function(e) character(0))
+  stop(sprintf(paste0("%d of %d subjects have no subgroup assignment: a ",
+                      "covariate that defines the identified subgroup%s has ",
+                      "missing values."),
+               sum(is.na(sg_hat)), length(sg_hat),
+               if (length(covs)) sprintf(" (%s)", paste(covs, collapse = ", "))
+               else ""),
+       call. = FALSE)
+}
+
+# Columns of `cols` named in subgroup-definition strings, in order of first
+# appearance.  Each identifier-like token that is a column is kept; a token
+# that is not (an M.* factor name "var.level", see create_subgroup_indicator())
+# is cut at its first dot.
+.sg_def_columns <- function(sg_def, cols) {
+  txt <- as.character(unlist(sg_def, use.names = FALSE))
+  txt <- txt[!is.na(txt)]
+  if (!length(txt) || !length(cols)) return(character(0))
+  toks <- unlist(regmatches(txt, gregexpr("[A-Za-z.][A-Za-z0-9._]*", txt)),
+                 use.names = FALSE)
+  toks <- ifelse(toks %in% cols, toks, sub("\\..*$", "", toks))
+  as.character(intersect(toks, cols))
+}
+
+
+# Effect on the arms' own scale from a two-arm fit glm(y ~ treat) made by
+# the estimate extractors below (treat coded 0/1: the intercept is the control
+# arm, intercept + coefficient the treatment arm).  "RD" = p1 - p0 and
+# "RR" = p1 / p0, the fitted arm proportions of the binomial fit; "IRD" =
+# r1 - r0, the fitted arm rates of the Poisson fit, per unit of exposure when
+# the fit has the log-exposure offset, the convention under which the "IRR"
+# value exp(coefficient) equals r1 / r0.  Treatment minus (over) control, the
+# direction compute_aor() uses for the truth columns.  (With an offset on a
+# binomial fit, which no measure documents, the values are those at
+# log-exposure 0.)  A value that is not finite is NA_real_, the extractors'
+# failure value.  An arm with no events has a fitted proportion near zero, so
+# RR is extreme but finite (very large when the control arm has none, near
+# zero when the treatment arm has none), as OR is.
+.glm_arm_effect <- function(fit, effect_measure) {
+  cf <- stats::coef(fit)
+  v0 <- fit$family$linkinv(cf[[1]])
+  v1 <- fit$family$linkinv(cf[[1]] + cf[[2]])
+  val <- if (effect_measure == "RR") v1 / v0 else v1 - v0
+  if (is.finite(val)) val else NA_real_
+}
+
+
+# =============================================================================
 # Internal: extract FS estimates  (column-name-general)
 # =============================================================================
 
@@ -962,8 +1040,12 @@ run_simulation_analysis <- function(
       "MD"  =          stats::gaussian(),
       stats::binomial()
     )
-    # Whether the effect is on log scale (exponentiate) or identity
+    # Whether the treatment coefficient is exponentiated (OR, IRR) or used as
+    # it is (MD).  RD, RR and IRD are taken from the fitted arm values instead
+    # (arm_scale, tested first; see .glm_arm_effect()), so the "RR" entry of
+    # log_scale is not reached.
     log_scale <- effect_measure %in% c("OR", "IRR", "RR")
+    arm_scale <- effect_measure %in% c("RD", "RR", "IRD")
 
     .glm_effect <- function(sub_df) {
       tryCatch({
@@ -980,7 +1062,8 @@ run_simulation_analysis <- function(
                             family = glm_family)
         }
         b <- coef(fit)[[2]]  # treatment coefficient
-        if (log_scale) exp(b) else b
+        if (arm_scale) .glm_arm_effect(fit, effect_measure)
+        else if (log_scale) exp(b) else b
       }, error = function(e) NA_real_)
     }
 
@@ -1007,17 +1090,21 @@ run_simulation_analysis <- function(
   # A subgroup is "found" when the consistency result table has rows OR the
   # engine returned a treat.recommend assignment with harm members (GRF / DINA
   # modes, where fs_res is NULL but membership lives in fs_full$df.est).
+  # A treat.recommend assignment with no harm member is an empty identified
+  # set: a no-find, whatever the result table holds.
   .has_treat_rec <- !is.null(fs_full) && !is.null(fs_full$df.est) &&
     "treat.recommend" %in% names(fs_full$df.est) &&
     any(fs_full$df.est$treat.recommend == 0L, na.rm = TRUE)
 
-  if ((is.null(fs_res) || nrow(fs_res) == 0) && !.has_treat_rec) {
+  if ((is.null(fs_res) || nrow(fs_res) == 0 ||
+       "treat.recommend" %in% names(fs_full$df.est)) && !.has_treat_rec) {
     out$hr.Hc.hat <- out$hr.itt
     out$size.H  <- 0L
     out$size.Hc <- nrow(df)
 
     # Classification when nothing found: everyone is predicted Hc.
-    # Matches fs.estimates.out() from the paper's original code.
+    # With nothing found the complement is everyone: sens(Hc) = 1 and
+    # ppv(Hc) = |Hc|/N, as defined in León et al. (2024), Section 3.
     if (harm_col %in% names(df)) {
       true_H <- df[[harm_col]] == 1L
       n_true_H <- sum(true_H)
@@ -1027,8 +1114,8 @@ run_simulation_analysis <- function(
         # sens = 0 (none of H captured), ppv = 0 (no Ĥ predicted).
         out$sens <- 0
         out$ppv  <- 0
-        out$spec <- sum(!true_H) / nrow(df)  # = |Hc|/N
-        out$npv  <- 1                          # all Hc correctly in Ĥc
+        out$spec <- 1                          # sens(Hc): all of Hc is in the complement
+        out$npv  <- sum(!true_H) / nrow(df)    # ppv(Hc) = |Hc|/N
       }
       # Null (n_true_H == 0): sens/ppv remain NA (undefined).
       # spec = 1, npv = 1 (everyone is Hc and predicted Hc).
@@ -1049,6 +1136,7 @@ run_simulation_analysis <- function(
   if (!is.null(fs_full) && !is.null(fs_full$df.est) &&
       "treat.recommend" %in% names(fs_full$df.est)) {
     df$sg_hat <- as.integer(fs_full$df.est$treat.recommend == 0)
+    sg_def_txt <- fs_full$sg.harm  # definition at hand, for the NA message
   } else {
     sg_factors <- character(0)
     for (i in seq_len(min(7, ncol(fs_res)))) {
@@ -1056,9 +1144,13 @@ run_simulation_analysis <- function(
       if (cn %in% names(fs_res) && !is.na(fs_res[[cn]][1]))
         sg_factors <- c(sg_factors, fs_res[[cn]][1])
     }
+    sg_def_txt <- sg_factors       # definition at hand, for the NA message
     if (length(sg_factors) > 0)
       df$sg_hat <- create_subgroup_indicator(df, sg_factors)
-    else {
+    if (length(sg_factors) == 0 || !any(df$sg_hat == 1L, na.rm = TRUE)) {
+      # No factor recovered, or an indicator with no member: an empty
+      # identified set, scored as the no-find path above scores it.
+      out$any.H <- 0L
       out$hr.Hc.hat <- out$hr.itt
       out$size.H  <- 0L
       out$size.Hc <- nrow(df)
@@ -1068,7 +1160,7 @@ run_simulation_analysis <- function(
         n_true_H <- sum(true_H)
         if (n_true_H > 0) {
           out$sens <- 0;  out$ppv <- 0
-          out$spec <- sum(!true_H) / nrow(df);  out$npv <- 1
+          out$spec <- 1;  out$npv <- sum(!true_H) / nrow(df)
         } else {
           out$spec <- 1;  out$npv <- 1
         }
@@ -1124,6 +1216,9 @@ run_simulation_analysis <- function(
   if (harm_col %in% names(df)) {
     true_H <- df[[harm_col]] == 1L
     hat_H  <- df$sg_hat == 1L
+    # NA membership: tp and fn, or tn and fp, below would be NA and the first
+    # `if` would stop.  Stop here with the reason (same cases stop).
+    if (anyNA(hat_H)) .stop_na_membership(df$sg_hat, sg_def_txt, names(df))
 
     tp <- sum(true_H & hat_H);   fp <- sum(!true_H & hat_H)
     tn <- sum(!true_H & !hat_H); fn <- sum(true_H & !hat_H)
@@ -1131,7 +1226,8 @@ run_simulation_analysis <- function(
     out$sens <- if ((tp + fn) > 0) tp / (tp + fn) else NA_real_
     out$spec <- if ((tn + fp) > 0) tn / (tn + fp) else NA_real_
     out$ppv  <- if ((tp + fp) > 0) tp / (tp + fp) else NA_real_
-    out$npv  <- if ((tn + fn) > 0) tn / (tn + fn) else NA_real_
+    # Empty estimated complement (everyone identified): npv 0/0 = 0.
+    out$npv  <- if ((tn + fn) > 0) tn / (tn + fn) else 0
 
     # True-subgroup effect estimates
     if (is_glm) {
@@ -1241,7 +1337,15 @@ run_simulation_analysis <- function(
   # GLM-specific parameters (ignored by grf.subg.harm.survival)
   if (is_glm) {
     grf_args$outcome_type  <- outcome_type
-    if (!is.null(effect_measure)) grf_args$effect_measure <- effect_measure
+    # Count outcome: pass "log_IRR" for the simulation's "IRR" or "IRD".  The
+    # forest fit does not use effect_measure (grf.subg.harm.glm() accepts
+    # only "log_IRR" or "log_RR" for a count and stores it); the extractor
+    # below computes the reported effect on the simulation's own scale.
+    if (identical(outcome_type, "count")) {
+      grf_args$effect_measure <- "log_IRR"
+    } else if (!is.null(effect_measure)) {
+      grf_args$effect_measure <- effect_measure
+    }
     if (!is.null(offset_name))    grf_args$offset.name    <- offset_name
     # grf.subg.harm.glm() does NOT accept event.name — remove it
     # to prevent "unused argument" error from do.call()
@@ -1346,7 +1450,12 @@ run_simulation_analysis <- function(
       "MD"  =          stats::gaussian(),
       stats::binomial()
     )
+    # Whether the treatment coefficient is exponentiated (OR, IRR) or used as
+    # it is (MD).  RD, RR and IRD are taken from the fitted arm values instead
+    # (arm_scale, tested first; see .glm_arm_effect()), so the "RR" entry of
+    # log_scale is not reached.
     log_scale <- effect_measure %in% c("OR", "IRR", "RR")
+    arm_scale <- effect_measure %in% c("RD", "RR", "IRD")
 
     .glm_effect_grf <- function(sub_df, oc, ec, tc) {
       tryCatch({
@@ -1362,7 +1471,8 @@ run_simulation_analysis <- function(
                             family = glm_family)
         }
         b <- coef(fit)[[2]]
-        if (log_scale) exp(b) else b
+        if (arm_scale) .glm_arm_effect(fit, effect_measure)
+        else if (log_scale) exp(b) else b
       }, error = function(e) NA_real_)
     }
 
@@ -1394,7 +1504,7 @@ run_simulation_analysis <- function(
       n_true_H <- sum(true_H)
       if (n_true_H > 0) {
         out$sens <- 0;  out$ppv <- 0
-        out$spec <- sum(!true_H) / nrow(df);  out$npv <- 1
+        out$spec <- 1;  out$npv <- sum(!true_H) / nrow(df)
       } else {
         out$spec <- 1;  out$npv <- 1
       }
@@ -1410,7 +1520,10 @@ run_simulation_analysis <- function(
   has_tr     <- !is.null(grf_est$data) &&
                 "treat.recommend" %in% names(grf_est$data)
 
-  if (!has_sg || !has_tr) {
+  # A treat.recommend assignment with no harm member is an empty identified
+  # set: a no-find, whatever sg.harm.id holds.
+  if (!has_sg || !has_tr ||
+      !any(grf_est$data$treat.recommend == 0L, na.rm = TRUE)) {
     out$hr.Hc.hat <- out$hr.itt
     out$size.H  <- 0L
     out$size.Hc <- nrow(df)
@@ -1420,7 +1533,7 @@ run_simulation_analysis <- function(
       n_true_H <- sum(true_H)
       if (n_true_H > 0) {
         out$sens <- 0;  out$ppv <- 0
-        out$spec <- sum(!true_H) / nrow(df);  out$npv <- 1
+        out$spec <- 1;  out$npv <- sum(!true_H) / nrow(df)
       } else {
         out$spec <- 1;  out$npv <- 1
       }
@@ -1433,6 +1546,10 @@ run_simulation_analysis <- function(
   grf_data  <- grf_est$data
   harm_ind  <- as.integer(grf_data$treat.recommend == 0)
   grf_data$sg_hat <- harm_ind
+  # NA membership: size.H below would be NA and `if (out$size.H > 10)` would
+  # stop.  Stop here with the reason (same cases stop).
+  if (anyNA(harm_ind))
+    .stop_na_membership(harm_ind, sg_harm_id, names(grf_data))
 
   out$size.H  <- sum(harm_ind)
   out$size.Hc <- sum(harm_ind == 0L)
@@ -1535,7 +1652,8 @@ run_simulation_analysis <- function(
       out$sens <- if ((tp + fn) > 0) tp / (tp + fn) else NA_real_
       out$spec <- if ((tn + fp) > 0) tn / (tn + fp) else NA_real_
       out$ppv  <- if ((tp + fp) > 0) tp / (tp + fp) else NA_real_
-      out$npv  <- if ((tn + fn) > 0) tn / (tn + fn) else NA_real_
+      # Empty estimated complement (everyone identified): npv 0/0 = 0.
+      out$npv  <- if ((tn + fn) > 0) tn / (tn + fn) else 0
     }
 
     true_H_df <- df[[harm_col]] == 1L

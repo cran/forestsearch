@@ -44,7 +44,9 @@ family, not by changing the sort.
 
 \strong{Scale.}  The link (tau) scale of \code{fit$family}, which is not the scale
 the effect is usually reported on: \code{log(HR)} for \code{cox}, \code{log(OR)} for
-\code{binomial}, \code{log(IRR)} for \code{poisson}, and the raw mean difference for
+\code{binomial}, the log mean-count ratio for \code{poisson} (DINA takes no exposure
+offset, so this equals \code{log(IRR)} only when mean follow-up does not depend
+on arm given the covariates), and the raw mean difference for
 \code{gaussian}.  A harm threshold of HR 1.25 is therefore
 \code{m_diff = log(1.25)}, not \code{1.25}.
 
@@ -73,8 +75,7 @@ returned object (\verb{$n_min}), so \code{\link[=dina_subgroup_bootstrap]{dina_s
 
 \item{n_min.frac}{numeric in (0, 1); fraction of \code{nrow(df)} used for the
 adaptive \code{n_min} floor when \code{n_min = NULL}. Default \code{0.10}. Ignored when
-\code{n_min} is supplied.
-Default \code{60L}, matching the convention in GRF and \code{forestsearch()}.}
+\code{n_min} is supplied.}
 
 \item{direction}{one of \code{"both"} (default), \code{"left"}, or \code{"right"}.
 For each covariate \code{x_j} controls whether to search subgroups of

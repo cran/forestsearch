@@ -7,12 +7,16 @@
 compute_dgm_cde(dgm, harm_col = NULL)
 }
 \arguments{
-\item{dgm}{A DGM object (e.g., from \code{create_gbsg_dgm} or
-\code{generate_aft_dgm_flex}). Must contain \code{df_super_rand}
-with columns \code{theta_0} and \code{theta_1}.}
+\item{dgm}{A DGM object (e.g., from \code{generate_aft_dgm_flex} or
+\code{setup_gbsg_dgm}). The super-population is read from
+\code{dgm$df_super_rand} when present (as from \code{setup_gbsg_dgm}),
+otherwise from \code{dgm$df_super} (as from
+\code{generate_aft_dgm_flex}); it must have columns \code{theta_0} and
+\code{theta_1}. If neither data frame is present, or those columns are
+missing, the function warns and returns \code{dgm} unchanged.}
 
 \item{harm_col}{Character. Name of the subgroup indicator column in
-\code{dgm$df_super_rand}. If \code{NULL} (default), auto-detected
+that super-population data frame. If \code{NULL} (default), auto-detected
 from \code{flag.harm}, \code{flag_harm}, or \code{H}.}
 }
 \value{
@@ -43,7 +47,7 @@ the super-population data frame.
 }
 \examples{
 \dontrun{
-dgm <- create_gbsg_dgm(model = "alt", k_inter = 2.0)
+dgm <- setup_gbsg_dgm(model = "alt", k_inter = 2.0)
 dgm <- compute_dgm_cde(dgm)
 dgm$hazard_ratios$CDE_harm   # theta-ddagger(H)
 dgm$hazard_ratios$CDE         # theta-ddagger overall

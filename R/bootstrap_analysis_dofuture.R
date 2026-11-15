@@ -76,7 +76,7 @@
 #' @param nb_boots Integer. Number of bootstrap samples to generate (e.g., 500-1000).
 #'   More iterations provide better bias correction but increase computation time.
 #' @param show_three Logical. If \code{TRUE}, prints detailed progress for the
-#'   first three bootstrap iterations for debugging purposes. Default: \code{FALSE}.
+#'   first three bootstrap iterations for debugging purposes. No default; must be supplied.
 #' @param H_obs Numeric. Observed log hazard ratio for subgroup H (harm/questionable group,
 #'   \code{treat.recommend == 0}) from original sample. Used as reference for
 #'   bias correction.
@@ -304,6 +304,7 @@ bootstrap_results <- function(fs.est, df_boot_analysis, cox.formula.boot,
                               effect_measure = NULL,
                               boot_index_mat = NULL,
                               mr_in_replicates = FALSE) {
+  .fs_preserve_rng()
   # =========================================================================
   # SECTION: PRECONDITION -- AN IDENTIFIED SUBGROUP IS REQUIRED
   # =========================================================================

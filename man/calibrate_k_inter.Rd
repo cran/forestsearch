@@ -40,7 +40,10 @@ Default: FALSE}
 
 \item{verbose}{Logical. Print diagnostic information. Default: FALSE}
 
-\item{...}{Additional arguments passed to \code{\link{create_gbsg_dgm}}}
+\item{...}{Additional arguments passed to the internal GBSG builder that
+\code{\link{setup_gbsg_dgm}} also calls: \code{k_z3},
+\code{z1_quantile}, \code{n_super}, \code{use_rand_params} and
+\code{seed}, with the meanings given there.}
 }
 \value{
 Numeric value of k_inter that achieves the target HR
@@ -53,18 +56,32 @@ hazard ratio in the harm subgroup.
 This function uses \code{uniroot} to find the k_inter value such that
 the empirical HR (or AHR) in the harm subgroup equals target_hr_harm.
 }
+\section{Superseded}{
+
+This function is kept so that published simulations can be reproduced; it
+calibrates \code{k_inter} for \code{\link{setup_gbsg_dgm}()}. New work
+should use \code{\link{find_k_inter_for_target_hr}()}, which calibrates
+\code{k_inter} for \code{\link{generate_aft_dgm_flex}()} on any survival
+dataset with a 0/1 treatment column. It targets the Cox-based harm-subgroup hazard ratio, as
+\code{use_ahr = FALSE} does here; there is no packaged equivalent of
+\code{use_ahr = TRUE}. The calibrated quantity does not depend on the
+censoring model, so the censoring step of the GBSG wrapper (see
+\code{\link{setup_gbsg_dgm}}) does not affect the calibrated value. This
+function will be deprecated in a future release.
+}
+
 \examples{
 \dontrun{
 # Find k_inter for HR = 1.5 in harm subgroup
 k <- calibrate_k_inter(target_hr_harm = 1.5, verbose = TRUE)
 
 # Verify
-dgm <- create_gbsg_dgm(model = "alt", k_inter = k, verbose = TRUE)
+dgm <- setup_gbsg_dgm(model = "alt", k_inter = k, verbose = TRUE)
 print(dgm$hr_H_true)  # Should be close to 1.5
 
 # Calibrate to AHR instead
 k_ahr <- calibrate_k_inter(target_hr_harm = 1.5, use_ahr = TRUE, verbose = TRUE)
-dgm_ahr <- create_gbsg_dgm(model = "alt", k_inter = k_ahr, verbose = TRUE)
+dgm_ahr <- setup_gbsg_dgm(model = "alt", k_inter = k_ahr, verbose = TRUE)
 print(dgm_ahr$AHR_H_true)  # Should be close to 1.5
 }
 

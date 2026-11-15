@@ -64,7 +64,12 @@ committed population-noise seed (commit \code{2a4787bc}).}
 }
 \value{
 An object of class \code{c("aft_dgm_flex", "gbsg_dgm", "list")}
-with all fields from \code{create_gbsg_dgm()} plus:
+with the builder's fields (\code{df_super_rand}; the true hazard ratios
+\code{hr_causal}, \code{hr_H_true}, \code{hr_Hc_true}, \code{AHR},
+\code{AHR_H_true}, \code{AHR_Hc_true} and the list
+\code{hazard_ratios}; \code{model_params}, \code{cens_params},
+\code{subgroup_info}, \code{effect_modifiers}, \code{analysis_vars},
+\code{model_type}, \code{n_super} and \code{seed}) plus:
 \describe{
 \item{\code{df_super}}{Super-population data frame with
 \code{simulate_from_dgm()}-compatible column names.}
@@ -81,13 +86,12 @@ otherwise \code{"none"}.}
 }
 \description{
 Creates a GBSG-based data generating mechanism that is fully compatible with
-\code{\link{simulate_from_dgm}}.  This is the replacement for
-\code{create_gbsg_dgm()}: it accepts exactly the same arguments and produces
-the same numeric output, but returns an object of class
-\code{"aft_dgm_flex"} instead of \code{"gbsg_dgm"}.
+\code{\link{simulate_from_dgm}}.  It builds the mechanism with the
+package's internal GBSG builder and returns it as an object of class
+\code{c("aft_dgm_flex", "gbsg_dgm", "list")}.
 }
 \details{
-Internally the function calls \code{create_gbsg_dgm()} and then:
+Internally the function calls that builder and then:
 \enumerate{
 \item Adds a \code{df_super} field with column names aligned to
 \code{simulate_from_dgm()} conventions
@@ -100,12 +104,72 @@ and a \code{model_params$censoring} sub-list.
 The original \code{df_super_rand} field is kept so that
 \code{compute_dgm_cde()} and \code{print.gbsg_dgm} continue to work.
 
+\strong{Subgroup.} The harm subgroup H is \code{z1 = 1} and \code{z3 = 1}:
+\code{z1} is 1 when the estrogen receptor value \code{er} is at or below
+its \code{z1_quantile} sample quantile in \code{survival::gbsg} (the 25th
+percentile by default), and \code{z3} is 1 for premenopausal patients
+(\code{meno == 0}). Its indicator is \code{flag.harm} in
+\code{df_super_rand} and \code{flag_harm} in \code{df_super}. Under
+\code{model = "null"} the indicator is 0 for every patient.
+
+\strong{Model.} A Weibull accelerated failure time model is fitted with
+\code{survival::survreg()} to \code{survival::gbsg}, with time
+\code{rfstime / 30.4375} (months), event \code{status} and treatment
+\code{treat = hormon}. Its covariates are \code{treat}, \code{z1},
+\code{z2}, \code{z3}, \code{z4} and \code{z5}, where \code{z2}, \code{z4}
+and \code{z5} are the quartile groups of \code{age}, \code{pgr} and
+\code{nodes}, entered as scores 1 to 4; under \code{model = "alt"} the
+interaction \code{zh = treat * z1 * z3} is added. \code{k_treat} and
+\code{k_z3} multiply the fitted \code{treat} and \code{z3} coefficients.
+With AFT coefficients \code{gamma} and scale \code{sigma}, the
+hazard-scale coefficients are \code{-gamma / sigma}
+(\code{model_params$b_hr}).
+
+\strong{Interaction (\code{k_inter}).} Under \code{model = "alt"}, \code{k_inter}
+multiplies the fitted \code{zh} coefficient,
+\code{gamma[zh] <- k_inter * gamma[zh]} (the default \code{k_inter = 1} keeps
+the fitted value). Each patient's log hazard ratio
+(\code{loghr_po = theta_1 - theta_0} in \code{df_super_rand}) is then
+\code{-(gamma[treat] + gamma[zh]) / sigma} in H and \code{-gamma[treat] / sigma} in
+its complement, so \code{k_inter = 0} gives every patient the same hazard
+ratio. The exponentials of these two values are the stored
+\code{AHR_H_true} and \code{AHR_Hc_true}. The Cox-based
+\code{hr_H_true} and \code{hr_Hc_true} are fitted to stacked potential
+outcomes of the \code{n_super} patients drawn with replacement from the
+GBSG rows, and differ from them; at \code{k_inter = 0} they still differ
+slightly from each other. Under \code{model = "null"}, \code{k_inter} is
+not used.
+
 Noise columns requested via \code{k_random_noise} are inert
 N(0,1) population attributes intended as candidate confounders; the
 builder never puts them in the outcome model. They are drawn once onto
 the super-population (both \code{df_super_rand} and \code{df_super}),
 so simulated trials and evaluation frames inherit them by row resampling.
 }
+\section{Superseded}{
+
+This function is kept so that published simulations can be reproduced.
+New work should use \code{\link{generate_aft_dgm_flex}()} with
+\code{\link{simulate_from_dgm}()}, which take any survival dataset with a
+0/1 treatment column. On the GBSG data they give the same outcome model,
+true hazard ratios and \code{k_inter} calibration once the caller has built
+the GBSG covariates, at \code{k_z3 = 1} and \code{use_rand_params = FALSE}
+(\code{generate_aft_dgm_flex()} has neither argument); there is no drop-in
+replacement call. The censoring step differs: here (with the default
+\code{cens_type = "weibull"}) a Weibull censoring model is fitted to the
+resampled super-population, in which treatment is the arm assigned for
+simulation, not the observed treatment, and its covariate term is the
+fitted term multiplied by the ratio of the event-model scale to the
+censoring-model scale. The true hazard ratios stored in the object and the
+\code{k_inter} calibration are not affected; simulated censoring times are,
+and with them the observed times and event indicators and anything computed
+from them, such as the beta(Hhat) targets scored on a frame from
+\code{\link{fs_build_eval_frame}()}. The "Extreme Subgroup
+Effects" article on the package website shows the general machinery on the
+GBSG data, with a uniform treatment effect. This function will be deprecated
+in a future release.
+}
+
 \examples{
 \dontrun{
 dgm <- setup_gbsg_dgm(model = "alt", k_inter = 2, verbose = FALSE)
@@ -116,6 +180,6 @@ sim <- simulate_from_dgm(dgm, n = 400, seed = 1)
 
 }
 \seealso{
-\code{\link{create_gbsg_dgm}}, \code{\link{simulate_from_dgm}},
+\code{\link{generate_aft_dgm_flex}}, \code{\link{simulate_from_dgm}},
 \code{\link{compute_dgm_cde}}
 }

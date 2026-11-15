@@ -324,7 +324,9 @@ get_FSdata <- function(df.analysis, use_lasso = FALSE, use_grf = FALSE, grf_cuts
   lassokeep <- NULL
   lassoomit <- NULL
   if(use_lasso){
-    # Reduce dimension via LASSO (Cox for survival, GLM for binary/continuous)
+    # Reduce dimension via LASSO: Cox for survival; a GLM otherwise --
+    # logistic for binary (Poisson when offset.name is given), linear for
+    # continuous, Poisson for count (log offset when offset.name is given).
     get_lasso <- lasso_selection(
       df = df.FS,
       confounders.name = confounders.name,
@@ -445,12 +447,11 @@ get_FSdata <- function(df.analysis, use_lasso = FALSE, use_grf = FALSE, grf_cuts
   # Remove any factors to cut at median if already in GRF
   if (replace_med_grf) {
     if (use_grf && length(conf.cont_medians) > 0 && length(grf_cuts) > 0) {
-      # Find which conf.cont_medians are present in any grf_cuts
-      to_exclude <- vapply(
-        conf.cont_medians,
-        function(x) any(grepl(x, grf_cuts)),
-        logical(1)
-      )
+      # Find which conf.cont_medians are the variable of a GRF cut.  The
+      # variable name of a cut is the text before "<=" or ">=", trimmed;
+      # names are compared exactly (not as substrings or regexes).
+      grf_cut_names <- trimws(sub("\\s*[<>]=.*$", "", grf_cuts))
+      to_exclude <- conf.cont_medians %in% grf_cut_names
       # Update conf.cont_medians
       if (any(to_exclude)) {
         conf.cont_medians <- conf.cont_medians[!to_exclude]
@@ -495,8 +496,12 @@ get_FSdata <- function(df.analysis, use_lasso = FALSE, use_grf = FALSE, grf_cuts
   if(use_grf){
     if(details) cat('Initial GRF cuts included', grf_cuts, '\n')
     if(length(confs) > 0 & length(grf_cuts) > 0){
-      # Vectorized check: keep only grf_cuts not matching any confs
-      flag_omit <- sapply(grf_cuts, function(cut) any(sapply(confs, function(x) grepl(x, cut))))
+      # Drop a GRF cut only if its variable name (the text before "<=" or
+      # ">=", trimmed) is exactly a categorical confounder, or the whole cut
+      # string is exactly in the current pool.  Exact comparison, not a
+      # substring or regex match.
+      grf_cut_names <- trimws(sub("\\s*[<>]=.*$", "", grf_cuts))
+      flag_omit <- (grf_cut_names %in% conf.categorical) | (grf_cuts %in% confs)
       grf_cuts_keep <- grf_cuts[!flag_omit]
       confs <- unique(c(confs, grf_cuts_keep))
     }
@@ -512,12 +517,15 @@ get_FSdata <- function(df.analysis, use_lasso = FALSE, use_grf = FALSE, grf_cuts
     }
   }
   # DINA cuts: merged into the candidate pool exactly like GRF cuts -- keep
-  # only those not already represented in confs (substring match), then
-  # union-dedup.  dina_cuts are already canonical "var <= value" expressions.
+  # only those not already represented in confs (exact match: the cut's
+  # variable name is a categorical confounder, or the whole cut string is
+  # already in confs), then union-dedup.  dina_cuts are canonical
+  # "var <= value" or "var >= value" expressions.
   if(length(dina_cuts) > 0){
     if(details) cat('Factors per DINA:', c(dina_cuts), '\n')
     if(length(confs) > 0){
-      flag_omit <- sapply(dina_cuts, function(cut) any(sapply(confs, function(x) grepl(x, cut))))
+      dina_cut_names <- trimws(sub("\\s*[<>]=.*$", "", dina_cuts))
+      flag_omit <- (dina_cut_names %in% conf.categorical) | (dina_cuts %in% confs)
       dina_cuts_keep <- dina_cuts[!flag_omit]
     } else {
       dina_cuts_keep <- dina_cuts
@@ -595,7 +603,7 @@ get_FSdata <- function(df.analysis, use_lasso = FALSE, use_grf = FALSE, grf_cuts
       "use_lasso = FALSE); ",
       "(3) candidate covariates are numeric or factor and have ",
       "sufficient variability; ",
-      "(4) GRF-related thresholds (dmin.grf, frac.tau, vi.grf.min) ",
+      "(4) GRF-related thresholds (dmin.grf, frac.tau) ",
       "are appropriate for the outcome type and sample size ",
       "(frac.tau is survival-specific and may be ignored for GLM)."),
       paste(sources, collapse = ", ")

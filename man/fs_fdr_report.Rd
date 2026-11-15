@@ -44,7 +44,7 @@ is inert; here it annotates the null's operating characteristics only.}
 \item{nsims}{Integer; null replicates per null.  Default 1000.}
 
 \item{n}{Integer or \code{NULL}; simulated trial size.  Default
-\code{nrow(df_analysis)}.  The published reference baseline used
+\code{NULL}, giving \code{nrow(df_analysis)}.  The published reference baseline used
 \code{n = 700}; pass that to reproduce it exactly.}
 
 \item{confounders}{Character vector or \code{NULL}; candidate covariates.
@@ -52,7 +52,13 @@ Default \code{NULL} inherits \code{confounders.name} from the fitted
 object (intersected per replicate with the DGM columns), falling back to
 the GBSG covariate set when the analysis carried none.}
 
-\item{n_super}{Integer; super-population size for the DGM.  Default 25000.}
+\item{n_super}{Integer; super-population size for the DGM.  Default 25000.
+Under \code{null = "harm"}, \code{k_inter} is calibrated by
+\code{\link{calibrate_k_inter}} on the GBSG builder's default
+super-population size (5000), not on \code{n_super}; the calibrated value
+does not depend on that size beyond the root-finding tolerance (1e-6),
+because the root is fixed by the AFT coefficients fitted to
+\code{survival::gbsg}.}
 
 \item{analysis_time}{Numeric; administrative censoring time (months).
 Default 84.}
@@ -149,8 +155,24 @@ because \code{simulate_from_dgm()} emits fixed names
 is forced \code{TRUE} so B is computable.
 }
 }
+\note{
+This function builds its null data through the superseded GBSG wrapper
+(\code{\link{setup_gbsg_dgm}}, with \code{\link{calibrate_k_inter}} for
+the \code{"harm"} null), in which the censoring model is fitted to the
+resampled super-population and its covariate term is multiplied by the
+ratio of the event-model scale to the censoring-model scale; this changes
+the simulated censoring times, and with them the rates in \code{fdr}, but
+not the true hazard ratios in \code{hr_structure}.
+}
 \examples{
 \dontrun{
+# The GBSG trial with time in months and the column names used below
+gbsg_df <- within(survival::gbsg, {
+  id    <- pid
+  time  <- rfstime / 30.4375
+  treat <- hormon
+})
+
 # A fitted survival/Cox analysis (thresholds and knobs live on the object)
 fit <- forestsearch(
   df.analysis = gbsg_df,
@@ -164,12 +186,12 @@ fit <- forestsearch(
   mr_inference = TRUE)
 
 # Characterize its operating FDR and whether harm confirmation helps
-rep <- fs_fdr_report(fit, gbsg_df, nsims = 1000, n_workers = 100)
+rep <- fs_fdr_report(fit, gbsg_df, nsims = 1000)
 rep                       # prints the realized-HR table and the A/B table
 rep$fdr                   # one row per null x c_confirm
 
 # Reproduce the published reference (n = 700): A ~ 0.138 (hom), 0.278 (harm)
-fs_fdr_report(fit, gbsg_df, n = 700, nsims = 1000, n_workers = 100)
+fs_fdr_report(fit, gbsg_df, n = 700, nsims = 1000)
 }
 
 }

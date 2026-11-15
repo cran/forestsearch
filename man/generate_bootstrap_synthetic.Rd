@@ -24,7 +24,7 @@ generate_bootstrap_synthetic(
 
 \item{cat_vars}{Character vector of categorical variable names}
 
-\item{n}{Number of synthetic observations to generate (default: same as original)}
+\item{n}{Number of synthetic observations to generate (default: NULL, meaning same as original)}
 
 \item{seed}{Random seed for reproducibility}
 
@@ -32,12 +32,22 @@ generate_bootstrap_synthetic(
 
 \item{id_var}{Optional name of ID variable to regenerate (will be numbered 1:n)}
 
-\item{cat_flip_prob}{Probability of flipping categorical values (default: noise_level/2)}
+\item{cat_flip_prob}{Probability of flipping categorical values (default: NULL, giving noise_level/2)}
 
 \item{preserve_bounds}{Logical: should continuous variables stay within original bounds? (default: TRUE)}
 
-\item{ordinal_vars}{Optional character vector of ordinal categorical variables
-(these will be perturbed to adjacent values rather than randomly flipped)}
+\item{ordinal_vars}{Optional character vector naming which of the
+\code{cat_vars} are ordinal. A numeric or character variable listed in
+both \code{cat_vars} and \code{ordinal_vars} is changed to a neighbouring
+level (in sorted order) instead of a random other level. A factor listed
+in both is set to NA, with a warning, at each row selected for change,
+unless its levels are "1", "2", ... in that order. A variable listed only
+in \code{ordinal_vars} is not perturbed: it is kept as resampled and is
+named in the 'kept as-is' message. Known limitation: for a numeric-coded
+variable at its lowest or highest level, the new value is not always the
+adjacent level (with codes 1, ..., k, a row at 1 that is selected for
+change keeps its value half the time, and a row at k moves to any of
+1, ..., k - 1 with equal probability).}
 }
 \value{
 A data frame with synthetic data
@@ -52,6 +62,8 @@ synth_gbsg <- generate_bootstrap_synthetic(
   data = survival::gbsg,
   continuous_vars = c("age", "size", "nodes", "pgr", "er", "rfstime"),
   cat_vars = c("meno", "hormon", "status"),
+  # listed only in ordinal_vars, so it is resampled but not perturbed;
+  # list it in cat_vars as well to perturb it
   ordinal_vars = c("grade"),
   id_var = "pid",
   n = 1000,
@@ -74,6 +86,8 @@ synth_data <- generate_bootstrap_synthetic(
   data = my_data,
   continuous_vars = c("height", "weight", "age"),
   cat_vars = c("gender", "smoker"),
+  # listed only in ordinal_vars, so it is resampled but not perturbed;
+  # list it in cat_vars as well to perturb it
   ordinal_vars = c("education"),
   id_var = "id",
   n = 150,

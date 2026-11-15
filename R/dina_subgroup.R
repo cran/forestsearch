@@ -137,7 +137,9 @@
 #'
 #'   **Scale.**  The link (tau) scale of `fit$family`, which is not the scale
 #'   the effect is usually reported on: `log(HR)` for `cox`, `log(OR)` for
-#'   `binomial`, `log(IRR)` for `poisson`, and the raw mean difference for
+#'   `binomial`, the log mean-count ratio for `poisson` (DINA takes no exposure
+#'   offset, so this equals `log(IRR)` only when mean follow-up does not depend
+#'   on arm given the covariates), and the raw mean difference for
 #'   `gaussian`.  A harm threshold of HR 1.25 is therefore
 #'   `m_diff = log(1.25)`, not `1.25`.
 #'
@@ -165,7 +167,6 @@
 #' @param n_min.frac numeric in (0, 1); fraction of `nrow(df)` used for the
 #'   adaptive `n_min` floor when `n_min = NULL`. Default `0.10`. Ignored when
 #'   `n_min` is supplied.
-#'   Default `60L`, matching the convention in GRF and `forestsearch()`.
 #' @param direction one of `"both"` (default), `"left"`, or `"right"`.
 #'   For each covariate `x_j` controls whether to search subgroups of
 #'   the form `x_j <= q` (left), `x_j >= q` (right), or both.
@@ -400,7 +401,9 @@ dina_subgroup <- function(fit, df, covariates,
   .validate_selection_rule(selection_rule, sg_focus, effect_neighborhood)
 
   # DINA's tau-hat is the link-scale linear predictor: identity (MD) for
-  # gaussian, log-OR for binomial, log-IRR for poisson, log-HR for cox.
+  # gaussian, log-OR for binomial, the log mean-count ratio for poisson
+  # (dina() takes no exposure offset, so this is log-IRR only when mean
+  # follow-up does not depend on arm given the covariates), log-HR for cox.
   # Mirror forestsearch by applying the neighborhood band on the natural
   # scale for ratio families (exponentiate before the inclusion test).
   effect_log_scale <- isTRUE(fit$family %in% c("binomial", "poisson", "cox"))

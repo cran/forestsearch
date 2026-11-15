@@ -299,13 +299,20 @@
     effect_measure %in% c("RD", "IRD")
 
   if (is_bounded_identity && user_set_threshold && hr.threshold > 1.0) {
+    # Name the measure and its ratio-scale counterpart: RD -> OR, IRD -> IRR
+    # (the ratio measure of the same rate model).  A rate difference is not
+    # bounded by 1 in itself; [-1, 1] is the range the threshold remap uses.
+    bound_line <- switch(effect_measure,
+      RD  = "  A risk difference cannot exceed 1.0.\n",
+      IRD = "  A rate-difference threshold above 1.0 is outside that range.\n")
+    ratio_measure <- switch(effect_measure, RD = "OR", IRD = "IRR")
     warning(
       sprintf(paste0(
         "effect.threshold = %.2f but effect_measure = '%s' ",
         "(identity scale, range [-1, 1]).\n",
-        "  A risk difference cannot exceed 1.0.\n",
-        "  Did you mean effect_measure = 'OR' (ratio scale)?"),
-        hr.threshold, effect_measure),
+        "%s",
+        "  Did you mean effect_measure = '%s' (ratio scale)?"),
+        hr.threshold, effect_measure, bound_line, ratio_measure),
       call. = FALSE)
   }
 
@@ -332,6 +339,13 @@
 #' controlled trials, particularly for multi-regional clinical trials
 #' ('MRCT') requiring regional consistency evaluation.  Methods are
 #' described in Leon et al. (2024) \doi{10.1002/sim.10163}.
+#' Post-selection inference for the reported subgroup (multiplier
+#' resampling, \code{mr_inference = TRUE}) follows León and Anderson
+#' (2026a) \doi{10.48550/arXiv.2609.38361}. The current methodology for
+#' the search itself -- forest search as closed-form stability selection
+#' on splitting consistency, the family-wise false-declaration rate and
+#' the two-subgroup claim -- is given in León and Anderson (2026b)
+#' \doi{10.48550/arXiv.2610.28379}.
 #'
 #' @param df.analysis Data frame. Analysis dataset with required columns.
 #' @param outcome.name Character. Name of time-to-event outcome variable. Default "tte".
@@ -368,11 +382,17 @@
 #'   }
 #'   To disable parallelism entirely, pass
 #'   \code{parallel_args = list(plan = "sequential")}.
+#'   A sequential and a parallel plan can give different consistency
+#'   proportions, and possibly a different selection, whenever literal
+#'   splitting runs (\code{consistency_method = "split"}, an incidence-rate
+#'   difference (\code{effect_measure = "IRD"}) under \code{"resample"}, or a
+#'   candidate whose closed form is not available), except under
+#'   \code{sg_focus = "maxeff"}, which runs the same loop on every plan.
 #' @param df.predict Data frame. Prediction dataset (optional).
 #' @param df.test Data frame. Test dataset (optional).
 #' @param is.RCT Logical. Is this a randomized controlled trial? Default TRUE.
 #' @param seedit Integer. Random seed. Default 8316951.
-#' @param est.scale Character. Estimation scale ("hr" or "rmst"). Default "hr".
+#' @param est.scale Character. Estimation scale ("hr" or "1/hr"). Default "hr".
 #' @param use_lasso Logical. Use LASSO for variable selection. Default FALSE.
 #'   The default changed from \code{TRUE} in an earlier release: with
 #'   \code{subgroup_method = "consistency"} a model-based front end makes the
@@ -384,10 +404,9 @@
 #'   \code{grf.subg.harm.survival()} / \code{grf.subg.harm.glm()} (or taken
 #'   from \code{grf_res} / \code{grf_cuts} when supplied) and enter the
 #'   candidate family through \code{\link{get_FSdata}} alongside the
-#'   quartile (and any DINA) cuts.  This flag governs candidate-cut
-#'   generation only: GRF variable-importance ordering of the cut columns
-#'   is a separate step controlled solely by \code{vi.grf.min} and runs,
-#'   or is skipped, regardless of \code{use_grf}.  Default FALSE.
+#'   quartile (and any DINA) cuts.  This is the only switch that fits a
+#'   GRF in the forest-search path (the former variable-importance
+#'   screening, \code{vi.grf.min}, is deprecated and inert).  Default FALSE.
 #'   The default changed from \code{TRUE} in an earlier release, for the same
 #'   fixed-candidate-family reason given under \code{use_lasso}.
 #' @param grf_res GRF results object (optional, for reuse).
@@ -428,15 +447,25 @@
 #'   When \code{selected_only = TRUE} (the default), \code{use_dina} screening
 #'   contributes the cut(s) chosen by \code{\link{dina_subgroup}} -- using
 #'   this call's \code{sg_focus} / \code{selection_rule} /
-#'   \code{effect_neighborhood} / \code{n.min} / \code{hr.threshold}, i.e. the
-#'   same cut \code{subgroup_method = "dina"} would select. Set \code{FALSE} to
-#'   contribute the full frontier candidate set instead.
+#'   \code{effect_neighborhood} / \code{n.min} / \code{hr.threshold}, ranked by
+#'   \code{sg_focus} with DINA's native tau-hat as the effect statistic (under
+#'   \code{"maxSG"} / \code{"minSG"} size ranks first and tau-hat breaks
+#'   ties).  That is the cut \code{subgroup_method = "dina"}
+#'   would select only under \code{dina_select_statistic = "dina"}; under the
+#'   default \code{dina_select_statistic = "effect"},
+#'   \code{subgroup_method = "dina"} re-ranks the qualifying family on the
+#'   inferential effect and can select a different cut, while this screening
+#'   step does not re-rank.  Set \code{FALSE} to contribute the full frontier
+#'   candidate set instead.
 #'
 #'   \strong{\code{m_diff} is the candidacy floor, on the link scale, and is
 #'   derived rather than taken from this list.}  It is the harm floor a
 #'   candidate must clear to enter the qualifying family that \code{sg_focus}
 #'   then ranks -- \code{log(HR)} for \code{cox}, \code{log(OR)} for
-#'   \code{binomial}, \code{log(IRR)} for \code{poisson}, and the raw mean
+#'   \code{binomial}, the log mean-count ratio for \code{poisson} (DINA takes
+#'   no exposure offset -- \code{offset.name} is not passed to its fit -- so
+#'   this equals \code{log(IRR)} only when mean follow-up does not depend on
+#'   arm given the covariates), and the raw mean
 #'   difference for \code{gaussian}.  Under \code{subgroup_method = "dina"}
 #'   (and under \code{selected_only = TRUE} screening) it is computed as
 #'   \code{log(hr.threshold)} -- identity for \code{gaussian} -- from the
@@ -504,13 +533,13 @@
 #'   selected subgroup may be a single covariate or, where the method's depth
 #'   allows (DINA \code{max_depth = 2}; GRF \code{grf_depth >= 2}), an
 #'   AND-conjunction.
-#' @param max_n_confounders Integer. Maximum number of candidate cut columns
-#'   retained after GRF variable-importance screening, keeping the
-#'   highest-importance columns.  Default 1000.  \strong{Applied only when
-#'   \code{vi.grf.min} is numeric}: the truncation lives inside the
-#'   variable-importance block, so with \code{vi.grf.min = NULL} (the
-#'   default) this argument has no effect, and a finite value below the
-#'   number of cut columns triggers a warning saying so.
+#' @param max_n_confounders \strong{Deprecated} (0.4.0.9000): accepted and
+#'   ignored with a warning.  GRF variable-importance screening of the
+#'   candidate cut columns was removed so that the candidate family is the
+#'   cut grid alone unless \code{use_lasso}, \code{use_grf} or
+#'   \code{use_dina} is \code{TRUE}.  It capped the importance-ordered
+#'   column list, which no longer exists.  Will be removed in a future
+#'   release; drop it from the call.
 #' @param grf_depth Integer. GRF tree depth. Default 2.
 #' @param grf_selection Character, one of \code{"frontier"} (default) or
 #'   \code{"tree"}, used only when \code{subgroup_method = "grf"}.
@@ -544,9 +573,32 @@
 #'   native-family restriction follows the effect rather than the DR score).
 #'   \code{"effect"} is the default because only it ranks on the inferential
 #'   coefficient; \code{"dr"} is rejected under \code{mr_inference = TRUE}.
+#'   Under \code{"effect"}, \code{dmin.grf} is applied first, on the DR scale,
+#'   as an existence gate: if no DR candidate reaches it, no subgroup is
+#'   returned.  Otherwise it is not applied per candidate: the whole
+#'   DR-candidate family (filtered by \code{n.min}, not by \code{dmin.grf}) is
+#'   re-ranked, and admission uses the effect floor from \code{hr.threshold}
+#'   (the resolved \code{effect.threshold} for GLM outcomes).  If no candidate
+#'   can be scored on the effect, the DR winner, which did reach
+#'   \code{dmin.grf}, is kept; if candidates are scored but none clears the
+#'   effect floor, no subgroup is returned.
 #'   Ignored for \code{grf_selection = "tree"} (the policy-tree leaf is the
 #'   selection, with no enumerated family to rank).
-#' @param dmin.grf Numeric. Minimum events for GRF. Default 0.0.
+#' @param dmin.grf Numeric. Harm threshold on GRF's doubly robust (DR) scale,
+#'   not a number of events.  It is compared with a subgroup's DR harm effect,
+#'   the subgroup mean of the DR score for control minus the subgroup mean of
+#'   the DR score for treatment (the two columns of
+#'   \code{policytree::double_robust_scores()}, computed for every patient):
+#'   for survival a difference in restricted mean survival time up
+#'   to the GRF horizon (see \code{frac.tau}); for other outcomes a difference
+#'   on the scale of the outcome given to GRF (see \code{grf_count_transform}).
+#'   Under \code{grf_selection = "tree"} (and in \code{use_grf} screening) the
+#'   policy-tree subgroup with the largest DR harm effect must reach it; under
+#'   \code{grf_selection = "frontier"} with \code{grf_select_statistic = "dr"}
+#'   it is applied to every frontier candidate.  Under
+#'   \code{grf_select_statistic = "effect"} it is applied first as an existence
+#'   gate on the DR scale and is then not applied per candidate; see
+#'   \code{grf_select_statistic}.  Default 0.0.
 #' @param frac.tau Numeric in (0, 1]. Multiplier on the GRF time horizon
 #'   passed to \code{grf::causal_survival_forest()}. The effective
 #'   horizon is
@@ -554,8 +606,7 @@
 #'   i.e. \code{frac.tau} times the smaller of the two arm-specific
 #'   maximum event times.  Values < 1 truncate the horizon inward of
 #'   that maximum (the conservative choice when events are sparse near
-#'   the tail).  Applies to both the GRF variable-importance
-#'   pre-screen inside \code{forestsearch()} and the downstream call to
+#'   the tail).  Used by the downstream call to
 #'   \code{\link{grf.subg.harm.survival}}.  Used only when
 #'   \code{outcome_type = "survival"}; ignored for GLM outcomes
 #'   (binary, continuous, count).  Default 0.8.
@@ -883,14 +934,13 @@
 #'   Default 10.
 #' @param d1.min Integer. Same as \code{d0.min} for the treatment arm.
 #'   Default 10.
-#' @param max.minutes Numeric. \strong{Currently inert; scheduled for
-#'   deprecation in v0.3.0.} Previously intended as a wall-clock time
-#'   budget for the combination search, this argument is no longer
-#'   enforced in the parallelized search path and has no effect on
-#'   behavior. Search scope is governed by \code{maxk}, the candidate-factor
-#'   front ends (\code{use_grf}, \code{use_lasso}, \code{conf_force}),
-#'   and the number of parallel workers. The default of 3 is retained
-#'   only for signature compatibility.
+#' @param max.minutes \strong{Deprecated} (0.4.0.9000): accepted and
+#'   ignored. It was documented as a wall-clock budget for the
+#'   combination search but was never enforced in the parallel search
+#'   path. A non-default value emits one warning. Search scope is governed
+#'   by \code{maxk}, the candidate-factor front ends (\code{use_grf},
+#'   \code{use_lasso}, \code{conf_force}) and the number of workers.
+#'   The formal will be removed in a later release; drop it from calls.
 #' @param minp Numeric. Minimum prevalence threshold. Default 0.025.
 #' @param details Logical. Print progress details. Default FALSE.
 #' @param quiet Logical. If TRUE, suppress the configuration summary
@@ -915,28 +965,13 @@
 #'
 #'   Set a finite value only to bound runtime, knowing it can change which
 #'   subgroup is selected.  The default was \code{200} in earlier versions.
-#' @param vi.grf.min Numeric or \code{NULL}.  GRF variable-importance
-#'   screening of the candidate cut columns.  \code{NULL} (the default since
-#'   0.3.0) skips the screening entirely: no causal forest is fitted and the
-#'   cut columns are searched in the order \code{get_FSdata()} builds them.
-#'   A numeric value fits a causal forest (\code{grf::causal_forest()} for
-#'   GLM outcomes, \code{grf::causal_survival_forest()} for survival),
-#'   \strong{orders} the cut columns by variable importance, and retains those
-#'   with \code{vi_ratio > vi.grf.min}, where \code{vi_ratio} is each column's
-#'   importance divided by the maximum.  At values \code{<= 0} nothing is
-#'   filtered out -- \code{grf::variable_importance()} is non-negative and the
-#'   block is guarded by \code{vi_max > 0} -- so the effect is ordering only.
-#'   That ordering sets the candidate matrix's column order; it does
-#'   \strong{not} reach candidate selection, because the candidate table is
-#'   re-sorted by \code{(-HR, K)} before the consistency loop.  Measured effect
-#'   on \code{n_candidates_evaluated} and \code{early_stop_candidate}: zero;
-#'   the selected subgroup's subject membership is unchanged and only the
-#'   clause order of \code{sg.harm} may differ.  Versions before 0.3.0
-#'   defaulted to \code{-0.2}; pass \code{vi.grf.min = -0.2} explicitly to
-#'   reproduce their output.  \code{max_n_confounders} is applied
-#'   \strong{only when this screening runs} -- see that argument.
+#' @param vi.grf.min \strong{Deprecated} (0.4.0.9000): accepted and ignored
+#'   with a warning.  GRF variable-importance screening of the candidate cut
+#'   columns was removed so that the candidate family is the cut grid alone
+#'   unless \code{use_lasso}, \code{use_grf} or \code{use_dina} is
+#'   \code{TRUE}.  Will be removed in a future release; drop it from the call.
 #' @param use_twostage Logical. Use two-stage sequential consistency algorithm for
-#'   improved performance. Default FALSE for backward compatibility. When TRUE,
+#'   improved performance. Default TRUE. When TRUE,
 #'   \code{fs.splits} becomes the maximum number of splits, and early stopping
 #'   is enabled. See Details.  Overridden to \code{FALSE} under
 #'   \code{sg_focus = "maxeff"} (no two-stage screening).
@@ -986,7 +1021,9 @@
 #'       \code{"poisson"} (centred Poisson(1) weights, the multiplier-bootstrap
 #'       analogue of nonparametric-bootstrap multiplicities); also
 #'       \code{"gaussian"}, \code{"rademacher"}.}
-#'     \item{\code{ci_method}}{\code{"field"} (default) additionally runs the
+#'     \item{\code{ci_method}}{\code{"field"} (default under
+#'       \code{subgroup_method = "consistency"}; the \code{"dina"} and
+#'       \code{"grf"} methods default to \code{"ij"}) additionally runs the
 #'       field-calibrated block, whose one-sided bounds are the primary
 #'       reported products; the de-biased element, its infinitesimal-jackknife SE and its
 #'       IJ intervals are returned in every call regardless, so nothing is
@@ -1000,21 +1037,22 @@
 #'       Passed as \code{TRUE} by every internal caller.}
 #'     \item{\code{seed}}{Seed for the multiplier draws; defaults to
 #'       \code{seedit}.}
-#'     \item{\code{return_reselection}}{Logical, default \code{FALSE}.  When
+#'     \item{\code{return_reselection}}{Logical, default \code{TRUE}.  When
 #'       \code{TRUE} the gate's return gains the \code{reselection} element
 #'       (per-draw winners and the re-selection frequencies \code{p_hat});
-#'       add-only pass-through, the default reproduces prior output exactly.}
+#'       nothing in the arithmetic depends on it, and \code{FALSE} restores
+#'       the smaller return object.}
 #'     \item{\code{field_M_cap}}{Optional override of the uniform (kappa)
 #'       sweep's mass-carrying cap; \code{NULL} (default) keeps
 #'       \code{fs_mr_field_uniform()}'s default.  Consulted only when
 #'       \code{field_uniform = TRUE}.}
-#'     \item{\code{field_complement}}{Logical, default \code{FALSE}.  Under
+#'     \item{\code{field_complement}}{Logical, default \code{TRUE}.  Under
 #'       \code{ci_method = "field"} with \code{include_complement = TRUE},
 #'       also evaluate the field block for the complement subgroup, attached
 #'       as \code{field$complement} with the one-sided 95\% \emph{upper}
 #'       bound as its primary product (the benefit-claim orientation; see
-#'       \code{\link{fs_mr_inference}}).  Add-only pass-through: the default
-#'       reproduces prior output exactly.}
+#'       \code{\link{fs_mr_inference}}).  \code{FALSE} omits the complement's
+#'       field block (the prior behaviour).}
 #'     \item{\code{ij_residual}}{\code{"two_term"} (default), \code{"winner"}
 #'       or \code{"winner_floor"}: which infinitesimal-jackknife residual
 #'       populates the reported de-biased SE and interval (both blocks); all
@@ -1049,11 +1087,25 @@
 #'   representation, and taking that representation to its analytic limit
 #'   yields the closed form implemented here. The \code{"resample"} path applies to the Cox
 #'   (survival) outcome and to GLM outcomes whose effect is a single model
-#'   coefficient (OR, RR, RD, MD, IRR); configurations it cannot represent that
-#'   way (IRD, propensity-adjusted effects, or a non-convergent fit on a given
-#'   candidate) fall back to \code{"split"} automatically. When
+#'   coefficient (OR, RR, RD, MD, IRR); an IRD effect, or a candidate whose
+#'   closed form is not available (for example a non-convergent fit), falls
+#'   back to \code{"split"} automatically.  The route is decided by the
+#'   effect measure alone: propensity adjustment
+#'   (\code{ps_adjust_method = "iptw"} or \code{"dr_gcomp"}, with
+#'   \code{ps_method} other than \code{"none"}) does not send a supported
+#'   measure to \code{"split"}.  Under propensity adjustment the
+#'   closed form fits the treatment effect without the propensity weights,
+#'   and without covariates (\code{adjust_covariates} cannot be combined with
+#'   \code{ps_method} other than \code{"none"}), so the consistency rate is
+#'   that of the unadjusted effect. When
 #'   \code{use_twostage = TRUE}, \code{"resample"} bypasses the two-stage
 #'   split screening entirely (the rate is computed directly).
+#'   A sequential and a parallel plan can give different consistency
+#'   proportions, and possibly a different selection, whenever literal
+#'   splitting runs (\code{consistency_method = "split"}, an incidence-rate
+#'   difference (\code{effect_measure = "IRD"}) under \code{"resample"}, or a
+#'   candidate whose closed form is not available), except under
+#'   \code{sg_focus = "maxeff"}, which runs the same loop on every plan.
 #' @param outcome_type Character. One of \code{"survival"} (default),
 #'   \code{"binary"}, \code{"continuous"}, or \code{"count"}.
 #' @param effect_measure Character or \code{NULL}. Effect measure for GLM
@@ -1071,7 +1123,8 @@
 #'   uses the hazard ratio.
 #' @param offset.name Character or \code{NULL}. Name of the follow-up time
 #'   column for rate-based measures (IRR, IRD).
-#' @param adverse_outcome Logical or \code{NULL}. If \code{TRUE}, higher
+#' @param adverse_outcome Logical or \code{NULL} (default, resolved by
+#'   outcome type). If \code{TRUE}, higher
 #'   outcome values indicate harm (default for binary and count).  If \code{FALSE},
 #'   higher values indicate benefit (default for continuous).
 #' @param overdispersion Character. Overdispersion correction for
@@ -1091,7 +1144,11 @@
 #'   behavior.  Applies to both internal GRF pre-screening and
 #'   standalone GRF analysis when passed through
 #'   \code{run_simulation_analysis()}.
-#' @param adjust_covariates Character vector or \code{NULL}. Additional terms
+#' @param adjust_covariates This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character vector or \code{NULL}. Additional terms
 #'   used to adjust the Cox model that scores survival subgroups during
 #'   consistency evaluation.  Terms are appended verbatim to the model
 #'   right-hand side after the treatment term, so survival modelling helpers
@@ -1105,10 +1162,14 @@
 #'   The candidate-search ranking is adjusted on both paths.  Mutually
 #'   exclusive with \code{ps_method != "none"}.  Default \code{NULL}
 #'   (treatment-only, unadjusted -- the previous behaviour).
-#' @param ps_method Character or \code{NULL}. Propensity score estimation
+#' @param ps_method This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character or \code{NULL}. Propensity score estimation
 #'   method: \code{"grf"}, \code{"lasso"}, \code{"logistic"}, or
-#'   \code{"none"}.  Default: \code{"none"} for RCT, \code{"grf"} for
-#'   observational.
+#'   \code{"none"}.  Default: \code{NULL}, which resolves to \code{"none"}
+#'   for RCT and \code{"grf"} for observational.
 #'
 #'   **GLM outcome types only** (\code{"binary"}, \code{"continuous"},
 #'   \code{"count"}). Propensity adjustment is **not implemented for
@@ -1118,7 +1179,11 @@
 #'   use \code{adjust_covariates}. Note the default resolves to \code{"grf"}
 #'   when \code{is.RCT = FALSE}, so an observational survival analysis must
 #'   pass \code{ps_method = "none"} explicitly.
-#' @param ps_adjust_method Character. PS adjustment method: \code{"none"}
+#' @param ps_adjust_method This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character. PS adjustment method: \code{"none"}
 #'   (default), \code{"iptw"} (stabilized inverse probability of treatment
 #'   weights), or \code{"dr_gcomp"} (IPS covariate).
 #'
@@ -1126,7 +1191,11 @@
 #'   \code{"none"} -- it selects how the estimator closure is rebuilt, and that
 #'   rebuild is GLM-gated. It has no effect on a survival outcome, which is
 #'   refused at \code{ps_method}.
-#' @param ps_hat Numeric vector or \code{NULL}. User-supplied propensity
+#' @param ps_hat This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Numeric vector or \code{NULL}. User-supplied propensity
 #'   scores.  Must have length equal to \code{nrow(df.analysis)}, and is
 #'   applied **positionally** to \code{df.analysis}.
 #'
@@ -1212,9 +1281,10 @@
 #'       (\code{naive}, \code{debiased}, \code{selection_bias},
 #'       \code{settings}, \code{harm_flag}, \code{timing_seconds}).  MR
 #'       approximates the full bootstrap (FB) to leading order; its interval is
-#'       the infinitesimal-jackknife analogue of the FB interval under the
-#'       default \code{ci_method = "field"} and under \code{"ij"}, and the
-#'       subgroup robust-SE interval under \code{"wald"}.  Under the default
+#'       the infinitesimal-jackknife analogue of the FB interval under
+#'       \code{ci_method = "field"} (the default under
+#'       \code{subgroup_method = "consistency"}) and under \code{"ij"}, and the
+#'       subgroup robust-SE interval under \code{"wald"}.  Under \code{"field"}
 #'       the return also carries the \code{field} element.}
 #'     \item{mr_harm_confirmed}{Logical, three-valued.  \code{TRUE} when MR ran
 #'       and the de-biased estimate still indicates harm under
@@ -1263,8 +1333,23 @@
 #' }
 #'
 #' Supplying \code{effect.threshold} or \code{consistency.threshold} (or the
-#' legacy names) suppresses the corresponding remap and the supplied value is
-#' used on the scale shown above.
+#' legacy names) suppresses the corresponding default remap, and the supplied
+#' value is used on the scale shown above, with one exception: for \code{RD}
+#' and \code{IRD} a supplied value greater than 1 is taken to be on a ratio
+#' scale and is replaced by the default in the table: \code{effect.threshold}
+#' by 0.05 for \code{RD} or 0.01 for \code{IRD}, with two warnings (one from
+#' the input check, one from the remap), and \code{consistency.threshold} by
+#' 0, with one warning.  The remapped \code{effect.threshold}
+#' is the value the fit records (in \code{threshold_config} and
+#' \code{args_call_all}, which a bootstrap or cross-validation replay
+#' re-uses), and it is also the DINA harm floor wherever DINA selects a cut
+#' (\code{subgroup_method = "dina"}, or \code{use_dina = TRUE} screening with
+#' \code{selected_only = TRUE}): on these two routes \code{RD} and \code{IRD}
+#' run with DINA only on the \code{gaussian} family, whose floor is the
+#' resolved \code{effect.threshold} (see \code{dina_args}).  Screening with
+#' \code{selected_only = FALSE} has neither the restriction nor this floor:
+#' it contributes the frontier candidate set on any family, for \code{RD} and
+#' \code{IRD} too.
 #'
 #' \strong{The pair rule, on the consistency path with a ratio estimand.}  For
 #' \code{subgroup_method = "consistency"} with survival (HR) or binary
@@ -1414,73 +1499,179 @@
 #' For final regulatory submissions, \code{use_twostage = FALSE} may be preferred
 #' for exact reproducibility.
 #'
+#' @section Options not tested against the manuscript analyses:
+#' The arguments \code{adjust_covariates}, \code{ps_method},
+#' \code{ps_adjust_method} and \code{ps_hat} are implemented, but the
+#' published analyses and simulation studies of León and Anderson (2026a,
+#' 2026b) use the unadjusted treatment-only fits, and no coverage or bias
+#' results exist for these paths.  They are untested, not known to be wrong.
+#' Users who need them should check them on their own data, for example
+#' against a direct \code{coxph()} or \code{glm()} fit of the selected
+#' subgroup.
+#'
 #' @examples
 #' \dontrun{
-#' # Example 1: Standard analysis (backward compatible)
-#' result <- forestsearch(
-#'   df.analysis = trial_data,
-#'   sg_focus = "hr",
-#'   hr.threshold = 1.25,
+#' ## Example 1 -- Survival (GBSG, hormone therapy): the analysis of
+#' ## León and Anderson (2026a, Sec. 6) and of the survival-post-selection
+#' ## article on the package website. Forest search over the cut grid (no
+#' ## model-based front ends), effMaxSG selection in a 10% effect
+#' ## neighbourhood, multiplier-resampling inference for the reported
+#' ## subgroup computed inside the fit.
+#' library(survival)
+#' df_gbsg <- within(gbsg, {
+#'   id          <- seq_len(nrow(gbsg))
+#'   time_months <- rfstime / 30.4375
+#'   grade3      <- ifelse(grade == "3", 1, 0)
+#' })
+#' fs_surv <- forestsearch(
+#'   df.analysis            = df_gbsg,
+#'   outcome.name           = "time_months",
+#'   event.name             = "status",
+#'   treat.name             = "hormon",
+#'   id.name                = "id",
+#'   confounders.name       = c("age", "meno", "size", "grade3", "nodes",
+#'                              "pgr", "er"),
+#'   is.RCT                 = TRUE,
+#'   use_lasso = FALSE, use_grf = FALSE, use_dina = FALSE,
+#'   conf.cont_jcuts        = list(er = 10, pgr = 10),
+#'   conf_force             = c("er <= 0", "pgr <= 0"),
+#'   subgroup_method        = "consistency",
+#'   sg_focus               = "effMaxSG",
+#'   selection_rule         = "neighborhood",
+#'   effect_neighborhood    = 0.10,
+#'   hr.threshold           = 1.0,
+#'   hr.consistency         = 1.0,
 #'   pconsistency.threshold = 0.90,
-#'   fs.splits = 400,
-#'   details = TRUE
+#'   consistency_method     = "resample",
+#'   fs.splits              = 1000,
+#'   n.min = 60, d0.min = 10, d1.min = 10, maxk = 2,
+#'   mr_inference           = TRUE,
+#'   mr_inference_args      = list(draws = 5000L),
+#'   parallel_args          = list(plan = "multisession", workers = 4),
+#'   seedit                 = 8316951
 #' )
+#' print(fs_surv)
 #'
-#' # Example 2: Fast exploratory analysis with two-stage
-#' result_fast <- forestsearch(
-#'   df.analysis = trial_data,
-#'   sg_focus = "maxSG",
-#'   hr.threshold = 1.15,
-#'   pconsistency.threshold = 0.85,
-#'   fs.splits = 500,
-#'   use_twostage = TRUE,
-#'   details = TRUE
+#' ## mr_estimates_table() lays the multiplier-resampling estimates out in the
+#' ## format of the bootstrap tables. A bootstrap template is optional:
+#' ## mr_estimates_table(fs_surv) builds the table from fs_surv alone. With a
+#' ## template, the descriptive columns come from the bootstrap result (a few
+#' ## replicates are enough for the layout; the survival-post-selection
+#' ## article compares the two at full size).
+#' fs_boot <- forestsearch_bootstrap_dofuture(
+#'   fs.est        = fs_surv,
+#'   nb_boots      = 20,
+#'   parallel_args = list(plan = "multisession", workers = 4)
 #' )
+#' mr_estimates_table(fs_surv, boot_results = fs_boot, est.scale = "hr")
 #'
-#' # Example 3: Two-stage with custom parameters
-#' result_custom <- forestsearch(
-#'   df.analysis = trial_data,
-#'   sg_focus = "hr",
-#'   hr.threshold = 1.3,
-#'   pconsistency.threshold = 0.95,
-#'   fs.splits = 600,
-#'   use_twostage = TRUE,
-#'   twostage_args = list(
-#'     n.splits.screen = 50,
-#'     batch.size = 25,
-#'     conf.level = 0.99
-#'   ),
-#'   parallel_args = list(plan = "multisession", workers = 4),
-#'   details = TRUE
-#' )
+#' ## Example 2 -- Binary outcome, odds ratio (ACTG175, ZDV+ddI vs ddI):
+#' ## the forest-search analysis of León and Anderson (2026a, Table S3); the
+#' ## binary analysis of León and Anderson (2026b) selects the same region
+#' ## with effect_neighborhood = 0.20. Adverse-scale outcome (1 = no CD4
+#' ## improvement at week 20), OR thresholds at the null, same selection rule
+#' ## and multiplier-resampling gate as Example 1.
+#' if (requireNamespace("speff2trial", quietly = TRUE)) {
+#'   actg <- subset(speff2trial::ACTG175, arms %in% c(1L, 3L))
+#'   actg <- actg[!is.na(actg$cd420), ]
+#'   actg$id           <- seq_len(nrow(actg))
+#'   actg$treat        <- as.integer(actg$arms == 1L)
+#'   actg$y_binary_neg <- as.integer(!(actg$cd420 > actg$cd40))
+#'   bin_vars <- c("hemo", "homo", "drugs", "race", "gender", "symptom")
+#'   for (v in bin_vars) actg[[v]] <- as.numeric(actg[[v]])
+#'   fs_bin <- forestsearch(
+#'     df.analysis            = actg,
+#'     outcome.name           = "y_binary_neg",
+#'     event.name             = "y_binary_neg",
+#'     treat.name             = "treat",
+#'     id.name                = "id",
+#'     confounders.name       = c("age", "preanti", "wtkg", "karnof", "cd40",
+#'                                "cd80", bin_vars),
+#'     outcome_type           = "binary",
+#'     effect_measure         = "OR",
+#'     adverse_outcome        = TRUE,
+#'     use_lasso = FALSE, use_grf = FALSE, use_dina = FALSE,
+#'     conf.cont_jcuts        = list(cd40 = 10, wtkg = 10),
+#'     subgroup_method        = "consistency",
+#'     sg_focus               = "effMaxSG",
+#'     selection_rule         = "neighborhood",
+#'     effect_neighborhood    = 0.10,
+#'     effect.threshold       = 1.0,
+#'     consistency.threshold  = 1.0,
+#'     pconsistency.threshold = 0.90,
+#'     consistency_method     = "resample",
+#'     fs.splits              = 500,
+#'     n.min = 60, d0.min = 10, d1.min = 10, maxk = 2,
+#'     mr_inference           = TRUE,
+#'     mr_inference_args      = list(draws = 5000L),
+#'     parallel_args          = list(plan = "multisession", workers = 4),
+#'     seedit                 = 8316951
+#'   )
+#'   print(fs_bin)
+#' }
 #'
-#' # Example 4: Binary outcome with OR thresholds
-#' result_binary <- forestsearch(
-#'   df.analysis = trial_data,
-#'   outcome_type = "binary",
-#'   effect_measure = "OR",
-#'   effect.threshold = 1.5,
-#'   consistency.threshold = 1.3,
-#'   pconsistency.threshold = 0.90
-#' )
-#'
-#' # Example 5: Binary outcome with RD thresholds
-#' result_rd <- forestsearch(
-#'   df.analysis = trial_data,
-#'   outcome_type = "binary",
-#'   effect_measure = "RD",
-#'   effect.threshold = 0.07,       # 7 pct-point harm
-#'   consistency.threshold = 0.03   # 3 pct-point per split
-#' )
+#' ## Example 3 -- Continuous outcome, mean difference (ACTG175): the
+#' ## continuous application of León and Anderson (2026b), with the field
+#' ## (calibrated one-sided) bounds for the selected subgroup and its
+#' ## complement. Outcome is CD4 decline from baseline to week 20 (adverse
+#' ## scale); thresholds are on the mean-difference scale.
+#' if (requireNamespace("speff2trial", quietly = TRUE)) {
+#'   actg <- subset(speff2trial::ACTG175, arms %in% c(1L, 3L))
+#'   actg <- actg[!is.na(actg$cd420), ]
+#'   actg$id        <- seq_len(nrow(actg))
+#'   actg$treat     <- as.integer(actg$arms == 1L)
+#'   actg$y_decline <- actg$cd40 - actg$cd420
+#'   bin_vars <- c("hemo", "homo", "drugs", "race", "gender", "symptom")
+#'   for (v in bin_vars) actg[[v]] <- as.factor(actg[[v]])
+#'   fs_cont <- forestsearch(
+#'     df.analysis            = actg,
+#'     outcome.name           = "y_decline",
+#'     treat.name             = "treat",
+#'     id.name                = "id",
+#'     confounders.name       = c("age", "preanti", "wtkg", "karnof", "cd40",
+#'                                "cd80", bin_vars),
+#'     outcome_type           = "continuous",
+#'     effect_measure         = "MD",
+#'     adverse_outcome        = TRUE,
+#'     use_lasso = FALSE, use_grf = FALSE, use_dina = FALSE,
+#'     conf.cont_jcuts        = list(age = 10, preanti = 10, wtkg = 10,
+#'                                   karnof = 10, cd40 = 10, cd80 = 10),
+#'     sg_focus               = "effMaxSG",
+#'     selection_rule         = "neighborhood",
+#'     effect_neighborhood    = 0.20,
+#'     effect.threshold       = 10,
+#'     consistency.threshold  = 5,
+#'     pconsistency.threshold = 0.90,
+#'     consistency_method     = "resample",
+#'     fs.splits              = 500,
+#'     n.min = 60, d0.min = 10, d1.min = 10, maxk = 2,
+#'     mr_inference           = TRUE,
+#'     mr_inference_args      = list(ci_method = "field", draws = 5000L,
+#'                                   include_complement = TRUE,
+#'                                   field_complement = TRUE,
+#'                                   field_scale_complement = "selected",
+#'                                   return_reselection = TRUE),
+#'     parallel_args          = list(plan = "sequential"),
+#'     seedit                 = 8316951
+#'   )
+#'   print(fs_cont)
+#' }
 #' }
 #'
 #' @references
 #' \itemize{
+#'   \item León, L. F. and Anderson, K. M. (2026a). Inference for standard
+#'     trial estimands after data-driven subgroup discovery.
+#'     arXiv:2609.38361. \doi{10.48550/arXiv.2609.38361}
+#'   \item León, L. F. and Anderson, K. M. (2026b). Interpretable subgroup
+#'     identification across survival and generalized-linear outcomes.
+#'     arXiv:2610.28379. \doi{10.48550/arXiv.2610.28379}
 #'   \item FDA Guidance for Industry: Enrichment Strategies for Clinical Trials
 #'   \item Athey & Imbens (2016). Recursive partitioning for heterogeneous
 #'     causal effects. PNAS.
 #'   \item Wager & Athey (2018). Estimation and inference of heterogeneous
 #'     treatment effects using random forests. JASA.
+#'   \item León et al. (2024). \doi{10.1002/sim.10163}
 #' }
 #'
 #' @seealso
@@ -1606,6 +1797,7 @@ forestsearch <- function(df.analysis,
                          # Multiplier resampling (optional; GLM resample path)
                          mr_inference = FALSE,
                          mr_inference_args = list()) {
+  .fs_preserve_rng()
 
   # ===========================================================================
   # SECTION 1A: RESOLVE FORMAL DEFAULTS BEFORE ARGUMENT CAPTURE
@@ -1620,6 +1812,40 @@ forestsearch <- function(df.analysis,
   grf_count_transform <- match.arg(grf_count_transform)
   subgroup_method     <- match.arg(subgroup_method)
   consistency_method  <- match.arg(consistency_method)
+
+  # Deprecated arguments (0.4.0.9000): vi.grf.min, max_n_confounders and
+  # max.minutes are accepted so existing calls do not break, warned about
+  # once per call, and ignored.  GRF variable-importance screening/ordering
+  # of the candidate cut columns no longer exists: the candidate family is
+  # the cut grid alone unless use_lasso, use_grf or use_dina asks for a
+  # model-based front end.  max.minutes was never enforced.  All three
+  # formals are removed in a later release.  The values are deliberately NOT
+  # reset, so that args_call_all records what the caller passed.
+  if (!is.null(vi.grf.min)) {
+    warning("forestsearch(): 'vi.grf.min' is deprecated and ignored. GRF ",
+            "variable-importance screening of the candidate cut columns was ",
+            "removed; the candidate family is the cut grid alone unless ",
+            "use_lasso, use_grf or use_dina is TRUE. The argument will be ",
+            "removed in a future release -- drop it from the call.",
+            call. = FALSE)
+  }
+  if (!missing(max_n_confounders) &&
+      !identical(as.numeric(max_n_confounders), 1000)) {
+    warning("forestsearch(): 'max_n_confounders' is deprecated and ignored ",
+            "(it capped the variable-importance-ordered column list, which ",
+            "no longer exists). It will be removed in a future release -- ",
+            "drop it from the call.", call. = FALSE)
+  }
+  # Value trigger (not bare !missing()): args_call_all always carries
+  # max.minutes, and bootstrap/CV replay it via do.call(forestsearch, ...).
+  if (!missing(max.minutes) &&
+      !identical(as.numeric(max.minutes), 3)) {
+    warning("forestsearch(): 'max.minutes' is deprecated and ignored. The ",
+            "wall-clock budget was never enforced in the parallel search; ",
+            "scope is governed by maxk and the candidate-factor controls. ",
+            "The argument will be removed in a future release -- drop it ",
+            "from the call.", call. = FALSE)
+  }
 
   # DINA's selector statistic is a first-class argument, mirroring
   # `grf_select_statistic`.  It is normalized here and injected as the canonical
@@ -2082,7 +2308,7 @@ forestsearch <- function(df.analysis,
       adjust_covariates = adjust_covariates
     )
 
-    # Unadjusted fast path (0.3.3): for the continuous/MD case with no
+    # Unadjusted fast path (0.3.3): for the continuous/MD and binary/OR cases with no
     # regression adjustment and no propensity adjustment, swap in the
     # bit-identical fast closure (.make_lm_estimator_fast: lm.fit + the
     # summary.lm/vcov.lm extraction ops).  ps_adjust_method is still the
@@ -2092,15 +2318,26 @@ forestsearch <- function(df.analysis,
     # untagged slow one, so the tag cannot leak onto a weighted path.  The
     # attribute is the only signal that travels: the search loop routes its
     # per-candidate fit to the vector path on it.
-    if (outcome_type == "continuous" &&
-        identical(ps_adjust_method[[1L]], "none") &&
+    if (identical(ps_adjust_method[[1L]], "none") &&
         length(.fs_adjust_terms(adjust_covariates)) == 0L) {
-      estimator_fn <- .make_lm_estimator_fast(
-        treat.name      = treat.name,
-        outcome.name    = outcome.name,
-        adverse_outcome = adverse_outcome
-      )
-      attr(estimator_fn, "fs_fast_unadjusted") <- TRUE
+      if (outcome_type == "continuous") {
+        estimator_fn <- .make_lm_estimator_fast(
+          treat.name      = treat.name,
+          outcome.name    = outcome.name,
+          adverse_outcome = adverse_outcome
+        )
+        attr(estimator_fn, "fs_fast_unadjusted") <- TRUE
+      } else if (outcome_type == "binary" && identical(effect_measure, "OR")) {
+        # Binary OR twin (0.4.0.9000): same predicate, same tag, bit-identical
+        # glm.fit closure (.make_glm_or_estimator_fast).  RD and RR keep the
+        # slow closure (their fallback tiers are untouched).
+        estimator_fn <- .make_glm_or_estimator_fast(
+          treat.name      = treat.name,
+          outcome.name    = outcome.name,
+          adverse_outcome = adverse_outcome
+        )
+        attr(estimator_fn, "fs_fast_unadjusted") <- TRUE
+      }
     }
 
     # Resolve screening and consistency thresholds from effect_measure.
@@ -2132,6 +2369,14 @@ forestsearch <- function(df.analysis,
       # NOTE: RD/IRD are probability/rate differences bounded in [-1, 1].
       # MD (mean difference) has no natural bounds and is NOT checked here.
       if (user_set_threshold && effect_threshold > 1.0) {
+        # The measure's ratio-scale counterpart, its default and an example:
+        # RD -> OR, 0.05; IRD -> IRR, 0.01 (?forestsearch, "Resolved defaults,
+        # per estimand").  The message prints the value the remap assigns.
+        .fs_remap_ratio   <- switch(effect_measure, RD = "OR", IRD = "IRR")
+        .fs_remap_default <- switch(effect_measure, RD = 0.05, IRD = 0.01)
+        .fs_remap_example <- switch(effect_measure,
+          RD  = "effect.threshold = 0.07 for a 7 pct-point threshold",
+          IRD = "effect.threshold = 0.02 for a rate difference of 0.02")
         warning(
           sprintf(
             paste0(
@@ -2141,12 +2386,12 @@ forestsearch <- function(df.analysis,
               "  Did you mean effect.threshold = %.2f on the %s scale?\n",
               "  Remapping to default: %.2f.\n",
               "  To use a custom %s threshold, pass a value in [-1, 1] ",
-              "(e.g., effect.threshold = 0.07 for a 7 pct-point threshold)."),
+              "(e.g., %s)."),
             effect_threshold, effect_measure,
-            effect_threshold, "OR", 0.05, effect_measure),
+            effect_threshold, .fs_remap_ratio, .fs_remap_default,
+            effect_measure, .fs_remap_example),
           call. = FALSE)
-        effect_threshold <- switch(effect_measure,
-          RD = 0.05, IRD = 0.01)
+        effect_threshold <- .fs_remap_default
       }
 
       if (consistency_threshold >= 1.0 && !user_set_consistency) {
@@ -2292,12 +2537,17 @@ forestsearch <- function(df.analysis,
     )
 
     # Resolve dmin.grf for GLM outcomes.
-    # The survival default for dmin.grf is on the RMST scale (event count
-    # threshold over a window) and would filter out all candidates for
-    # binary/continuous outcomes where DR score differences are on the
-    # probability/mean scale (0--1).  When the user has not supplied a
-    # value, default to 0.0 (any positive harm qualifies); when the user
-    # supplied a value explicitly, respect it.
+    # dmin.grf is a harm threshold on GRF's doubly robust (DR) scale, not a
+    # number of events: a subgroup's DR harm effect (mean control DR score
+    # minus mean treated DR score) must reach it (>= dmin.grf).  For survival
+    # that effect is a difference in restricted mean survival time up to the
+    # GRF horizon; for GLM outcomes it is a difference on the scale of the
+    # outcome given to GRF (a probability for binary, outcome units for
+    # continuous, log(Y + 0.5) or raw counts for count, per
+    # grf_count_transform), so a value chosen on the RMST scale does not
+    # carry over.  When the user has not supplied a value, use 0.0 (the
+    # formal default: any non-negative DR harm effect qualifies); a supplied
+    # value is used as given.
     if (missing(dmin.grf)) {
       dmin.grf <- 0.0
     }
@@ -2432,7 +2682,7 @@ forestsearch <- function(df.analysis,
   # Defaults:
   #   RCT = TRUE  -> ps_method = "none"  (randomization ensures balance)
   #   RCT = FALSE -> ps_method = "grf"   (non-parametric, cross-fitted)
-  #   ps_adjust_method = "iptw" (default)
+  #   ps_adjust_method = "none" (default; "iptw" or "dr_gcomp" on request)
   # ===========================================================================
 
   # Resolve ps_method default
@@ -2551,6 +2801,7 @@ forestsearch <- function(df.analysis,
         outcome.name     = outcome.name,
         offset.name      = offset.name,
         effect_measure   = effect_measure,
+        adverse_outcome  = adverse_outcome,
         ps_adjust_method = ps_adjust_resolved
       )
     }
@@ -2616,7 +2867,10 @@ forestsearch <- function(df.analysis,
                         else adverse_outcome,
       # The SAME resolved admission set MR re-selects over, so the identifier
       # and MR cannot disagree about which candidates were in contention.
-      admission = admission_resolved)
+      admission = admission_resolved,
+      # Gaussian floor: the resolved threshold (A-001), supplied or not, so
+      # the fit, the recorded value and a bootstrap / CV replay agree.
+      effect.threshold = effect.threshold)
 
     t.min_all <- (proc.time()[3] - t.start_all) / 60
 
@@ -3067,8 +3321,12 @@ forestsearch <- function(df.analysis,
 
       if (isTRUE(da$selected_only)) {
         # Selected-cut screening: contribute the SINGLE cut dina_subgroup()
-        # selects, using forestsearch's own selection criteria (so this
-        # matches what subgroup_method = "dina" would choose).  m_diff is the
+        # selects, using forestsearch's own selection criteria with DINA's
+        # native tau-hat as the effect statistic.  That is the cut
+        # subgroup_method = "dina" would choose only under
+        # dina_select_statistic = "dina"; under the default "effect" that
+        # route re-ranks the qualifying family on the inferential effect
+        # (.dina_reselect_on_effect()), and this step does not.  m_diff is the
         # harm floor on the link scale: log(hr.threshold) for ratio families
         # (cox/binomial/poisson), identity for gaussian.  The same refusal the
         # subgroup_method = "dina" derivation applies: there is no identity-
@@ -3076,9 +3334,13 @@ forestsearch <- function(df.analysis,
         # This route is optional screening, so the refusal surfaces through
         # the enclosing tryCatch as "DINA analysis failed: ..." and the run
         # continues with no DINA cuts.
+        # The gaussian floor is the resolved effect.threshold (SECTION
+        # 2B-ii), supplied or not: the value the returned object records and
+        # a replay re-uses (A-001).
         .dina_assert_ratio_estimand(da$fit$family, effect_measure)
-        m_diff_sel <- if (identical(da$fit$family, "gaussian")) hr.threshold
-                      else log(hr.threshold)
+        m_diff_sel <- if (identical(da$fit$family, "gaussian")) {
+                        effect.threshold
+                      } else log(hr.threshold)
         sgsel <- dina_subgroup(
           fit                 = dina_res,
           df                  = df.dina,
@@ -3089,7 +3351,8 @@ forestsearch <- function(df.analysis,
           grid_probs          = da$select$grid_probs,
           sg_focus            = sg_focus,
           selection_rule      = selection_rule,
-          effect_neighborhood = effect_neighborhood
+          effect_neighborhood = effect_neighborhood,
+          tau_sign            = .dina_tau_sign(outcome_type, adverse_outcome)
         )
         if (isTRUE(sgsel$found)) {
           # Vectorized over the 1-or-2 selected cuts: a depth-2 conjunction
@@ -3184,7 +3447,14 @@ forestsearch <- function(df.analysis,
   if (details && use_lasso) {
     n_kept <- length(lassokeep)
     n_total <- n_kept + length(lassoomit)
-    cat("Cox-LASSO selected:", n_kept, "of", n_total, "candidate factors\n")
+    lasso_label <- switch(outcome_type,
+      binary     = "Logistic-LASSO",
+      continuous = "Linear-LASSO",
+      count      = "Poisson-LASSO",
+      "Cox-LASSO"
+    )
+    cat(paste0(lasso_label, " selected:"), n_kept, "of", n_total,
+        "candidate factors\n")
     if (length(lassoomit) > 0) {
       cat("  Omitted:", paste(lassoomit, collapse = ", "), "\n")
     }
@@ -3210,107 +3480,11 @@ forestsearch <- function(df.analysis,
 
   if (is.null(df.predict)) df.predict <- df
 
-  # The max_n_confounders truncation is applied only inside the variable-
-  # importance block below (the `seq_len(min(..., max_n_confounders))` line
-  # under `if (vi_max > 0)`).  With vi.grf.min = NULL -- the default
-  # since 0.3.0 -- that block is skipped, so a finite cap below the number of
-  # cut columns silently does nothing.  Say so once, actionably.
-  if (is.null(vi.grf.min) && is.finite(max_n_confounders) &&
-      max_n_confounders < length(FSconfounders.name)) {
-    warning("max_n_confounders = ", max_n_confounders, " is inert: variable-",
-            "importance screening is off (vi.grf.min = NULL), so all ",
-            length(FSconfounders.name), " candidate cut columns are searched. ",
-            "Set vi.grf.min to a numeric value (e.g. -0.2, the pre-0.3.0 ",
-            "default) to apply the cap.", call. = FALSE)
-  }
-
-  # ===========================================================================
-  # SECTION 5: GRF VARIABLE IMPORTANCE SCREENING
-  # ===========================================================================
-
-  if (!is.null(vi.grf.min)) {
-    X <- apply(df[, FSconfounders.name, drop = FALSE], 2, as.numeric)
-
-    if (outcome_type == "survival") {
-      # Survival path: causal_survival_forest (unchanged)
-      # Guard against zero events in either arm: max(numeric(0)) is -Inf
-      # (with a warning), which would propagate to horizon = frac.tau * -Inf
-      # and crash causal_survival_forest.  Skip the GRF VI step instead.
-      y_evt_t <- Y[Treat == 1 & Event == 1]
-      y_evt_c <- Y[Treat == 0 & Event == 1]
-
-      if (length(y_evt_t) == 0L || length(y_evt_c) == 0L) {
-        if (!quiet) {
-          message("[forestsearch] Skipping GRF variable-importance screening: ",
-                  "zero events in ",
-                  if (length(y_evt_t) == 0L) "treatment" else "control",
-                  " arm.")
-        }
-        cs.forest <- structure("zero-events", class = "try-error")
-      } else {
-        tau.rmst <- min(max(y_evt_t), max(y_evt_c))
-        tune_arg <- if (tune_grf) "all" else "none"
-
-        if (!is.RCT) {
-          cs.forest <- try(suppressWarnings(
-            grf::causal_survival_forest(X, Y, Treat, Event,
-                                         horizon = frac.tau * tau.rmst, seed = seedit,
-                                         tune.parameters = tune_arg,
-                                         num.threads = .fs_grf_num_threads())
-          ), TRUE)
-        } else {
-          cs.forest <- try(suppressWarnings(
-            grf::causal_survival_forest(X, Y, Treat, Event, W.hat = 0.5,
-                                         horizon = frac.tau * tau.rmst, seed = seedit,
-                                         tune.parameters = tune_arg,
-                                         num.threads = .fs_grf_num_threads())
-          ), TRUE)
-        }
-      }
-    } else {
-      # GLM path: causal_forest (no event/horizon)
-      if (outcome_type == "count") {
-        # Count data: variance-stabilising log transform (same as
-        # grf.subg.harm.glm with grf_count_transform = "log")
-        Y_vi <- if (grf_count_transform == "log") log(Y + 0.5) else Y
-      } else if (outcome_type == "binary") {
-        # Binary: complement (1-Y) so positive CATE = treatment helps
-        Y_vi <- if (adverse_outcome) 1L - Y else Y
-      } else {
-        # Continuous: negate (-Y) so positive CATE = treatment helps
-        Y_vi <- if (adverse_outcome) -Y else Y
-      }
-      cs.forest <- try(suppressWarnings(
-        fit_causal_forest_glm(X, Y_vi, Treat, is.RCT, seedit = seedit,
-                              tune_grf = tune_grf)
-      ), TRUE)
-    }
-
-    if (!inherits(cs.forest, "try-error")) {
-      vi.cs <- round(grf::variable_importance(cs.forest), 4)
-      vi.cs2 <- data.frame(confs_labels, FSconfounders.name, vi.cs)
-      vi.order <- order(vi.cs, decreasing = TRUE)
-      vi.cs2 <- vi.cs2[vi.order, ]
-
-      conf.screen <- vi.cs2[, 2]
-      vi_max <- max(vi.cs2[, 3])
-      if (vi_max > 0) {
-        vi_ratio <- vi.cs2[, 3] / vi_max
-        selected.vars <- which(vi_ratio > vi.grf.min)
-        conf.screen <- conf.screen[selected.vars]
-        conf.screen <- conf.screen[seq_len(min(length(conf.screen), max_n_confounders))]
-      }
-      # Fall back to full set if GRF screening eliminated everything
-      if (length(conf.screen) == 0L) {
-        conf.screen <- FSconfounders.name
-      }
-    } else {
-      # GRF fit failed: skip screening, use all confounders
-      conf.screen <- FSconfounders.name
-    }
-  } else {
-    conf.screen <- FSconfounders.name
-  }
+  # Candidate cut columns are searched as get_FSdata() built them.  The GRF
+  # variable-importance screening/ordering that stood here before
+  # 0.4.0.9000 is deprecated (see vi.grf.min): no forest is fitted in the
+  # forest-search path unless use_lasso, use_grf or use_dina is TRUE.
+  conf.screen <- FSconfounders.name
 
   # ===========================================================================
   # SECTION 6: SUBGROUP SEARCH
@@ -3389,7 +3563,6 @@ forestsearch <- function(df.analysis,
         d1.min = d1.min,
         n.min = n.min,
         hr.threshold = if (!is.null(effect_threshold)) effect_threshold else hr.threshold,
-        max.minutes = max.minutes,
         minp = minp,
         maxk = maxk,
         parallel_workers = 1,  # Ensure sequential execution if inside parallel context
@@ -3428,6 +3601,9 @@ forestsearch <- function(df.analysis,
   # Optionally, filter only valid arguments for subgroup.search
   valid_args <- names(formals(subgroup.search))
   search_args <- search_args[names(search_args) %in% valid_args]
+  # max.minutes is deprecated and inert; args_call_all always carries it, so
+  # drop it here or subgroup.search() would warn on every call.
+  search_args$max.minutes <- NULL
 
   find.grps <- tryCatch(
     do.call(subgroup.search, search_args),
@@ -3656,7 +3832,11 @@ forestsearch <- function(df.analysis,
              "ambiguous merge with internal subgroup-flag tables.",
              call. = FALSE)
       }
-      df.est_out <- merge(df, temp, by.x = id.name, by.y = "id", all.x = TRUE)
+      # Flags attach by row position (the flag table is built row-wise from df) and df.predict is
+      # evaluated by the rule: a bootstrap resample repeats ids, so a merge on id would compute
+      # Eq. 7's observed-data term on the resample.
+      df.est_out <- df
+      df.est_out$treat.recommend <- temp$treat.recommend
 
       # Return df.predict
       if (!is.null(df.predict)) {
@@ -3667,7 +3847,7 @@ forestsearch <- function(df.analysis,
                "ambiguous merge with internal subgroup-flag tables.",
                call. = FALSE)
         }
-        df.predict_out <- merge(df.predict, temp, by.x = id.name, by.y = "id", all.x = TRUE)
+        df.predict_out <- get_dfpred(df.predict, sg.harm, version = 2)
       }
 
       # Return df.test

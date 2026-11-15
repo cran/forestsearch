@@ -240,6 +240,7 @@ utils::globalVariables(c(
   "sim",
   "hr_test",
   "any_found", "sg_found", "hr_sg_null",
+  ".estimators", "declared",
   "hr_sg_train", "POhr_sg_train", "n_sg_train",
   "regAflag", "sg_le85", "regAflag2", "regAflag3",
   "found",
@@ -263,7 +264,13 @@ utils::globalVariables(c(
 # ============================================================================
 # fs_plot_bias_coverage() -- ggplot2 aes() column names
 # ============================================================================
-  "b", "r", "cell", "estimator", "cov", "cov1", "cov2", "obs", "ref"
+  "b", "r", "cell", "estimator", "cov", "cov1", "cov2", "obs", "ref",
+
+# ============================================================================
+# Propensity-weighted estimator closures: `weights = sw` is evaluated by
+# model.frame() in the data slice (.make_lm_estimator())
+# ============================================================================
+  "sw"
 ))
 
 

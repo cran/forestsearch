@@ -106,11 +106,15 @@ get_dgm_hr <- function(dgm, which = "hr_H") {
 #' checking for \code{flag.harm}, \code{flag_harm}, and \code{H} in
 #' the super-population data frame.
 #'
-#' @param dgm A DGM object (e.g., from \code{create_gbsg_dgm} or
-#'   \code{generate_aft_dgm_flex}). Must contain \code{df_super_rand}
-#'   with columns \code{theta_0} and \code{theta_1}.
+#' @param dgm A DGM object (e.g., from \code{generate_aft_dgm_flex} or
+#'   \code{setup_gbsg_dgm}). The super-population is read from
+#'   \code{dgm$df_super_rand} when present (as from \code{setup_gbsg_dgm}),
+#'   otherwise from \code{dgm$df_super} (as from
+#'   \code{generate_aft_dgm_flex}); it must have columns \code{theta_0} and
+#'   \code{theta_1}. If neither data frame is present, or those columns are
+#'   missing, the function warns and returns \code{dgm} unchanged.
 #' @param harm_col Character. Name of the subgroup indicator column in
-#'   \code{dgm$df_super_rand}. If \code{NULL} (default), auto-detected
+#'   that super-population data frame. If \code{NULL} (default), auto-detected
 #'   from \code{flag.harm}, \code{flag_harm}, or \code{H}.
 #'
 #' @return The DGM object with CDE values added to
@@ -120,7 +124,7 @@ get_dgm_hr <- function(dgm, which = "hr_H") {
 #'
 #' @examples
 #' \dontrun{
-#' dgm <- create_gbsg_dgm(model = "alt", k_inter = 2.0)
+#' dgm <- setup_gbsg_dgm(model = "alt", k_inter = 2.0)
 #' dgm <- compute_dgm_cde(dgm)
 #' dgm$hazard_ratios$CDE_harm   # theta-ddagger(H)
 #' dgm$hazard_ratios$CDE         # theta-ddagger overall
@@ -402,7 +406,7 @@ compute_cde <- function(df, subset_indicator = NULL) {
 #' Includes both HR and AHR metrics.
 #'
 #' @param results data.table with simulation results from run_simulation_analysis
-#' @param analyses Character vector. Analysis methods to include. Default: all
+#' @param analyses Character vector. Analysis methods to include. Default: NULL, meaning all analyses in results
 #' @param digits Integer. Decimal places for proportions. Default: 2
 #' @param digits_hr Integer. Decimal places for hazard ratios. Default: 3
 #'
@@ -410,8 +414,14 @@ compute_cde <- function(df, subset_indicator = NULL) {
 #'
 #' @examples
 #' \dontrun{
-#' dgm <- create_gbsg_dgm()
-#' sim_res <- run_simulation_analysis(dgm, nsim = 10)
+#' dgm <- setup_gbsg_dgm()
+#' # run_simulation_analysis() runs one replicate per call; ten are stacked.
+#' # confounders_base names the DGM's numeric candidate covariates, as in the
+#' # simulations article (the default v1-v7 columns are factors).
+#' sim_res <- data.table::rbindlist(lapply(1:10, function(i)
+#'   run_simulation_analysis(sim_id = i, dgm = dgm, n_sample = 500,
+#'     confounders_base = c("z1", "z2", "z3", "z4", "z5", "size", "grade3"))),
+#'   fill = TRUE)
 #' summarize_simulation_results(sim_res)
 #' }
 #' @export
@@ -680,7 +690,9 @@ format_oc_results <- function(
     # Detection rate
     detection_rate <- mean(res$any.H, na.rm = TRUE)
 
-    # Classification metrics (averaged across sims with detection).
+    # Classification metrics (averaged over every sim with a stored value: a
+    # sim with no subgroup contributes spec = 1 and npv = |Hc|/N as
+    # run_simulation_analysis() stores them; NA rows drop out).
     # Under null models (León et al. 2024, Sec 3): Q = emptyset,
     # so sens = NA and ppv = 0.  NaN from mean(all-NA) is replaced
     # with NA for clean table display.

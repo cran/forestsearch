@@ -383,7 +383,38 @@ print.hte_test <- function(x, ...) {
 #' @param regression Character: "ols", "logistic", or "poisson".
 #' @param offset Numeric offset vector (Poisson only).
 #' @param poly_order Integer. Default: 1.
-#' @return List with hte_test, covariates_used, source.
+#' @return List with \code{hte_test} (the \code{\link{test_hte}} result),
+#'   \code{covariates_used} (the \code{df} columns entered in the test),
+#'   \code{n_covariates} (their number), \code{n_candidates}
+#'   (\code{length(fs_result$find.grps$max_sg_est)}, \code{NA} when that
+#'   is absent) and \code{source}; or \code{NULL} with a warning when no
+#'   covariate is found.
+#'
+#'   The covariates come from \code{fs_result$confounders.evaluated} when
+#'   it is non-empty, else from \code{fs_result$confounders.candidate},
+#'   taken as column names.  Each \code{confounders.evaluated} label is
+#'   mapped to columns of \code{df}: a label that is exactly a column name
+#'   (a categorical confounder such as \code{"meno"}, including a
+#'   non-syntactic name such as \code{"ER-pos"}) is that column; any other
+#'   label (a cut such as \code{"age <= 53"}) is parsed, and its variables
+#'   that are columns of \code{df} are used.  Each column is used once, in
+#'   the order first met.  Two warnings: a label that resolves to no column
+#'   of \code{df} warns that it "cannot be resolved to a column of df" and
+#'   is skipped; and when no covariate column is left, the function warns
+#'   "No covariate found in df for the ForestSearch covariates" and returns
+#'   \code{NULL}.  (When neither field is present it warns "No covariates
+#'   found." and returns \code{NULL}.)  Factor and character columns enter
+#'   the test as their level codes minus 1, other columns as numbers.
+#'
+#'   \code{source} names the field used:
+#'   \code{"confounders.evaluated (GRF/LASSO selected)"} or
+#'   \code{"confounders.candidate (all candidates)"}.  The first string is
+#'   fixed.  On the default (consistency) route
+#'   \code{confounders.evaluated} holds the fit's candidate factor labels,
+#'   which are LASSO-screened or include GRF cuts only when the fit used
+#'   \code{use_lasso} or \code{use_grf} (both \code{FALSE} by default); on
+#'   the \code{subgroup_method = "dina"} and \code{"grf"} routes it is the
+#'   fit's \code{confounders.name}.
 #' @export
 test_hte_from_forestsearch <- function(fs_result, df,
                                         outcome.name,
@@ -396,7 +427,23 @@ test_hte_from_forestsearch <- function(fs_result, df,
   covs <- NULL; source_desc <- NULL
   if (!is.null(fs_result$confounders.evaluated) &&
       length(fs_result$confounders.evaluated) > 0) {
-    covs <- fs_result$confounders.evaluated
+    # Evaluated labels are bare column names (categorical) or cut
+    # expressions such as "age <= 55" (continuous): map each label to the
+    # df columns it refers to, and use the unique columns.  A label that is
+    # exactly a column name is that column (it may not be a syntactic R
+    # name, e.g. "ER-pos"); any other label is parsed.
+    covs <- character(0)
+    for (lab in fs_result$confounders.evaluated) {
+      lab_vars <- if (lab %in% names(df)) lab else
+        intersect(tryCatch(all.vars(parse(text = lab)),
+                           error = function(e) character(0)),
+                  names(df))
+      if (length(lab_vars) == 0)
+        warning("Label '", lab, "' in confounders.evaluated cannot be ",
+                "resolved to a column of df; skipped.")
+      covs <- c(covs, lab_vars)
+    }
+    covs <- unique(covs)
     source_desc <- "confounders.evaluated (GRF/LASSO selected)"
   } else if (!is.null(fs_result$confounders.candidate) &&
              length(fs_result$confounders.candidate) > 0) {
@@ -413,7 +460,11 @@ test_hte_from_forestsearch <- function(fs_result, df,
     else if (is.character(col)) X_cols[[v]] <- as.numeric(as.factor(col)) - 1
     else X_cols[[v]] <- as.numeric(col)
   }
-  if (length(X_cols) == 0) return(NULL)
+  if (length(X_cols) == 0) {
+    warning("No covariate found in df for the ForestSearch covariates; ",
+            "returning NULL.")
+    return(NULL)
+  }
 
   X <- do.call(cbind, X_cols)
   colnames(X) <- names(X_cols)

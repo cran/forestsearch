@@ -733,15 +733,37 @@ filter_call_args <- function(source_args, target_func, override_args = NULL) {
 #'   for harm).  Default \code{NULL} (use "Recommend"/"Questionable").
 #' @param font_size Numeric. Font size in pixels for table text (default: 12).
 #'
+#' @details
+#' \strong{Orientation of the GLM estimates table.}  For a non-survival fit
+#' with the default \code{est.scale = "hr"} (and for a
+#' \code{grf_glm_result}), the estimates table shows the per-arm
+#' \code{Rate(C)}, \code{Rate(T)} (binary) or \code{Mean(C)}, \code{Mean(T)}
+#' (continuous, count), their raw difference \code{Diff} (treated minus
+#' control; in percentage points for binary outcomes) and the effect column.
+#' The effect column follows the fit's orientation: its estimator is built
+#' with the fit's stored \code{adverse_outcome} or, when none is stored,
+#' with \code{\link{forestsearch}}'s rule (\code{TRUE} for binary and count
+#' outcomes, \code{FALSE} otherwise), so it is on the scale of the fit's own
+#' estimates.  The arm columns and \code{Diff} do not follow it: they are
+#' the raw outcome.  So for an unadjusted fit where a lower outcome is
+#' adverse (\code{adverse_outcome = FALSE}, the default for continuous
+#' outcomes) the effect and \code{Diff} have opposite signs: an MD is
+#' \code{-Diff}, an RD is \code{-Diff / 100}, and the log of an OR or RR has
+#' the sign opposite to \code{Diff}.  Count outcomes and the rate measures
+#' (IRR, IRD) are not reoriented (see \code{\link{make_effect_estimator}}),
+#' so for them \code{adverse_outcome} does not change the effect column.
+#'
 #' @return List with gt tables for estimates, subgroups, and optionally
 #'   search info.
 #'
 #' @importFrom gt gt fmt_number tab_header tab_spanner tab_source_note tab_options md px
 #' @examples
 #' \dontrun{
-#' library(survival)
+#' gbsg <- survival::gbsg
+#' gbsg$grade3 <- as.integer(gbsg$grade == 3)
 #' fs <- forestsearch(
 #'   gbsg,
+#'   id.name          = "pid",
 #'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
 #'   outcome.name     = "rfstime",
 #'   treat.name       = "hormon",
@@ -825,6 +847,17 @@ sg_tables <- function(fs,
       effect_measure <- em_map[[effect_measure]]
     }
 
+    # Orientation: the GRF result's own adverse_outcome (stored at the top
+    # level; a grf_glm_result has no args_call_all), so the effect column has
+    # the fit's own orientation (MD: the sign; binary OR, RR, RD: which level
+    # is coded as the event; count, and binary IRR or IRD: no change, as the
+    # rate estimator takes no adverse_outcome).  NULL only on an object not
+    # built by grf.subg.harm.glm(); resolved by forestsearch()'s rule.
+    adverse_outcome <- fs$adverse_outcome
+    if (is.null(adverse_outcome)) {
+      adverse_outcome <- outcome_type %in% c("binary", "count")
+    }
+
     # Build estimator closure
     estimator_fn_grf <- tryCatch(
       make_effect_estimator(
@@ -833,6 +866,7 @@ sg_tables <- function(fs,
         outcome.name      = outcome.name,
         offset.name       = offset.name,
         effect_measure    = effect_measure,
+        adverse_outcome   = adverse_outcome,
         adjust_covariates = fs$args_call_all$adjust_covariates
       ),
       error = function(e) NULL
@@ -911,11 +945,34 @@ sg_tables <- function(fs,
 
     # CATE footnote (GRF-specific context)
     if (!is.null(fs$cate_sg)) {
+      # The CATE is on the scale of the outcome given to causal_forest().
+      # For a count that is the per-subject count (the offset does not
+      # enter it), transformed as recorded in grf_y_transform
+      # ("log(Y + 0.5)" or "identity").  The sign is not named: negating
+      # the outcome for adverse_outcome = TRUE does not change the scale,
+      # and the object does not record whether that negation was applied
+      # (counts were not negated before part 4's fix F10, commit f2e8de47).
+      # Other outcome types keep the original label.
+      cate_scale <- "risk-difference scale"
+      if (identical(outcome_type, "count")) {
+        count_scales <- c("log(Y + 0.5)" = "log(Y + 0.5) scale, Y = count",
+                          "identity"     = "count scale")
+        y_tr <- fs$grf_y_transform
+        if (is.character(y_tr) && length(y_tr) == 1L &&
+            y_tr %in% names(count_scales)) {
+          cate_scale <- count_scales[[y_tr]]
+          if (!is.null(offset.name)) {
+            cate_scale <- paste0(cate_scale, ", not offset-adjusted")
+          }
+        } else {
+          cate_scale <- "scale not recorded"
+        }
+      }
       tab_estimates_grf <- tab_estimates_grf |>
         gt::tab_source_note(
           source_note = gt::md(sprintf(
-            "**GRF CATE:** H&#x302; = %.4f, H&#x302;<sup>c</sup> = %.4f (risk-difference scale)",
-            fs$cate_sg, fs$cate_sgc
+            "**GRF CATE:** H&#x302; = %.4f, H&#x302;<sup>c</sup> = %.4f (%s)",
+            fs$cate_sg, fs$cate_sgc, cate_scale
           ))
         )
     }
@@ -978,6 +1035,15 @@ sg_tables <- function(fs,
     effect_measure <- args_fs$effect_measure
     if (is.null(effect_measure)) effect_measure <- "RD"
 
+    # Orientation: the fit's resolved adverse_outcome, so the effect column
+    # is the fit's own estimate, sign included (the arm means and Diff stay
+    # raw).  NULL only on an object not built by forestsearch(); resolved by
+    # forestsearch()'s rule.
+    adverse_outcome <- args_fs$adverse_outcome
+    if (is.null(adverse_outcome)) {
+      adverse_outcome <- outcome_type %in% c("binary", "count")
+    }
+
     # Build estimator closure for the table
     estimator_fn_tab <- tryCatch(
       make_effect_estimator(
@@ -986,6 +1052,7 @@ sg_tables <- function(fs,
         outcome.name      = args_fs$outcome.name,
         offset.name       = args_fs$offset.name,
         effect_measure    = effect_measure,
+        adverse_outcome   = adverse_outcome,
         adjust_covariates = args_fs$adjust_covariates
       ),
       error = function(e) NULL

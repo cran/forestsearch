@@ -1,677 +1,124 @@
-## ----setup, include=FALSE-----------------------------------------------------
-knitr::opts_chunk$set(
-
-  echo = TRUE,
-  warning = FALSE,
-  message = FALSE,
-
-  fig.align = "center",
-  fig.retina = 2,
-  fig.width = 8,
-  fig.height = 6
-)
-
-# Bootstrap 5 code-folding hook for pkgdown compatibility
-# Usage: add `echo=FALSE, code_fold=TRUE` to any chunk header
-knitr::knit_hooks$set(code_fold = function(before, options, envir) {
-  if (!before && isTRUE(options$code_fold)) {
-    id <- gsub("[^a-zA-Z0-9]", "", options$label)
-    code_lines <- knitr::knit_code$get(options$label)
-    code_text  <- htmltools::htmlEscape(paste(code_lines, collapse = "\n"))
-    sprintf(
-      '<p><a class="btn btn-outline-secondary btn-sm" data-bs-toggle="collapse" href="#collapse-%s" role="button" aria-expanded="false" aria-controls="collapse-%s"><i class="bi bi-code-slash"></i> Code</a></p>\n<div class="collapse" id="collapse-%s"><div class="card card-body p-0"><pre class="r"><code class="hljs">%s</code></pre></div></div>',
-      id, id, id, code_text
-    )
-  }
-})
-
-# Initialize timing
-timings <- list()
-t_vignette_start <- proc.time()
-
-## ----load-packages------------------------------------------------------------
+## ----setup--------------------------------------------------------------------
+#| message: false
+#| warning: false
+knitr::opts_chunk$set(comment = "#>", fig.align = "center")
 library(forestsearch)
 library(survival)
-library(data.table)
-library(ggplot2)
-library(gt)
-library(grf)
-library(policytree)
-library(doFuture)
 
-# Optional packages for enhanced output
-library(patchwork)
-library(weightedsurv)
 
-# Set ggplot theme
-theme_set(theme_minimal(base_size = 12))
-
-## ----data-setup---------------------------------------------------------------
-# Load GBSG data (from the survival package)
-df.analysis <- gbsg
-
-# Prepare analysis variables
-df.analysis <- within(df.analysis, {
-  id <- seq_len(nrow(df.analysis))
-  time_months <- rfstime / 30.4375
-  grade3 <- ifelse(grade == "3", 1, 0)
-  treat <- hormon
+## ----data---------------------------------------------------------------------
+df <- survival::gbsg
+df <- within(df, {
+  id          <- seq_len(nrow(df))              # the fit's subject identifier
+  time_months <- rfstime / 30.4375              # recurrence-free survival, days to months
+  grade3      <- ifelse(grade == "3", 1, 0)     # grade 3 against grade 1 or 2
 })
+confounders <- c("age", "meno", "size", "grade3", "nodes", "pgr", "er")
+stopifnot(nrow(df) == 686, sum(df$status) == 299)
 
-# Define variable roles
-confounders.name <- c("age", "meno", "size", "grade3", "nodes", "pgr", "er")
-outcome.name <- "time_months"
-event.name <- "status"
-id.name <- "id"
-treat.name <- "hormon"
+whole <- coxph(Surv(time_months, status) ~ hormon, data = df)
+whole_hr <- c(est = unname(exp(coef(whole))), exp(confint(whole))[1, ])
+c(patients = nrow(df), hormonal_therapy = sum(df$hormon == 1),
+  none = sum(df$hormon == 0), events = sum(df$status))
+sprintf("Whole-trial hazard ratio %.3f (%.3f, %.3f), hormonal therapy vs none",
+        whole_hr[["est"]], whole_hr[[2]], whole_hr[[3]])
 
-# Display data structure
-cat("Sample size:", nrow(df.analysis), "\n")
-cat("Events:", sum(df.analysis[[event.name]]), 
-    sprintf("(%.1f%%)\n", 100 * mean(df.analysis[[event.name]])))
-cat("Baseline factors:", paste(confounders.name, collapse = ", "), "\n")
 
-## ----baseline-table-----------------------------------------------------------
-create_summary_table(
-  data                  = df.analysis,                                       # required
-  treat_var             = treat.name,                                        # default "treat"
-  vars_continuous       = c("age", "nodes", "size", "er", "pgr"),            # default NULL
-  vars_categorical      = c("grade", "meno"),                                # default NULL
-  vars_binary           = NULL,                                              # default NULL
-  var_labels            = NULL,                                              # default NULL
-  digits                = 1,                                                 # default 1
-  show_pvalue           = TRUE,                                              # default TRUE
-  show_smd              = TRUE,                                              # default TRUE
-  show_missing          = TRUE,                                              # default TRUE
-  table_title           = "GBSG Baseline Characteristics by Treatment Arm",  # default "Baseline Characteristics by Treatment Arm"
-  table_subtitle        = NULL,                                              # default NULL
-  source_note           = NULL,                                              # default NULL
-  font_size             = 12,                                                # default 12
-  header_font_size      = 14,                                                # default 14
-  footnote_font_size    = 10,                                                # default 10
-  use_alternating_rows  = TRUE,                                              # default TRUE
-  stripe_color          = "#f9f9f9",                                         # default "#f9f9f9"
-  indent_size           = 20,                                                # default 20
-  highlight_pval        = 0.05,                                              # default 0.05
-  highlight_smd         = 0.2,                                               # default 0.2
-  highlight_color       = "#fff3cd",                                         # default "#fff3cd"
-  compact_mode          = FALSE,                                             # default FALSE
-  column_width_var      = 200,                                               # default 200
-  column_width_stats    = 120,                                               # default 120
-  show_column_borders   = FALSE                                              # default FALSE
-)
+## ----fit-fs-------------------------------------------------------------------
+#| message: false
+#| results: hide
+t0 <- proc.time()[["elapsed"]]
+fit_fs <- forestsearch(
+  df.analysis = df,
+  outcome.name = "time_months", event.name = "status", treat.name = "hormon", id.name = "id",
+  confounders.name = confounders,
+  is.RCT = TRUE, est.scale = "hr", seedit = 8316951,
+  # the candidate family
+  conf.cont_jcuts = list(er = 10, pgr = 10), conf_force = c("er <= 0", "pgr <= 0"),
+  n.min = 60, d0.min = 10, d1.min = 10, maxk = 2,
+  # the identifier, its thresholds and the selection rule
+  subgroup_method = "consistency", consistency_method = "resample",
+  hr.threshold = 1.00, hr.consistency = 1.00, pconsistency.threshold = 0.90,
+  stop_threshold = NULL,                      # evaluate every candidate; no early stop
+  sg_focus = "effMaxSG", selection_rule = "neighborhood", effect_neighborhood = 0.20,
+  quiet = TRUE, parallel_args = list(plan = "sequential"))
+fit_sec_fs <- proc.time()[["elapsed"]] - t0
 
-## ----km-itt, fig.width=8, fig.height=5----------------------------------------
-# Prepare counting process data for KM plot
-dfcount <- df_counting(
-  df = df.analysis,
-  by.risk = 6,
-  tte.name = outcome.name,
-  event.name = event.name,
-  treat.name = treat.name
-)
 
-# Plot with confidence intervals and log-rank test
-plot_weighted_km(
-  dfcount,
-  conf.int = TRUE,
-  show.logrank = TRUE,
-  ymax = 1.05,
-  xmed.fraction = 0.775,
-  ymed.offset = 0.125
-)
+## ----fs-selected--------------------------------------------------------------
+in_H <- fit_fs$df.est$treat.recommend[match(df$id, fit_fs$df.est$id)] == 0
+stopifnot(!anyNA(in_H))
+cat(sprintf("Identified subgroup: %s\n", paste(fit_fs$sg.harm, collapse = " & ")))
+cat(sprintf("Patients in it: %d of %d. Fit: %.1f s\n", sum(in_H), nrow(df), fit_sec_fs))
 
-## ----grf-analysis-------------------------------------------------------------
-t0 <- proc.time()
 
-# All grf.subg.harm.survival() parameters shown with their default values.
-# Required: data, confounders.name, outcome.name, event.name, id.name, treat.name.
-grf_est <- grf.subg.harm.survival(
-  data                      = df.analysis,         # required
-  confounders.name          = confounders.name,    # required
-  outcome.name              = outcome.name,        # required
-  event.name                = event.name,          # required
-  id.name                   = id.name,             # required
-  treat.name                = treat.name,          # required
-  frac.tau                  = 0.6,                 # default 1.0; max follow-up fraction
-  n.min                     = 60,                  # default 60; min subgroup size
-  dmin.grf                  = 12,                  # default 0.0; min RMST diff (months)
-  RCT                       = TRUE,                # default TRUE
-  details                   = TRUE,                # default FALSE
-  sg.criterion              = "mDiff",             # default "mDiff"; or "Nsg"
-  maxdepth                  = 2,                   # default 2; max policy tree depth (<=3)
-  seedit                    = 8316951,             # default 8316951
-  return_selected_cuts_only = FALSE,               # default FALSE
-  tune_grf                  = FALSE                # default FALSE; CV hyperparameter tuning
-)
+## ----fs-funnel----------------------------------------------------------------
+counts <- fit_fs$find.grps$filter_counts
+funnel <- data.frame(
+  stage = c("enumerated (at most two cuts, size-eligible)",
+            "fittable (ten events in each arm, Cox fit obtained)",
+            "clearing the screening threshold, HR > 1.0",
+            "passing the consistency screen, p_cons >= 0.90"),
+  candidates = c(counts$n_evaluated, counts$n_passed_cox, counts$n_passed_hr,
+                 fit_fs$grp.consistency$n_passed))
+knitr::kable(funnel, row.names = FALSE, format.args = list(big.mark = ","))
 
-timings$grf <- (proc.time() - t0)["elapsed"]
 
-## ----grf-trees, fig.width=10, fig.height=4------------------------------------
-# Display policy trees
-# leaf1 = recommend control, leaf2 = recommend treatment
-par(mfrow = c(1, 2))
-plot(grf_est$tree1, leaf.labels = c("Control", "Treat"), main = "Depth 1")
-plot(grf_est$tree2, leaf.labels = c("Control", "Treat"), main = "Depth 2")
-par(mfrow = c(1, 1))
+## ----fs-candidates------------------------------------------------------------
+cand <- as.data.frame(fit_fs$grp.consistency$out_sg$result)
+cand$candidate <- ifelse(cand$M.2 == "", cand$M.1, paste(cand$M.1, cand$M.2, sep = " & "))
+cand <- cand[order(-cand$N), ]
+knitr::kable(cand[, c("candidate", "N", "hr", "Pcons")], digits = 3,
+             row.names = FALSE, col.names = c("candidate", "N", "HR", "p_cons"),
+             caption = "The candidates passing the consistency screen, largest first.")
+band <- (1 - 0.20) * max(cand$hr)
+within_band <- cand$hr >= band
+sel <- cand[within_band, ][which.max(cand$N[within_band]), ]
+cat(sprintf("Largest HR over the family: %.2f (N %d). Band: HR >= %.2f.\n",
+            max(cand$hr), cand$N[which.max(cand$hr)], band))
+cat(sprintf("max N(eps) takes the largest candidate within the band: N %d, HR %.2f.\n",
+            sel$N, sel$hr))
+cat(sprintf("max N alone would take N %d (HR %.2f); max beta the N %d.\n",
+            max(cand$N), cand$hr[which.max(cand$N)], cand$N[which.max(cand$hr)]))
+stopifnot(sel$N == sum(in_H))   # the rule, re-applied, picks the fit's own selection
 
-## ----parallel-setup-----------------------------------------------------------
-# Detect available cores (limited to 2 cores for CRAN checks)
-n_cores <- 2
-n_cores_total <- parallel::detectCores()
-cat("Using", n_cores, "of", n_cores_total, "total cores for parallel processing")
 
-## ----forestsearch-main, fig.width=10, fig.height=7----------------------------
-t0 <- proc.time()
-
-# All forestsearch() parameters shown with their default values.
-# Comments indicate the package default; the value used here may differ.
-fs <- forestsearch(
-  df.analysis                = df.analysis,                  # required
-
-  # ─── Variable names ─────────────────────────────────────────────────────
-  outcome.name               = outcome.name,                 # default "tte"
-  event.name                 = event.name,                   # default "event"
-  treat.name                 = treat.name,                   # default "treat"
-  id.name                    = id.name,                      # default "id"
-  potentialOutcome.name      = NULL,                         # default NULL
-  flag_harm.name             = NULL,                         # default NULL
-  confounders.name           = confounders.name,             # default NULL
-
-  # ─── Parallel processing ────────────────────────────────────────────────
-  parallel_args              = list(plan = "multisession",
-                                    workers = n_cores,
-                                    show_message = TRUE),    # default plan="multisession"
-
-  # ─── Prediction / RCT flag ──────────────────────────────────────────────
-  df.predict                 = NULL,                         # default NULL
-  df.test                    = NULL,                         # default NULL
-  is.RCT                     = TRUE,                         # default TRUE
-  seedit                     = 8316951,                      # default 8316951
-  est.scale                  = "hr",                         # default "hr"
-
-  # ─── Factor selection: LASSO + GRF ──────────────────────────────────────
-  use_lasso                  = TRUE,                         # default TRUE
-  use_grf                    = TRUE,                         # default TRUE
-  grf_res                    = NULL,                         # default NULL; pass cached GRF result
-  grf_cuts                   = NULL,                         # default NULL
-  max_n_confounders          = 1000,                         # default 1000
-  grf_depth                  = 2,                            # default 2
-  dmin.grf                   = 0.0,                          # default 0.0
-  frac.tau                   = 0.8,                          # default 0.8
-  return_selected_cuts_only  = TRUE,                         # default TRUE
-  vi.grf.min                 = -0.2,                         # default -0.2; GRF VI threshold
-  tune_grf                   = FALSE,                        # default FALSE
-
-  # ─── Cuts / discretization ──────────────────────────────────────────────
-  conf_force                 = NULL,                         # default NULL
-  defaultcut_names           = NULL,                         # default NULL
-  cut_type                   = "default",                    # default "default"
-  exclude_cuts               = NULL,                         # default NULL
-  replace_med_grf            = FALSE,                        # default FALSE
-  cont.cutoff                = 4,                            # default 4
-  conf.cont_medians          = NULL,                         # default NULL
-  conf.cont_medians_force    = NULL,                         # default NULL
-  conf.cont_jcuts            = NULL,                         # default NULL
-
-  # ─── Subgroup constraints ───────────────────────────────────────────────
-  n.min                      = 60,                           # default 60; min subgroup size
-  d0.min                     = 12,                           # default 10; min events arm 0
-  d1.min                     = 12,                           # default 10; min events arm 1
-  maxk                       = 2,                            # default 2; max factors per SG
-  max_subgroups_search       = 3,                            # default 10
-  max.minutes                = 3,                            # default 3; per-stage timeout
-
-  # ─── Thresholds (preferred names take precedence if both supplied) ─────
-  effect.threshold           = NULL,                         # default NULL; alias for hr.threshold
-  consistency.threshold      = NULL,                         # default NULL; alias for hr.consistency
-  hr.threshold               = 1.25,                         # default 1.25; screening threshold
-  hr.consistency             = 1.0,                          # default 1.0; consistency threshold
-
-  # ─── Selection (sg_focus / Pareto neighborhood) ─────────────────────────
-  sg_focus                   = "maxSG",                    # default "hr"; "hr"/"eff", "maxSG", "minSG", "hrMaxSG"/"effMaxSG", "hrMinSG"/"effMinSG"
-  selection_rule             = "neighborhood",               # default "neighborhood"; or "pareto", "both" (only for hrMaxSG/hrMinSG)
-  effect_neighborhood        = 0.10,                         # default 0.10; tol for hrMaxSG/hrMinSG
-
-  # ─── Consistency evaluation ─────────────────────────────────────────────
-  fs.splits                  = 100,                          # default 1000; split-half repeats
-  m1.threshold               = Inf,                          # default Inf
-  pconsistency.threshold     = 0.80,                         # default 0.90
-  stop_threshold             = 0.80,                         # default 0.95; early-stop consistency
-
-  # ─── Two-stage consistency ──────────────────────────────────────────────
-  use_twostage               = TRUE,                         # default TRUE
-  twostage_args              = list(),                       # default list()
-
-  # ─── GLM outcome support (survival analysis here) ───────────────────────
-  outcome_type               = "survival",                   # default "survival"; or "binary", "continuous", "count"
-  effect_measure             = NULL,                         # default NULL; auto-set from outcome_type
-  offset.name                = NULL,                         # default NULL; required for count
-  adverse_outcome            = NULL,                         # default NULL; auto-set
-  overdispersion             = "none",                       # default "none"; or "quasi", "negbin"
-  grf_count_transform        = "log",                        # default "log"; or "identity"
-
-  # ─── Propensity-score adjustment (observational analyses) ───────────────
-  ps_method                  = NULL,                         # default NULL
-  ps_adjust_method           = "none",                       # default "none"; or "iptw", "dr_gcomp"
-  ps_hat                     = NULL,                         # default NULL
-
-  # ─── Output / diagnostics ───────────────────────────────────────────────
-  show_candidate_summary     = TRUE,                         # default FALSE; pre-/post-consistency previews
-  minp                       = 0.025,                        # default 0.025
-  details                    = TRUE,                         # default FALSE
-  quiet                      = FALSE,                        # default FALSE
-  by.risk                    = 12,                           # default 12
-  plot.sg                    = TRUE,                         # default FALSE; KM plots for SG
-  plot.grf                   = FALSE                         # default FALSE
-)
-
-plan("sequential")
-timings$forestsearch <- (proc.time() - t0)["elapsed"]
-
-cat("\nForestSearch completed in", 
-    round(timings$forestsearch, 1), "seconds\n")
-
-## ----fs-results---------------------------------------------------------------
-# Generate results tables
-# All sg_tables() parameters shown with their default values.
-res_tabs <- sg_tables(
-  fs                    = fs,                                # required
-  which_df              = "est",                             # default "est"
-  est_title             = "Treatment Effect Estimates",      # default "Treatment Effect Estimates"
-  est_caption           = "Training data estimates",         # default "Training data estimates"
-  sg_title              = "Identified Subgroups",            # default "Identified Subgroups"
-  sg_subtitle           = NULL,                              # default NULL
-  potentialOutcome.name = NULL,                              # default NULL
-  hr_1a                 = NA,                                # default NA
-  hr_0a                 = NA,                                # default NA
-  ndecimals             = 3,                                 # default 3
-  include_search_info   = TRUE,                              # default TRUE
-  subgroup_notation     = NULL,                              # default NULL; or "harm", "benefit"
-  font_size             = 12                                 # default 12
-)
-
-# Display top subgroups meeting criteria
-res_tabs$sg10_out
-
-## ----fs-estimates-------------------------------------------------------------
-# ITT and subgroup estimates
-res_tabs$tab_estimates
-
-## ----fs-subgroup--------------------------------------------------------------
-cat("Identified subgroup (H):", paste(fs$sg.harm, collapse = " & "), "\n")
-cat("Subgroup size:", sum(fs$df.est$treat.recommend == 0), 
-    sprintf("(%.1f%% of ITT)\n", 
-            100 * mean(fs$df.est$treat.recommend == 0)))
-
-## ----bootstrap, eval=TRUE-----------------------------------------------------
-# Number of bootstrap iterations
-# Use 500-2000 for production; reduced here for vignette
-NB <- 2
-
-t0 <- proc.time()
-
-# All forestsearch_bootstrap_dofuture() parameters shown with their defaults.
-fs_bc <- forestsearch_bootstrap_dofuture(
-  fs.est        = fs,                                        # required
-  nb_boots      = NB,                                        # required (use 500-2000 for production)
-  seed          = 8316951L,                                  # default 8316951L
-  details       = FALSE,                                     # default FALSE
-  show_three    = FALSE,                                     # default FALSE
-  parallel_args = list(plan = "multisession",
-                       workers = n_cores,
-                       show_message = TRUE),                 # default list()
-  digits        = 4                                          # default 4
-)
-
-plan("sequential")
-timings$bootstrap <- (proc.time() - t0)["elapsed"]
-
-cat("\nBootstrap completed in", 
-    round(timings$bootstrap / 60, 1), "minutes\n")
-
-## ----bootstrap-summary--------------------------------------------------------
-# All summarize_bootstrap_results() parameters shown with their defaults.
-summaries <- summarize_bootstrap_results(
-  sgharm       = fs$sg.harm,                                 # required
-  boot_results = fs_bc,                                      # required
-  create_plots = TRUE,                                       # default FALSE
-  est.scale    = "hr",                                       # default "hr"
-  digits       = 2                                           # default 2
-)
-
-# Display bias-corrected estimates table
-summaries$table
-
-## ----fs-results_figure, fig.width=10, fig.height=7, fig.cap="Kaplan-Meier survival curves by identified subgroup"----
-
-# All plot_sg_weighted_km() parameters shown with their defaults.
-km_result <- plot_sg_weighted_km(
-  fs.est         = fs,                                       # required
-  fs_bc          = fs_bc,                                    # default NULL
-  outcome.name   = "time_months",                            # default "Y"
-  event.name     = "status",                                 # default "Event"
-  treat.name     = "hormon",                                 # default "Treat"
-  by.risk        = 12,                                       # default NULL
-  sg0_name       = NULL,                                     # default NULL
-  sg1_name       = NULL,                                     # default NULL
-  conf.int       = TRUE,                                     # default TRUE
-  show.logrank   = FALSE,                                    # default TRUE
-  show.cox       = FALSE,                                    # default TRUE
-  show.cox.bc    = TRUE,                                     # default TRUE
-  put.legend.lr  = "topleft",                                # default "topleft"
-  ymax           = 1.05,                                     # default 1.05
-  xmed.fraction  = 0.65,                                     # default 0.65
-  hr_bc_position = "topright",                               # default "bottomright"
-  hr_bc_cex      = 0.725,                                    # default 0.725
-  title          = NULL,                                     # default NULL
-  verbose        = FALSE                                     # default FALSE
-)
-
-## ----event-summary------------------------------------------------------------
-# note that default required minimum events is 12 for subgroup candidate
-# Here we evaluate frequency of subgroup candidates in bootstrap samples less than 15
-# All summarize_bootstrap_events() parameters shown with their defaults.
-event_summary <- summarize_bootstrap_events(
-  boot_results = fs_bc,                                      # required
-  threshold    = 15                                          # default 5
-)
-
-## ----bootstrap-diagnostics----------------------------------------------------
-# Quality metrics
-summaries$diagnostics_table_gt
-
-## ----subgroup-agreement-------------------------------------------------------
-# Agreement with original analysis
-if (!is.null(summaries$subgroup_summary$original_agreement)) {
-  summaries$subgroup_summary$original_agreement
+## ----unadjusted---------------------------------------------------------------
+hr_ci <- function(d) {
+  f <- coxph(Surv(time_months, status) ~ hormon, data = d)
+  ci <- exp(confint(f))
+  sprintf("%.3f (%.3f, %.3f)", exp(coef(f)), ci[1, 1], ci[1, 2])
 }
-
-# Factor presence across bootstrap iterations
-if (!is.null(summaries$subgroup_summary$factor_presence)) {
-  summaries$subgroup_summary$factor_presence
-}
-
-## ----bootstrap-plots, fig.width=10, fig.height=4, eval=TRUE-------------------
-if (!is.null(summaries$plots)) {
-  summaries$plots$H_distribution + summaries$plots$Hc_distribution
-}
-
-## ----kfold-cv, eval = TRUE----------------------------------------------------
-# 10-fold CV with multiple iterations
-# Use Ksims >= 50 for production
-Ksims <- 1
-
-t0 <- proc.time()
-
-# All forestsearch_tenfold() parameters shown with their defaults.
-fs_kfold <- forestsearch_tenfold(
-  fs.est        = fs,                                        # required
-  sims          = Ksims,                                     # required (use >=50 for production)
-  Kfolds        = 2,                                         # default 10
-  details       = FALSE,                                     # default TRUE
-  seed          = 8316951L,                                  # default 8316951L
-  parallel_args = list(plan = "multisession",
-                       workers = n_cores,
-                       show_message = FALSE),                # default plan="multisession", workers=6
-  keep_resCV    = FALSE                                      # default FALSE
-)
-
-plan("sequential")
-timings$kfold <- (proc.time() - t0)["elapsed"]
-
-# All cv_metrics_tables() parameters shown with their defaults.
-metrics_tables <- cv_metrics_tables(
-  cv_result        = fs_kfold,                               # required
-  sg_definition    = NULL,                                   # default NULL
-  title            = "Cross-Validation Metrics",             # default "Cross-Validation Metrics"
-  show_percentages = TRUE,                                   # default TRUE
-  digits           = 1,                                      # default 1
-  include_raw      = FALSE,                                  # default FALSE
-  table_style      = "combined",                             # default "combined"; or "separate", "minimal"
-  use_gt           = TRUE                                    # default TRUE
-)
-metrics_tables
+knitr::kable(
+  data.frame(set = c("identified region", "complement"),
+             N = c(sum(in_H), sum(!in_H)),
+             events = c(sum(df$status[in_H]), sum(df$status[!in_H])),
+             unadjusted = c(hr_ci(df[in_H, ]), hr_ci(df[!in_H, ]))),
+  col.names = c("", "N", "events", "unadjusted HR (95% CI)"), row.names = FALSE,
+  caption = "The identified region and its complement: unadjusted estimates, before any correction for the selection.")
 
 
-## ----oob-cv, eval = FALSE-----------------------------------------------------
-# t0 <- proc.time()
-# 
-# # All forestsearch_Kfold() parameters shown with their defaults.
-# fs_OOB <- forestsearch_Kfold(
-#   fs.est        = fs,                                        # required
-#   Kfolds        = round(nrow(df.analysis)/100, 0),           # default nrow(fs.est$df.est) (LOO)
-#   seedit        = 8316951L,                                  # default 8316951L
-#   parallel_args = list(plan = "multisession",
-#                        workers = n_cores,
-#                        show_message = TRUE),                 # default plan="multisession", workers=6
-#   sg0.name      = "Not recommend",                           # default "Not recommend"
-#   sg1.name      = "Recommend",                               # default "Recommend"
-#   details       = FALSE                                      # default FALSE
-# )
-# 
-# plan("sequential")
-# timings$oob <- (proc.time() - t0)["elapsed"]
-# 
-# # All forestsearch_KfoldOut() parameters shown with their defaults.
-# cv_out <- forestsearch_KfoldOut(
-#   res     = fs_OOB,                                          # required
-#   details = FALSE,                                           # default FALSE
-#   outall  = TRUE,                                            # default FALSE
-#   digits  = 4                                                # default 4
-# )
-# 
-# # All cv_summary_tables() parameters shown with their defaults.
-# tables <- cv_summary_tables(
-#   kfold_out    = cv_out,                                     # required
-#   title        = "Cross-Validation Summary",                 # default "Cross-Validation Summary"
-#   subtitle     = NULL,                                       # default NULL
-#   show_metrics = TRUE,                                       # default TRUE
-#   digits       = 3,                                          # default 3
-#   font_size    = 12,                                         # default 12
-#   use_gt       = TRUE                                        # default TRUE
-# )
-# 
-# tables$combined_table
-# 
-# tables$metrics_table
-# 
-# 
-# 
-# 
-
-## ----forest-plot, fig.width=18, fig.height=12, fig.cap="Subgroup forest plot including identified subgroups"----
+## ----fit-fs-inference---------------------------------------------------------
+#| eval: false
+# fit_fs_inf <- forestsearch(
+#   df.analysis = df,
+#   outcome.name = "time_months", event.name = "status", treat.name = "hormon", id.name = "id",
+#   confounders.name = confounders,
+#   is.RCT = TRUE, est.scale = "hr", seedit = 8316951,
+#   conf.cont_jcuts = list(er = 10, pgr = 10), conf_force = c("er <= 0", "pgr <= 0"),
+#   n.min = 60, d0.min = 10, d1.min = 10, maxk = 2,
+#   subgroup_method = "consistency", consistency_method = "resample",
+#   hr.threshold = 1.00, hr.consistency = 1.00, pconsistency.threshold = 0.90,
+#   stop_threshold = NULL,
+#   sg_focus = "effMaxSG", selection_rule = "neighborhood", effect_neighborhood = 0.20,
+#   # selection-adjusted inference
+#   mr_inference = TRUE,
+#   mr_inference_args = list(ci_method = "field", draws = 5000L, include_complement = TRUE,
+#                            field_scale_complement = "selected"),
+#   quiet = TRUE, parallel_args = list(plan = "sequential"))
+# mr_estimates_table(fit_fs_inf, est.scale = "hr", digits = 3)
 
 
-# Define reference subgroups for comparison
-subgroups <- list(
-  age_gt65 = list(
-    subset_expr = "age > 65",
-    name = "Age > 65",
-    type = "reference"
-  ),
-  age_le65 = list(
-    subset_expr = "age <= 65",
-    name = "Age ≤ 65",
-    type = "reference"
-  ),
-  pgr_positive = list(
-    subset_expr = "pgr > 0",
-    name = "PgR > 0",
-    type = "reference"
-  ),
-  pgr_negative = list(
-    subset_expr = "pgr <= 0",
-    name = "PgR ≤ 0",
-    type = "reference"
-  )
-)
-
-
-# All create_forest_theme() parameters shown with their defaults.
-my_theme <- create_forest_theme(
-  base_size         = 24,                                    # default 10
-  scale             = 1.0,                                   # default 1.0
-  row_padding       = NULL,                                  # default NULL
-  ci_pch            = 15,                                    # default 15
-  ci_lwd            = NULL,                                  # default NULL
-  ci_Theight        = NULL,                                  # default NULL
-  ci_col            = "black",                               # default "black"
-  header_fontsize   = NULL,                                  # default NULL (auto)
-  body_fontsize     = NULL,                                  # default NULL (auto)
-  footnote_fontsize = 17,                                    # default NULL
-  footnote_col      = "darkcyan",                            # default "darkcyan"
-  title_fontsize    = NULL,                                  # default NULL
-  cv_fontsize       = 22,                                    # default NULL
-  cv_col            = "gray30",                              # default "gray30"
-  refline_lwd       = NULL,                                  # default NULL
-  refline_lty       = "dashed",                              # default "dashed"
-  refline_col       = "gray30",                              # default "gray30"
-  vertline_lwd      = NULL,                                  # default NULL
-  vertline_lty      = "dashed",                              # default "dashed"
-  vertline_col      = "gray20",                              # default "gray20"
-  arrow_type        = "closed",                              # default "closed"
-  arrow_col         = "black",                               # default "black"
-  summary_fill      = "black",                               # default "black"
-  summary_col       = "black"                                # default "black"
-)
-
-
-# Create forest plot
-# Include fs_kfold and fs_OOB if available for CV metrics
-# All plot_subgroup_results_forestplot() parameters shown with their defaults.
-result <- plot_subgroup_results_forestplot(
-  fs_results        = list(fs.est   = fs,
-                           fs_bc    = fs_bc,
-                           fs_OOB   = NULL,
-                           fs_kfold = fs_kfold),             # required
-  df_analysis       = df.analysis,                           # required
-  subgroup_list     = subgroups,                             # default NULL
-  outcome.name      = outcome.name,                          # required
-  event.name        = event.name,                            # required
-  treat.name        = treat.name,                            # required
-  E.name            = "Hormonal",                            # default "Experimental"
-  C.name            = "Chemo",                               # default "Control"
-  est.scale         = "hr",                                  # default "hr"
-  xlog              = TRUE,                                  # default TRUE
-  title_text        = NULL,                                  # default NULL
-  arrow_text        = c("Favors Experimental", "Favors Control"),  # default same
-  footnote_text     = c("Eg 80% of training found SG: 70% of B (+) also B in CV testing"),  # default same
-  xlim              = c(0.25, 1.5),                          # default c(0.25, 1.5)
-  ticks_at          = c(0.25, 0.70, 1.0, 1.5),               # default c(0.25, 0.70, 1.0, 1.5)
-  show_cv_metrics   = TRUE,                                  # default TRUE
-  cv_source         = "auto",                                # default "auto"; or "kfold", "oob", "both"
-  posthoc_colors    = c("powderblue", "beige"),              # default same
-  reference_colors  = c("yellow", "powderblue"),             # default same
-  ci_column_spaces  = 25,                                    # default 20
-  conf.level        = 0.95,                                  # default 0.95
-  theme             = my_theme,                              # default NULL
-  outcome_type      = NULL,                                  # default NULL; auto-detect
-  effect_measure    = NULL,                                  # default NULL; auto-detect
-  offset.name       = NULL,                                  # default NULL
-  extreme_ci_cap    = 1.5,                                   # default 1.5
-  xlim_method       = "clinical"                             # default "clinical"; or "data"
-)
-
-
-# Option 2: Custom sizing
-# All render_forestplot() parameters shown with their defaults.
-render_forestplot(
-  x       = result,                                          # required
-  newpage = TRUE                                             # default TRUE
-)
-
-
-## ----KMdiffs, fig.width = 8, fig.height = 6, fig.align="center"---------------
-
-# Add additional subgroups along with ITT and identified subgroups
-ref_sgs <- list(
-age_young = list(subset_expr = "age < 65", color = "brown"),
-age_old = list(subset_expr = "age >= 65", color = "orange")
-)
-
-# All plot_km_band_forestsearch() parameters shown with their defaults.
-plot_km_band_forestsearch(
-  df             = df.analysis,                              # required
-  fs.est         = fs,                                       # default NULL
-  sg_cols        = NULL,                                     # default NULL
-  sg_labels      = NULL,                                     # default NULL
-  sg_colors      = NULL,                                     # default NULL
-  itt_color      = "azure3",                                 # default "azure3"
-  outcome.name   = outcome.name,                             # default "tte"
-  event.name     = event.name,                               # default "event"
-  treat.name     = treat.name,                               # default "treat"
-  xlabel         = "Time",                                   # default "Time"
-  ylabel         = "Survival differences",                   # default "Survival differences"
-  yseq_length    = 5,                                        # default 5
-  draws_band     = 20,                                       # default 1000 (lower for speed)
-  tau_add        = NULL,                                     # default NULL
-  by_risk        = 6,                                        # default 6
-  risk_cex       = 0.75,                                     # default 0.75
-  risk_delta     = 0.035,                                    # default 0.035
-  risk_pad       = 0.015,                                    # default 0.015
-  ymax_pad       = 0.11,                                     # default 0.11
-  show_legend    = TRUE,                                     # default TRUE
-  legend_pos     = "topleft",                                # default "topleft"
-  legend_cex     = 0.75,                                     # default 0.75
-  ref_subgroups  = ref_sgs,                                  # default NULL
-  verbose        = FALSE                                     # default FALSE
-)
- 
-# # Example with more subgroups
-# ref_sgs <- list(
-# pgr_positive = list(subset_expr = "pgr > 0", color ="green"),
-# pgr_negative = list(subset_expr = "pgr <= 0", color = "purple"),
-# age_young = list(subset_expr = "age < 65", color = "brown"),
-# age_old = list(subset_expr = "age >= 65", color = "orange")
-# )
-
-
-## ----summary-findings---------------------------------------------------------
-# Extract key results
-cat("=" %>% rep(60) %>% paste(collapse = ""), "\n")
-cat("FORESTSEARCH ANALYSIS SUMMARY\n")
-cat("=" %>% rep(60) %>% paste(collapse = ""), "\n\n")
-
-cat("Dataset: GBSG (N =", nrow(df.analysis), ")\n")
-cat("Outcome: Recurrence-free survival\n\n")
-
-cat("ITT Analysis:\n")
-cat("  HR (95% CI): 0.69 (0.54, 0.89)\n\n")
-
-cat("Identified Subgroup (H):\n")
-cat("  Definition:", paste(fs$sg.harm, collapse = " & "), "\n")
-cat("  Size:", sum(fs$df.est$treat.recommend == 0), 
-    sprintf("(%.1f%%)\n", 100 * mean(fs$df.est$treat.recommend == 0)))
-cat("  Unadjusted HR:", sprintf("%.2f", fs$grp.consistency$out_sg$result$hr[1]), "\n")
-
-cat("\nComplement Subgroup (Hc):\n")
-cat("  Size:", sum(fs$df.est$treat.recommend == 1),
-    sprintf("(%.1f%%)\n", 100 * mean(fs$df.est$treat.recommend == 1)))
-
-## ----timing-summary, echo=FALSE, code_fold=TRUE-------------------------------
-timings$total <- (proc.time() - t_vignette_start)["elapsed"]
-
-timing_df <- data.frame(
-  Analysis = c("GRF", "ForestSearch", "Bootstrap", "Total"),
-  Seconds = c(
-    timings$grf,
-    timings$forestsearch,
-    timings$bootstrap,
-    timings$total
-  )
-)
-timing_df$Minutes <- timing_df$Seconds / 60
-
-gt(timing_df) |>
-  tab_header(title = "Computational Timing") |>
-  fmt_number(columns = c(Seconds, Minutes), decimals = 1) |>
-  cols_label(
-    Analysis = "Component",
-    Seconds = "Time (sec)",
-    Minutes = "Time (min)"
-  )
-
-## ----session-info-------------------------------------------------------------
+## ----session------------------------------------------------------------------
 sessionInfo()
 

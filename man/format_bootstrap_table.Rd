@@ -11,7 +11,8 @@ format_bootstrap_table(
   boot_success_rate = NULL,
   sg_definition = NULL,
   title = NULL,
-  subtitle = NULL
+  subtitle = NULL,
+  bc_footnote = NULL
 )
 }
 \arguments{
@@ -29,6 +30,13 @@ format_bootstrap_table(
 \item{title}{Character. Custom title (optional)}
 
 \item{subtitle}{Character. Custom subtitle (optional)}
+
+\item{bc_footnote}{Character or \code{NULL} (default). The footnote on the
+bias-corrected column. \code{NULL} writes the bootstrap footnote
+("Bootstrap-adjusted estimate using infinitesimal jackknife method
+(\code{nb_boots} iterations)"); \code{\link{mr_estimates_table}} passes
+the multiplier-resampling one when it uses a bootstrap result as its
+template.}
 }
 \value{
 A gt table object
@@ -40,11 +48,13 @@ optional subgroup definition footnote.
 }
 \examples{
 \dontrun{
-fs <- forestsearch(gbsg,
+gbsg <- survival::gbsg
+gbsg$grade3 <- as.integer(gbsg$grade == 3)
+fs <- forestsearch(gbsg, id.name = "pid",
   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
 fs_bc <- forestsearch_bootstrap_dofuture(fs, nb_boots = 100)
-summaries <- summarize_bootstrap_results(fs$sg.harm, fs_bc)
-format_bootstrap_table(summaries$table_data)
+format_bootstrap_table(fs_bc$FSsg_tab, nb_boots = 100,
+  sg_definition = paste(fs$sg.harm, collapse = " & "))
 }
 }

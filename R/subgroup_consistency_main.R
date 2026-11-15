@@ -66,6 +66,65 @@
 }
 
 
+# ---------------------------------------------------------------------------
+# The caller's random-number state across exported calls.
+#
+# subgroup.consistency() seeds the generator (set.seed(seed); seed = 8316951
+# unless supplied, and forestsearch() does not supply it), and other exported
+# functions seed it from their own arguments.  Every exported function that
+# can reach that call starts with .fs_preserve_rng(): the OUTERMOST such call
+# saves the caller's .Random.seed (or its absence) and puts it back when it
+# exits, normally or by an error.  A nested exported call (forestsearch()
+# inside a bootstrap or cross-validation loop, subgroup.consistency() inside
+# forestsearch()) does nothing, so every draw made inside the outer call comes
+# from the same stream as before and every computed value is unchanged.
+# ---------------------------------------------------------------------------
+.fs_rng <- new.env(parent = emptyenv())
+.fs_rng$active <- FALSE
+
+#' Restore the caller's RNG state when the outermost exported call exits
+#'
+#' @param envir The calling function's frame; the restore is registered there
+#'   with \code{on.exit(add = TRUE)}.
+#' @return Invisibly, \code{TRUE} when this call registered the restore,
+#'   \code{FALSE} when an enclosing exported call already had.
+#' @noRd
+.fs_preserve_rng <- function(envir = parent.frame()) {
+  if (isTRUE(.fs_rng$active)) return(invisible(FALSE))
+  .fs_rng$active <- TRUE
+  had_seed <- exists(".Random.seed", envir = globalenv(), inherits = FALSE)
+  old_seed <- if (had_seed) get(".Random.seed", envir = globalenv(), inherits = FALSE)
+  old_kind <- RNGkind()
+  restore <- function() {
+    .fs_rng$active <- FALSE
+    if (had_seed) {
+      assign(".Random.seed", old_seed, envir = globalenv())
+    } else {
+      suppressWarnings(do.call(RNGkind, as.list(old_kind)))
+      if (exists(".Random.seed", envir = globalenv(), inherits = FALSE)) {
+        rm(".Random.seed", envir = globalenv())
+      }
+    }
+  }
+  do.call(base::on.exit, list(as.call(list(restore)), TRUE, FALSE),
+          envir = envir)
+  invisible(TRUE)
+}
+
+#' Mark the rest of a future evaluation as inside an exported call
+#'
+#' A future worker does not share \code{.fs_rng$active} with the main
+#' process, so the first exported call made there would restore the worker's
+#' generator when it returns.  A future body that makes several exported calls
+#' in one evaluation calls this first, so those calls leave the stream alone
+#' between them, as they do in the main process.  It never clears the flag.
+#' @noRd
+.fs_rng_hold <- function() {
+  .fs_rng$active <- TRUE
+  invisible(NULL)
+}
+
+
 #' Evaluate Subgroup Consistency
 #'
 #' Evaluates candidate subgroups using split-sample consistency validation.
@@ -208,7 +267,11 @@
 #'   (uses Cox model).
 #' @param consistency_threshold Numeric or \code{NULL}. Threshold for GLM
 #'   consistency evaluation.  Default \code{NULL} (uses \code{hr.consistency}).
-#' @param adjust_covariates Character vector or \code{NULL}. Additional Cox
+#' @param adjust_covariates This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character vector or \code{NULL}. Additional Cox
 #'   model terms used when scoring survival subgroups during consistency
 #'   evaluation, e.g. \code{"strata(x1)"} for a stratified model or
 #'   \code{"x2"} for linear adjustment.  Referenced columns must be present
@@ -256,20 +319,25 @@
 #'       is set up and no per-batch globals resolution is paid.  A parallel
 #'       plan with \code{workers = 1} is honoured as parallel (one-worker
 #'       batched backend); pass \code{plan = "sequential"} to run the plain
-#'       loop.  Results under \code{consistency_method = "resample"} are
-#'       identical on every path (the closed form consumes no RNG).  Under
-#'       \code{"split"} the plain loop draws from a single RNG stream seeded
-#'       once, whereas the batched backend gives each candidate its own
-#'       L'Ecuyer-CMRG stream indexed by global position, so a sequential
-#'       plan's \code{p.consistency} values differ from a parallel plan's
-#'       within Monte-Carlo noise at the stated \code{fs.splits}; invariance
-#'       to worker count holds within any plan.}
+#'       loop.  Under \code{consistency_method = "resample"} a candidate whose
+#'       closed form is available consumes no RNG, so its result is identical
+#'       on every path.  Literal splitting -- \code{"split"}, an IRD effect
+#'       under \code{"resample"}, or a candidate whose closed form is not
+#'       available and falls back to splitting -- draws, in the plain loop,
+#'       from a single RNG stream seeded once, whereas the batched backend
+#'       gives each candidate its own L'Ecuyer-CMRG stream indexed by global
+#'       position, so a sequential plan's \code{p.consistency} values can
+#'       differ from a parallel plan's within Monte-Carlo noise at the stated
+#'       \code{n.splits}, and admission and selection can differ too;
+#'       invariance to worker count holds within any plan (with a non-NULL
+#'       \code{seed}).  Under
+#'       \code{sg_focus = "maxeff"} every plan runs the same plain loop.}
 #'     \item{workers}{Number of parallel workers on a parallel plan.}
 #'     \item{batch_size}{Number of candidates to evaluate per batch on a
 #'       genuinely parallel plan -- the knob for the per-batch overhead
 #'       described above.  Smaller
 #'       values provide finer-grained early stopping but may increase overhead.
-#'       Default: When stop_threshold is set and sg_focus is "hr" or "minSG",
+#'       Default: When stop_threshold is set and sg_focus is "maxeffCons",
 #'       defaults to 1 (stop immediately when first candidate passes). For other
 #'       sg_focus values with stop_threshold, defaults to min(workers, n_candidates/4).
 #'       When stop_threshold is NULL, defaults to workers*2 for efficiency.}
@@ -402,6 +470,7 @@ subgroup.consistency <- function(df,
                                  adjust_covariates = NULL,
                                  consistency_method = c("resample", "split"),
                                  glm_resample_spec = NULL) {
+  .fs_preserve_rng()
 
   # ===========================================================================
   # SECTION 1: INPUT VALIDATION
@@ -707,9 +776,15 @@ subgroup.consistency <- function(df,
   # parallel plan with workers = 1 stays on the batched path, so results are
   # invariant to worker count WITHIN any plan (the per-candidate RNG streams of
   # .make_candidate_rng_seeds() are indexed by global position; the plain loop
-  # seeds a single stream once).  Under consistency_method = "resample" no RNG
-  # is consumed and every path gives identical results.  No warning: this is
-  # the code doing what it was asked, once per replicate in a bootstrap.
+  # seeds a single stream once).  Under consistency_method = "resample" a
+  # candidate with an available closed form consumes no RNG and gives the same
+  # result on every path.  Literal splitting ("split", IRD under "resample", or
+  # a candidate whose closed form is NA and falls back to splitting) draws from
+  # that single stream here but from per-candidate streams on the batched path,
+  # so Pcons -- and possibly admission and selection -- can differ between a
+  # sequential and a parallel plan.  The maxeff fast path runs the same loop on
+  # every plan.  No warning: this is the code doing what it was asked, once per
+  # replicate in a bootstrap.
   if (use_parallel && identical(parallel_args$plan, "sequential")) {
     if (details) {
       cat("Parallel config: sequential plan -- running the consistency ",

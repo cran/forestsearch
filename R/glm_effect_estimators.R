@@ -18,7 +18,7 @@
 #
 # Internal helpers (not exported):
 #   - .make_cox_estimator, .make_glm_binary_estimator, etc.
-#   - .estimate_rd, .estimate_or, .estimate_rr
+#   - .estimate_rd, .estimate_or, .estimate_rr, .fs_rd_gcomp_se
 #   - .ps_grf, .ps_lasso, .ps_logistic
 #   - .build_adjusted_formula, .robust_or_model_se
 # =============================================================================
@@ -53,16 +53,42 @@
 #'   is \code{"OR"} -- the same default \code{\link{forestsearch}} uses.
 #' @param adverse_outcome Logical. If \code{TRUE} (default), higher
 #'   outcome values indicate harm and the effect is computed on the
-#'   raw outcome.  If \code{FALSE}, the outcome is beneficial (e.g.,
-#'   improvement) and the effect is computed on \code{1 - Y} internally
-#'   so that effect > 0 (or OR > 1) consistently indicates treatment
-#'   harm.  Only applies to binary outcomes; ignored for survival,
-#'   continuous, and count.
+#'   raw outcome.  If \code{FALSE}, higher values indicate benefit
+#'   (e.g., improvement) and, where it applies, the effect is computed
+#'   on a reversed outcome so that effect > 0 (or a ratio > 1) indicates
+#'   treatment harm.  By outcome type and effect measure:
+#'   \itemize{
+#'     \item \code{"binary"} with \code{"OR"}, \code{"RR"} or \code{"RD"}:
+#'       with \code{FALSE} the outcome is replaced by \code{1 - Y} before
+#'       fitting.  The log-OR and the RD change sign; the log-RR becomes
+#'       the log risk ratio of the complementary event,
+#'       \code{log((1 - p1) / (1 - p0))}, which is not \code{-log(p1 / p0)}
+#'       (\code{p1}, \code{p0}: the treated and control risks).
+#'     \item \code{"continuous"} (\code{"MD"}): with \code{FALSE} the
+#'       outcome is replaced by \code{-Y} before fitting, so the MD
+#'       changes sign.
+#'     \item \code{"count"} (\code{"IRR"}, \code{"IRD"}), and
+#'       \code{"binary"} with \code{"IRR"} or \code{"IRD"}: ignored; the
+#'       Poisson rate estimator always uses the raw outcome.
+#'     \item \code{"survival"}: ignored; the Cox estimator always uses the
+#'       raw time and event.
+#'   }
+#'   \code{\link{forestsearch}} resolves its own default (\code{TRUE} for
+#'   binary and count outcomes, \code{FALSE} otherwise) and passes it here;
+#'   this function's default is \code{TRUE} for every outcome type.
 #' @param robust_se Logical. Use sandwich robust SE when available.
 #'   Default \code{TRUE}.
-#' @param adjust_covariates Character vector or \code{NULL}. Additional
+#' @param adjust_covariates This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character vector or \code{NULL}. Additional
 #'   covariate names to include in the outcome model formula.
-#' @param ps_adjust_method Character. Propensity score adjustment method.
+#' @param ps_adjust_method This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character. Propensity score adjustment method.
 #'   One of \code{"none"} (default), \code{"iptw"} (stabilized inverse
 #'   probability of treatment weights), or \code{"dr_gcomp"} (Bang &
 #'   Robins 2005 IPS covariate with G-computation).
@@ -520,12 +546,36 @@ make_effect_estimator <- function(
     pred1 <- stats::predict(fit_logit, newdata = nd1, type = "response")
     rd_est <- mean(pred1) - mean(pred0)
 
-    # SE via coefficient SE as approximation (exact delta method is complex
-    # with covariates; this is conservative for subgroup estimation)
+    # SE of rd_est by the delta method: the two-sample binomial SE when
+    # unadjusted, sqrt(g' V g) over every estimable coefficient when
+    # adjusted (.fs_rd_gcomp_se()).  The scaled-coefficient form
+    # abs(avg_deriv) * se_treat, which uses the treatment coefficient alone,
+    # is kept only as the adjusted branch's fallback.
     se_treat <- sqrt(diag(stats::vcov(fit_logit)))[[treat.name]]
     # Convert logistic SE to RD scale using average marginal effect
     avg_deriv <- mean(pred1 * (1 - pred1))
-    se_rd <- abs(avg_deriv) * se_treat
+    se_rd <- if (n_adj == 0L) {
+      # Unadjusted (A-055): the two-arm logistic model is saturated, so the
+      # arm means of pred0 and pred1 are the observed proportions p0 and p1,
+      # and the exact delta-method SE of rd_est is the two-sample binomial
+      # SE.  The scaled-coefficient form below drops the control arm's
+      # variance and degenerates when an arm is at 0% or 100%.  No weights
+      # reach this tier: the IPTW path (the only weighted one) returns
+      # above, and neither glm() call here takes a weights argument.
+      sqrt(p1 * (1 - p1) / n1 + p0 * (1 - p0) / n0)
+    } else {
+      # Adjusted (B1): the full delta method.  A value that is not a finite,
+      # non-negative number keeps the scaled-coefficient form (NA when the
+      # treatment coefficient is aliased, i.e. the effect is not
+      # estimable); the helper never errors, so no slice is routed to tier
+      # 3 by it.
+      se_dm <- .fs_rd_gcomp_se(fit_logit, nd0, nd1, pred0, pred1)
+      if (length(se_dm) == 1L && is.finite(se_dm) && se_dm >= 0) {
+        se_dm
+      } else {
+        abs(avg_deriv) * se_treat
+      }
+    }
 
     list(
       estimate    = rd_est,
@@ -555,6 +605,64 @@ make_effect_estimator <- function(
     measure     = "RD",
     method_used = "raw_means"
   )
+}
+
+
+#' Delta-method SE of the logistic g-computation risk difference
+#'
+#' The estimate is rd(b) = mean(plogis(X1 b)) - mean(plogis(X0 b)), with X1,
+#' X0 the design matrices of every row of the slice with treatment set to 1
+#' and to 0.  Its gradient in b is
+#' g = colMeans(p1 (1 - p1) X1) - colMeans(p0 (1 - p0) X0), and the SE is
+#' sqrt(g' V g) with V = vcov(fit).  Aliased coefficients (NA) are dropped
+#' from b, X1, X0 and V.  When any aliased column is one on which X1 and X0
+#' differ (a column that treatment changes), NA_real_ is returned, and the
+#' caller, .estimate_rd(), keeps its previous expression abs(avg_deriv) *
+#' se_treat.  This covers the slice where the treatment effect is not
+#' estimable: the treatment column itself is aliased when one arm is empty
+#' or has no observed outcome, dropping it would leave g = 0, and the
+#' previous expression is NA there.  It also covers an aliased user-supplied
+#' treatment-interaction column (e.g. adjust_covariates = c("site",
+#' "treat:age") with age constant and nonzero on the slice), where the
+#' treatment coefficient is estimable.
+#' The design matrices are built as predict.lm() builds them (the fit's
+#' terms, xlevels and contrasts), so the rows match p0 and p1, the fitted
+#' probabilities the estimate averages.
+#'
+#' @param fit A converged logistic glm.
+#' @param nd0,nd1 The slice with treatment set to 0 and to 1.
+#' @param p0,p1 Fitted probabilities for nd0 and nd1 (predict(type =
+#'   "response")).
+#' @return The SE, or NA_real_ when it is not a finite, non-negative number,
+#'   when an aliased column is one that treatment changes (see above), or
+#'   when any step fails (an error or a warning); never an error.
+#' @noRd
+.fs_rd_gcomp_se <- function(fit, nd0, nd1, p0, p1) {
+  tryCatch({
+    b   <- stats::coef(fit)
+    est <- names(b)[!is.na(b)]
+    al  <- names(b)[is.na(b)]
+    tt  <- stats::delete.response(stats::terms(fit))
+    design <- function(nd) {
+      mf <- stats::model.frame(tt, nd, na.action = stats::na.pass,
+                               xlev = fit$xlevels)
+      stats::model.matrix(tt, mf, contrasts.arg = fit$contrasts)
+    }
+    X0 <- design(nd0)
+    X1 <- design(nd1)
+    # Treatment changes an aliased column (stop -> NA; see above).
+    stopifnot(!any(X1[, al, drop = FALSE] != X0[, al, drop = FALSE],
+                   na.rm = TRUE))
+    X0 <- X0[, est, drop = FALSE]
+    X1 <- X1[, est, drop = FALSE]
+    stopifnot(length(p0) == nrow(X0), length(p1) == nrow(X1))
+    V <- stats::vcov(fit)[est, est, drop = FALSE]
+    g <- colMeans(p1 * (1 - p1) * X1) - colMeans(p0 * (1 - p0) * X0)
+    v <- sum(g * drop(V %*% g))
+    if (is.finite(v) && v >= 0) sqrt(v) else NA_real_
+  },
+  error   = function(e) NA_real_,
+  warning = function(w) NA_real_)
 }
 
 
@@ -946,7 +1054,13 @@ make_effect_estimator <- function(
 
     result <- tryCatch({
       if (ps_adjust_method == "iptw" && "sw" %in% names(data_slice)) {
-        fit <- stats::lm(fmla, data = data_slice, weights = data_slice$sw)
+        # `weights` is evaluated by model.frame() in `data` and then in the
+        # formula's environment.  `fmla` comes from .build_adjusted_formula(),
+        # whose frame does not hold `data_slice`, so `weights = data_slice$sw`
+        # never resolved and every weighted fit failed (0.4.0 and earlier).
+        # `sw` is a column of data_slice (the guard above), so it resolves in
+        # `data`.
+        fit <- stats::lm(fmla, data = data_slice, weights = sw)
       } else {
         fit <- stats::lm(fmla, data = data_slice)
       }
@@ -1092,6 +1206,117 @@ make_effect_estimator <- function(
         method_used = "ols_failed"
       )
     })
+
+    result
+  }
+}
+
+
+# ---------------------------------------------------------------------------
+# Unadjusted fast path, binary OR (0.4.0.9000)
+# ---------------------------------------------------------------------------
+
+#' Two-group logistic core, bit-identical to `glm()` + `coef()` + `vcov()`
+#'
+#' Fits `y ~ t` for an unadjusted, unweighted, offset-free two-group
+#' comparison via `stats::glm.fit()` on the explicit two-column model matrix
+#' -- the call `stats::glm()` makes for that formula (weights, start,
+#' etastart, mustart and offset at their defaults, `intercept = TRUE`,
+#' `singular.ok = TRUE`, `glm.control()`) -- then takes the treatment
+#' coefficient and its standard error by replicating `stats::summary.glm()`
+#' / `stats::vcov.glm()` operation for operation (R 4.6.1 sources):
+#' `p1 <- 1L:p`; `covmat.unscaled <- chol2inv(Qr$qr[p1, p1, drop = FALSE])`;
+#' `covmat <- dispersion * covmat.unscaled` with `dispersion = 1` for the
+#' binomial family (kept as `1 * ...` so the arithmetic is the same);
+#' `sqrt(diag(covmat))` at the treatment column.  A rank-deficient fit
+#' (single treatment arm) returns `estimate = NA` and `se = NA` without
+#' error, as the slow chain does.  `glm.fit()`'s own warnings ("fitted
+#' probabilities numerically 0 or 1 occurred", "algorithm did not converge")
+#' are raised exactly as through `glm()`: nothing is suppressed here.
+#'
+#' @param y Numeric vector. 0/1 outcome, already sliced, already on the
+#'   adverse scale.
+#' @param t Numeric or integer vector. Treatment indicator (0/1), same length.
+#' @param treat.name Character. The treatment column name `model.matrix()`
+#'   would use.
+#' @return List with `estimate`, `se` (doubles, possibly `NA`) and
+#'   `converged` (`glm.fit()`'s flag).
+#' @keywords internal
+#' @noRd
+.fs_logit_two_group <- function(y, t, treat.name) {
+  X <- cbind(1, t)
+  colnames(X) <- c("(Intercept)", treat.name)
+  fit <- stats::glm.fit(X, as.double(y),
+                        family = stats::binomial(link = "logit"))
+  coef_val <- fit$coefficients[[treat.name]]
+  p1 <- seq_len(fit$rank)
+  covmat <- 1 * chol2inv(fit$qr$qr[p1, p1, drop = FALSE])
+  # Column 2 is the treatment term; with the treatment column aliased
+  # (rank 1) the index is out of range and gives NA, as vcov(complete = TRUE)
+  # does for an aliased coefficient.
+  se_val <- unname(sqrt(diag(covmat))[2L])
+  list(estimate = coef_val, se = se_val, converged = fit$converged)
+}
+
+
+#' Fast unadjusted binary odds-ratio estimator closure
+#'
+#' Drop-in replacement for the `.make_glm_binary_estimator()` closure when
+#' `effect_measure = "OR"`, there is no covariate adjustment and no
+#' propensity adjustment: the routing predicate at the construction site
+#' (`forestsearch_main.R`) selects it, and every consumer of the closure
+#' works unchanged because the signature and the returned structure --
+#' fields, names, types, failure behaviour, the `reason` of a non-estimable
+#' slice -- are identical to the slow closure's, and the numbers are
+#' bit-identical (see `.fs_logit_two_group()`).  The search loop routes its
+#' per-candidate fit to the vector path on the `fs_fast_unadjusted`
+#' attribute; `fs_fast_core` in this closure's environment tells
+#' `fit_glm_for_subgroup_fast()` which core to run (the continuous closure
+#' carries no marker and keeps its OLS path).
+#'
+#' @keywords internal
+#' @noRd
+.make_glm_or_estimator_fast <- function(treat.name, outcome.name,
+                                        adverse_outcome = TRUE, ...) {
+  force(treat.name)
+  force(outcome.name)
+  force(adverse_outcome)
+  fs_fast_core <- "logit_or"
+
+  function(data_slice) {
+    # Sign convention as in .make_glm_binary_estimator(): Y -> 1 - Y when the
+    # outcome is beneficial, so that OR > 1 indicates treatment harm.
+    if (!adverse_outcome) {
+      data_slice[[outcome.name]] <- 1L - data_slice[[outcome.name]]
+    }
+
+    n0 <- sum(data_slice[[treat.name]] == 0L, na.rm = TRUE)
+    n1 <- sum(data_slice[[treat.name]] == 1L, na.rm = TRUE)
+
+    why <- .fs_existence_reason(
+      "OR",
+      .fs_binary_cells(data_slice[[outcome.name]], data_slice[[treat.name]]))
+    if (!is.null(why)) {
+      return(.fs_nonestimable(why, n0, n1, "log-OR", "nonestimable"))
+    }
+
+    result <- tryCatch({
+      core <- .fs_logit_two_group(data_slice[[outcome.name]],
+                                  data_slice[[treat.name]], treat.name)
+      list(estimate = core$estimate, se = core$se, converged = core$converged,
+           n0 = n0, n1 = n1, measure = "log-OR", method_used = "logistic")
+    },
+    error = function(e) {
+      list(estimate = NA_real_, se = NA_real_, converged = FALSE,
+           n0 = n0, n1 = n1, measure = "log-OR",
+           method_used = "logistic_failed_none")
+    })
+
+    # The slow closure's non-convergence rule, verbatim.
+    if (isFALSE(result$converged) && !is.na(result$estimate)) {
+      return(.fs_nonestimable("non-convergent fit", n0, n1,
+                              result$measure, result$method_used))
+    }
 
     result
   }

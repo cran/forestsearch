@@ -49,9 +49,18 @@
 #'   \code{hr.consistency} (`c2`).  Not an effect threshold.
 #'   Default: 0.90
 #' @param confounders.name Character vector. Confounder variable names for ForestSearch.
-#'   If NULL, automatically extracted from dgm
+#'   If NULL, automatically extracted from dgm: the columns of
+#'   \code{dgm$df_super} whose names start with \code{z_}, \code{ecog} or
+#'   \code{strat}, except that, for a mechanism built with a spline
+#'   (\code{dgm$model_params$spline_info}), the three internal columns of the
+#'   spline variable \code{<var>} are left out by their exact names
+#'   \code{<var>_treat}, \code{<var>_k} and \code{<var>_k_treat} (for
+#'   \code{\link{create_dgm_for_mrct}}: \code{z_bm_treat}, \code{z_bm_k},
+#'   \code{z_bm_k_treat}). A covariate such as \code{z_prior_treat} and the
+#'   region indicator stay in the set.
 #' @param conf_force Character vector. Forced cuts to consider in ForestSearch.
-#'   Default: c("z_age <= 65", "z_bm <= 0", "z_bm <= 1", "z_bm <= 2", "z_bm <= 5")
+#'   Default: NULL, which resolves to
+#'   c("z_age <= 65", "z_bm <= 0", "z_bm <= 1", "z_bm <= 2", "z_bm <= 5")
 #' @param fs_args Named list. Additional arguments passed directly to
 #'   \code{\link{forestsearch}} inside each simulation replicate. Use this to
 #'   control parameters not exposed by \code{mrct_region_sims} (e.g.,
@@ -65,7 +74,12 @@
 #'   Default: list() (uses forestsearch defaults)
 #' @param sim_args Named list. Additional arguments passed to
 #'   \code{\link{simulate_from_dgm}} inside each replicate (e.g.,
-#'   \code{rand_ratio}, \code{draw_treatment}).
+#'   \code{rand_ratio}, \code{draw_treatment}, \code{max_entry}, or
+#'   \code{entry_delay = list(var = "z_region", delay = a)} for a region
+#'   enrolling \code{a} time units later, redrawn every replicate).
+#'   If \code{dgm$df_super} has a column \code{entrytime}, it is passed as
+#'   \code{entry_var = "entrytime"} (one fixed entry time per
+#'   super-population row) and takes precedence over \code{entry_delay}.
 #'   Parameters already in the \code{mrct_region_sims} signature
 #'   (\code{analysis_time}, \code{cens_adjust}) take precedence.
 #'   Default: list(rand_ratio = 1, draw_treatment = TRUE)
@@ -85,6 +99,10 @@
 #'   \code{verbose_n_sims} simulation replicates. Set to 0 to suppress per-sim
 #'   output, or \code{Inf} to print all. Default: 2
 #' @param seed Integer. Base random seed for reproducibility. Default: NULL
+#' @param record Character. \code{"point"} (default) returns the point
+#'   estimates only, exactly as before this argument existed. \code{"full"}
+#'   adds, from the same simulated trials (nothing is redrawn), the
+#'   per-replicate record described under \emph{Full record} below.
 #'
 #' @return A data.table with simulation results containing:
 #' \describe{
@@ -107,6 +125,17 @@
 #'   \item{POhr_sg_train}{Potential outcome hazard ratio in subgroup (training)}
 #'   \item{hr_sg_null}{Subgroup HR when found, NA otherwise}
 #' }
+#' With \code{record = "full"}, the same table followed by the columns
+#' \code{TP_nonregion}, \code{FP_nonregion}, \code{FN_nonregion},
+#' \code{TN_nonregion}, \code{TP_region}, \code{FP_region},
+#' \code{FN_region}, \code{TN_region}, then the multiplier-resampling
+#' columns \code{mr_ci_method}, \code{mr_debiased_H}, \code{mr_ij_lower_H},
+#' \code{mr_ij_upper_H}, \code{mr_field_lower_1s_H}, \code{mr_debiased_Hc},
+#' \code{mr_ij_lower_Hc}, \code{mr_ij_upper_Hc},
+#' \code{mr_field_upper_1s_Hc}, \code{mr_field_upper_1s_s_Hc},
+#' \code{mr_bonf_lower_H}, \code{mr_bonf_upper_Hc}, \code{mr_p_hat_H},
+#' \code{mr_selection_rate}, and the attribute \code{"estimators"} (see
+#' \emph{Full record}).
 #'
 #' @details
 #' ## Simulation Process
@@ -125,6 +154,78 @@
 #' populations. It does not imply any prognostic effect. To include prognostic
 #' confounder effects, specify them when creating the DGM using
 #' \code{\link{create_dgm_for_mrct}} or \code{\link{generate_aft_dgm_flex}}.
+#'
+#' ## Full record
+#'
+#' With \code{record = "full"} the returned table is the \code{"point"}
+#' table with twenty-two columns added (eight counts, then fourteen
+#' multiplier-resampling columns) and a second table attached as an
+#' attribute, \code{est <- attr(res, "estimators")}; \code{res$hr_itt},
+#' \code{nrow(res)} and every \code{"point"} column are unchanged. (A
+#' data.table subset such as \code{res[order(sim)]} drops the attribute:
+#' take it first.)
+#'
+#' \code{estimators} has one row per trial and patient set:
+#' \code{itt_all} (all patients), \code{itt_nonregion}
+#' (\code{region_var == 0}), \code{itt_region} (\code{region_var == 1}),
+#' \code{region_Ghat} (the region outside the declared harm subgroup
+#' \eqn{\hat H}; the whole region in an undeclared trial),
+#' \code{region_Gstar} (the region with \code{flag_harm == 0}) and
+#' \code{Hstar_nonregion} (the non-region patients with
+#' \code{flag_harm == 1}). Columns: \code{sim}, \code{estimator},
+#' \code{n}, \code{n_exp}, \code{events_exp}, \code{events_ctl}; the
+#' unadjusted two-sample Cox fit \code{Surv(y_sim, event_sim) ~ treat_sim}
+#' on the set, \code{hr}, \code{lo}, \code{hi} (Wald 95\%) and
+#' \code{se_loghr} (a fit with an arm without events is kept; a fit that
+#' errors, e.g. on an empty set, gives \code{NA}); the targets on the same
+#' patients, \code{ahr} = \code{exp(mean(loghr_po))} and \code{cde} =
+#' \code{mean(exp(theta_1)) / mean(exp(theta_0))} (\code{NA} when the
+#' simulated trial lacks those columns); and \code{declared} (0/1, the
+#' trial's \code{any_found}). \code{itt_all} is unadjusted, so it equals
+#' \code{hr_itt} only when the trial has no \code{strat} column.
+#'
+#' The added columns of the per-trial table are the 2 x 2 counts of
+#' \eqn{\hat H} membership against \code{flag_harm == 1} over the
+#' non-region patients and over the region patients. \eqn{\hat H} is
+#' evaluated from the selected definition with \code{\link{get_dfpred}}
+#' (the route of \code{df.test}); it is empty in an undeclared trial, whose
+#' counts are kept.
+#'
+#' When the simulated trial has no \code{flag_harm} column, the
+#' \code{region_Gstar} and \code{Hstar_nonregion} rows are omitted and the
+#' counts are \code{NA}, with a message.
+#'
+#' After the counts come fourteen columns read from the trial's
+#' \code{forestsearch()} result \code{fs$mr_inference} (multiplier
+#' resampling, \code{fs_args = list(mr_inference = TRUE, ...)}; see
+#' \code{\link{fs_mr_inference}}), on the effect (HR) scale:
+#' \describe{
+#'   \item{\code{mr_ci_method}}{\code{ci_method}.}
+#'   \item{\code{mr_debiased_H}, \code{mr_ij_lower_H},
+#'     \code{mr_ij_upper_H}}{\code{debiased$est}, \code{$lower},
+#'     \code{$upper}: the de-biased estimate on \eqn{\hat H} and its
+#'     interval (IJ SE under \code{"ij"} and \code{"field"}, robust SE under
+#'     \code{"wald"}).}
+#'   \item{\code{mr_field_lower_1s_H}}{\code{field$lower_1s}.}
+#'   \item{\code{mr_debiased_Hc}, \code{mr_ij_lower_Hc},
+#'     \code{mr_ij_upper_Hc}}{\code{complement$debiased$est},
+#'     \code{$lower}, \code{$upper}.}
+#'   \item{\code{mr_field_upper_1s_Hc},
+#'     \code{mr_field_upper_1s_s_Hc}}{\code{field$complement$upper_1s} and
+#'     its studentized companion \code{field$complement$upper_1s_s}.}
+#'   \item{\code{mr_bonf_lower_H}, \code{mr_bonf_upper_Hc}}{
+#'     \code{field$joint$bonf_lower_H}, \code{field$joint$bonf_upper_Hc}.}
+#'   \item{\code{mr_p_hat_H}}{\code{reselection$p_hat[selected_index]}.}
+#'   \item{\code{mr_selection_rate}}{\code{selection_rate}.}
+#' }
+#' Each is \code{NA} when its element is absent: every one in a trial
+#' without \code{mr_inference} or without a declared subgroup (nothing to
+#' de-bias), or with the short MR return; the
+#' complement columns without \code{include_complement = TRUE}; the field
+#' columns unless \code{ci_method = "field"}; the complement field and
+#' Bonferroni columns without \code{field_complement = TRUE};
+#' \code{mr_p_hat_H} without \code{return_reselection = TRUE}. Under
+#' \code{record = "point"} none of these columns is added.
 #'
 #' @examples
 #' \dontrun{
@@ -184,8 +285,10 @@ mrct_region_sims <- function(
     parallel_args = list(plan = "multisession", workers = NULL, show_message = TRUE),
     details = FALSE,
     verbose_n_sims = 2L,
-    seed = NULL
+    seed = NULL,
+    record = c("point", "full")
 ) {
+  .fs_preserve_rng()
 
   # ===========================================================================
   # SECTION 1: INPUT VALIDATION
@@ -202,6 +305,8 @@ mrct_region_sims <- function(
   if (!region_var %in% names(dgm$df_super)) {
     stop("region_var '", region_var, "' not found in dgm$df_super")
   }
+
+  record <- match.arg(record)
 
   t_start <- proc.time()[3]
 
@@ -221,9 +326,19 @@ mrct_region_sims <- function(
     exclude_vars <- c("id", "treat", "tte", "event", "y_sim", "treat_sim",
                       "event_sim", "t_true", "c_time", "lin_pred_0", "lin_pred_1",
                       "loghr_po", "entrytime", "flag_harm")
+    # A mechanism built with a spline carries three internal columns of the
+    # spline variable: <var>_treat, <var>_k and <var>_k_treat. They are not
+    # baseline covariates. Exclude exactly these names (never a suffix match,
+    # which would also drop a covariate such as z_prior_treat).
+    spline_info <- dgm$model_params$spline_info
+    spline_helpers <- if (!is.null(spline_info)) {
+      paste0(spline_info$var, c("_treat", "_k", "_k_treat"))
+    } else {
+      character(0)
+    }
     confounders.name <- setdiff(
       all_vars[grepl("^z_|^ecog|^strat", all_vars)],
-      exclude_vars
+      c(exclude_vars, spline_helpers)
     )
   }
 
@@ -259,6 +374,8 @@ mrct_region_sims <- function(
   workers <- parallel_args$workers
   show_message <- null_or(parallel_args$show_message, TRUE)
 
+  old_plan <- future::plan()
+  on.exit(future::plan(old_plan), add = TRUE)
   if (plan_type == "sequential") {
     future::plan(future::sequential)
   } else {
@@ -293,8 +410,17 @@ mrct_region_sims <- function(
   # SECTION 4: RUN SIMULATIONS
   # ===========================================================================
 
-  # Setup progress handler (safe for callr and other backends)
+  # Setup progress handler (safe for callr and other backends); the caller's
+  # progressr.handlers option is restored on exit
+  old_handlers <- getOption("progressr.handlers")
+  on.exit(options(progressr.handlers = old_handlers), add = TRUE)
   progressr::handlers("progress")
+
+  # Internal helper bound locally: the worker expression resolves exported
+  # functions through the attached package only, so the record helper is
+  # shipped to the workers as a global.
+  full_record_fn <- .mrct_full_record
+  mr_record_fn <- .mrct_mr_record
 
   run_foreach <- function() {
     p <- progressr::progressor(along = seq_len(n_sims))
@@ -554,7 +680,7 @@ mrct_region_sims <- function(
       # -----------------------------------------------------------------------
       # Return results
       # -----------------------------------------------------------------------
-      data.table::data.table(
+      out_point <- data.table::data.table(
         sim = sim,
         n_itt = n_itt,
         hr_itt = hr_itt,
@@ -573,6 +699,17 @@ mrct_region_sims <- function(
         hr_sg_train = hr_sg_train,
         POhr_sg_train = POhr_sg_train
       )
+
+      if (record == "full") {
+        sg_harm <- if (any_found == 1) fs_result$sg.harm else NULL
+        full <- full_record_fn(dfs, region_var, sg_harm, sim, any_found)
+        out_point <- cbind(out_point, full$counts,
+                           mr_record_fn(if (any_found == 1)
+                                          fs_result$mr_inference else NULL))
+        out_point[, .estimators := list(list(full$estimators))]
+      }
+
+      out_point
     }
   }
 
@@ -594,6 +731,21 @@ mrct_region_sims <- function(
   results <- data.table::as.data.table(results)
   results[, hr_sg_null := data.table::fifelse(any_found == 0, NA_real_, hr_sg)]
 
+  if (record == "full") {
+    estimators <- data.table::rbindlist(results$.estimators)
+    results[, .estimators := NULL]
+    count_cols <- .mrct_count_cols()
+    mr_cols <- .mrct_mr_cols()
+    data.table::setcolorder(results, c(setdiff(names(results), c(count_cols, mr_cols)),
+                                       count_cols, mr_cols))
+    if (all(is.na(results$TP_region)) && nrow(results) > 0) {
+      message("mrct_region_sims(record = \"full\"): the simulated trials have no ",
+              "flag_harm column; the region_Gstar and Hstar_nonregion rows are ",
+              "omitted and the H-hat confusion counts are NA.")
+    }
+    data.table::setattr(results, "estimators", estimators)
+  }
+
   # ===========================================================================
   # SECTION 6: REPORT SUMMARY
   # ===========================================================================
@@ -613,6 +765,143 @@ mrct_region_sims <- function(
   }
 
   return(results)
+}
+
+
+# =============================================================================
+# Full per-replicate record (record = "full")
+# =============================================================================
+
+#' Names of the H-hat confusion columns of the full record
+#' @noRd
+.mrct_count_cols <- function() {
+  paste0(rep(c("TP", "FP", "FN", "TN"), 2),
+         rep(c("_nonregion", "_region"), each = 4))
+}
+
+#' Names of the multiplier-resampling columns of the full record
+#' @noRd
+.mrct_mr_cols <- function() {
+  c("mr_ci_method", "mr_debiased_H", "mr_ij_lower_H", "mr_ij_upper_H",
+    "mr_field_lower_1s_H", "mr_debiased_Hc", "mr_ij_lower_Hc", "mr_ij_upper_Hc",
+    "mr_field_upper_1s_Hc", "mr_field_upper_1s_s_Hc", "mr_bonf_lower_H",
+    "mr_bonf_upper_Hc", "mr_p_hat_H", "mr_selection_rate")
+}
+
+#' The multiplier-resampling columns of one trial's full record
+#'
+#' @param mr `fs_result$mr_inference`, or NULL (no MR, or no declaration).
+#' @return A one-row data.table with the .mrct_mr_cols() columns; NA where
+#'   the element is absent.
+#' @noRd
+.mrct_mr_record <- function(mr) {
+  num <- function(x) {
+    if (is.null(x) || length(x) != 1L || !is.numeric(x)) NA_real_ else as.numeric(x)
+  }
+  g <- function(...) {
+    x <- mr
+    for (k in c(...)) {
+      if (!is.list(x) || is.null(x[[k]])) return(NULL)
+      x <- x[[k]]
+    }
+    x
+  }
+  p_hat <- g("reselection", "p_hat")
+  sel <- g("selected_index")
+  p_hat_H <- if (!is.null(p_hat) && length(sel) == 1L && !is.na(sel) &&
+                 sel >= 1L && sel <= length(p_hat)) p_hat[[sel]] else NULL
+  ci <- g("ci_method")
+  data.table::data.table(
+    mr_ci_method           = if (is.character(ci) && length(ci) == 1L) ci else NA_character_,
+    mr_debiased_H          = num(g("debiased", "est")),
+    mr_ij_lower_H          = num(g("debiased", "lower")),
+    mr_ij_upper_H          = num(g("debiased", "upper")),
+    mr_field_lower_1s_H    = num(g("field", "lower_1s")),
+    mr_debiased_Hc         = num(g("complement", "debiased", "est")),
+    mr_ij_lower_Hc         = num(g("complement", "debiased", "lower")),
+    mr_ij_upper_Hc         = num(g("complement", "debiased", "upper")),
+    mr_field_upper_1s_Hc   = num(g("field", "complement", "upper_1s")),
+    mr_field_upper_1s_s_Hc = num(g("field", "complement", "upper_1s_s")),
+    mr_bonf_lower_H        = num(g("field", "joint", "bonf_lower_H")),
+    mr_bonf_upper_Hc       = num(g("field", "joint", "bonf_upper_Hc")),
+    mr_p_hat_H             = num(p_hat_H),
+    mr_selection_rate      = num(g("selection_rate"))
+  )
+}
+
+#' One estimator row of the full record on the patients `idx` of trial `s`
+#'
+#' The unadjusted two-sample Cox fit (errors give NA; a fit with an arm
+#' without events is kept, as safe_coxph()), from one summary(), and the
+#' targets AHR = exp(mean(loghr_po)) and CDE = mean(exp(theta_1)) /
+#' mean(exp(theta_0)) on the same patients.
+#' @noRd
+.mrct_record_fit <- function(s, idx) {
+  d <- s[idx]
+  ex <- d$treat_sim == 1
+  f <- tryCatch(
+    suppressWarnings(summary(survival::coxph(
+      survival::Surv(y_sim, event_sim) ~ treat_sim, data = d))),
+    error = function(e) NULL
+  )
+  ok <- !is.null(f) && is.numeric(f$conf.int[1])
+  data.table::data.table(
+    n = nrow(d),
+    n_exp = sum(ex),
+    events_exp = sum(d$event_sim[ex]),
+    events_ctl = sum(d$event_sim[!ex]),
+    hr = if (ok) unname(f$conf.int[1, "exp(coef)"]) else NA_real_,
+    lo = if (ok) unname(f$conf.int[1, "lower .95"]) else NA_real_,
+    hi = if (ok) unname(f$conf.int[1, "upper .95"]) else NA_real_,
+    se_loghr = if (ok) unname(f$coefficients[1, "se(coef)"]) else NA_real_,
+    ahr = if ("loghr_po" %in% names(d)) exp(mean(d$loghr_po)) else NA_real_,
+    cde = if (all(c("theta_1", "theta_0") %in% names(d))) {
+      mean(exp(d$theta_1)) / mean(exp(d$theta_0))
+    } else NA_real_
+  )
+}
+
+#' The full record of one simulated trial
+#'
+#' @param dfs The trial (data.table), as drawn in the replicate.
+#' @param region_var Region indicator column.
+#' @param sg_harm The selected subgroup definition (fs_result$sg.harm), or
+#'   NULL when no subgroup is declared.
+#' @param sim Replicate index.
+#' @param any_found 0/1.
+#' @return list(estimators = data.table, counts = one-row data.table)
+#' @noRd
+.mrct_full_record <- function(dfs, region_var, sg_harm, sim, any_found) {
+  reg <- dfs[[region_var]] == 1
+  H <- if (is.null(sg_harm)) {
+    rep(FALSE, nrow(dfs))
+  } else {
+    get_dfpred(as.data.frame(dfs), sg.harm = sg_harm, version = 2)$treat.recommend == 0
+  }
+  has_band <- "flag_harm" %in% names(dfs)
+  band <- if (has_band) dfs$flag_harm == 1 else NULL
+
+  sets <- list(itt_all = rep(TRUE, nrow(dfs)), itt_nonregion = !reg,
+               itt_region = reg, region_Ghat = reg & !H)
+  if (has_band) {
+    sets$region_Gstar <- reg & !band
+    sets$Hstar_nonregion <- !reg & band
+  }
+  est <- data.table::rbindlist(lapply(names(sets), function(k) {
+    cbind(data.table::data.table(sim = sim, estimator = k),
+          .mrct_record_fit(dfs, sets[[k]]))
+  }))
+  est[, declared := as.integer(any_found)]
+
+  cc <- function(h, b) c(sum(h & b), sum(h & !b), sum(!h & b), sum(!h & !b))
+  counts <- if (has_band) {
+    as.integer(c(cc(H[!reg], band[!reg]), cc(H[reg], band[reg])))
+  } else {
+    rep(NA_integer_, 8)
+  }
+  counts <- data.table::as.data.table(as.list(stats::setNames(counts, .mrct_count_cols())))
+
+  list(estimators = est, counts = counts)
 }
 
 
@@ -1015,8 +1304,8 @@ create_dgm_for_mrct <- function(
 #'   Default: NULL (auto).
 #' @param show_summary Logical. Annotate each violin with mean (SD) below
 #'   the x-axis labels. When trimming is active, displays trimmed
-#'   statistics. Default: TRUE when \code{trim_fraction} is non-NULL,
-#'   FALSE otherwise.
+#'   statistics. Default: \code{NULL}, which resolves to \code{TRUE} when
+#'   \code{trim_fraction} is non-NULL and \code{FALSE} otherwise.
 #' @param title Character. Plot title. Default: "Distribution of HR
 #'   Estimates Across Simulations".
 #' @param subtitle Character or NULL. Plot subtitle. When trimming is
@@ -1037,7 +1326,7 @@ create_dgm_for_mrct <- function(
 #'
 #' @examples
 #' \dontrun{
-#' # Default (no trimming) — backward compatible
+#' # Default (no trimming) -- backward compatible
 #' plot_results <- SGplot_estimates(
 #'   results_alt,
 #'   label_training = "Non-Region A, ITT",

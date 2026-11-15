@@ -3,14 +3,24 @@
 #' @param data Original dataset to bootstrap from
 #' @param continuous_vars Character vector of continuous variable names
 #' @param cat_vars Character vector of categorical variable names
-#' @param n Number of synthetic observations to generate (default: same as original)
+#' @param n Number of synthetic observations to generate (default: NULL, meaning same as original)
 #' @param seed Random seed for reproducibility
 #' @param noise_level Noise level for perturbation (0 to 1, default 0.1)
 #' @param id_var Optional name of ID variable to regenerate (will be numbered 1:n)
-#' @param cat_flip_prob Probability of flipping categorical values (default: noise_level/2)
+#' @param cat_flip_prob Probability of flipping categorical values (default: NULL, giving noise_level/2)
 #' @param preserve_bounds Logical: should continuous variables stay within original bounds? (default: TRUE)
-#' @param ordinal_vars Optional character vector of ordinal categorical variables
-#'                     (these will be perturbed to adjacent values rather than randomly flipped)
+#' @param ordinal_vars Optional character vector naming which of the
+#'   \code{cat_vars} are ordinal. A numeric or character variable listed in
+#'   both \code{cat_vars} and \code{ordinal_vars} is changed to a neighbouring
+#'   level (in sorted order) instead of a random other level. A factor listed
+#'   in both is set to NA, with a warning, at each row selected for change,
+#'   unless its levels are "1", "2", ... in that order. A variable listed only
+#'   in \code{ordinal_vars} is not perturbed: it is kept as resampled and is
+#'   named in the 'kept as-is' message. Known limitation: for a numeric-coded
+#'   variable at its lowest or highest level, the new value is not always the
+#'   adjacent level (with codes 1, ..., k, a row at 1 that is selected for
+#'   change keeps its value half the time, and a row at k moves to any of
+#'   1, ..., k - 1 with equal probability).
 #'
 #' @return A data frame with synthetic data
 #'
@@ -21,6 +31,8 @@
 #'   data = survival::gbsg,
 #'   continuous_vars = c("age", "size", "nodes", "pgr", "er", "rfstime"),
 #'   cat_vars = c("meno", "hormon", "status"),
+#'   # listed only in ordinal_vars, so it is resampled but not perturbed;
+#'   # list it in cat_vars as well to perturb it
 #'   ordinal_vars = c("grade"),
 #'   id_var = "pid",
 #'   n = 1000,
@@ -43,6 +55,8 @@
 #'   data = my_data,
 #'   continuous_vars = c("height", "weight", "age"),
 #'   cat_vars = c("gender", "smoker"),
+#'   # listed only in ordinal_vars, so it is resampled but not perturbed;
+#'   # list it in cat_vars as well to perturb it
 #'   ordinal_vars = c("education"),
 #'   id_var = "id",
 #'   n = 150,
@@ -142,6 +156,8 @@ generate_bootstrap_synthetic <- function(data,
   # Perturb categorical variables
   # ================================================================================
 
+  # Behaviour kept as is by decision (2026-11-12): the loop runs over cat_vars
+  # only; see the help page for ordinal_vars.
   for (var in cat_vars) {
     # Determine which indices to flip
     flip_indices <- which(runif(n) < cat_flip_prob)
@@ -165,6 +181,9 @@ generate_bootstrap_synthetic <- function(data,
         if (current_pos < length(unique_vals)) possible_new <- c(possible_new, unique_vals[current_pos + 1])
 
         if (length(possible_new) > 0) {
+          # Known limitation, documented in the help page; behaviour kept as is
+          # by decision (2026-11-12). (At an end level possible_new holds one
+          # number v, and sample(v, 1) draws from 1:v when v >= 1.)
           synthetic_data[[var]][i] <- sample(possible_new, 1)
         }
       }
@@ -346,11 +365,20 @@ detect_variable_types <- function(data, max_unique_for_cat = 10, exclude_vars = 
 
 #' Generate Synthetic GBSG Data using Generalized Bootstrap
 #'
+#' Calls \code{\link{generate_bootstrap_synthetic}()} on \code{survival::gbsg}
+#' with fixed variable lists. \code{grade} is passed in \code{ordinal_vars}
+#' only, so it is resampled but not perturbed.
+#'
 #' @param n Number of observations
 #' @param seed Random seed
 #' @param noise_level Noise level for perturbation
 #'
 #' @return Synthetic GBSG dataset
+#' @section Superseded:
+#' This GBSG-specific wrapper is kept for existing code. New work should call
+#' \code{\link{generate_bootstrap_synthetic}()} directly: the call in its first
+#' example, with the same \code{n}, \code{seed} and \code{noise_level},
+#' returns the same data. This wrapper will be deprecated in a future release.
 #' @examples
 #' \dontrun{
 #' df_synth <- generate_gbsg_bootstrap_general(n = 200, seed = 42)
@@ -363,7 +391,7 @@ generate_gbsg_bootstrap_general <- function(n = 686, seed = 123, noise_level = 0
 
   # Load gbsg data into local environment
   gbsg <- NULL  # Avoid R CMD check NOTE
-  data("gbsg", package = "survival", envir = environment())
+  gbsg <- survival::gbsg
 
   synthetic_data <- generate_bootstrap_synthetic(
     data = gbsg,
@@ -382,8 +410,14 @@ generate_gbsg_bootstrap_general <- function(n = 686, seed = 123, noise_level = 0
 
 #' Generate Bootstrap Sample with Added Noise
 #'
-#' Creates a bootstrap sample from a dataset with controlled noise added to both
-#' continuous and categorical variables. This function is useful for generating
+#' Creates a bootstrap sample from a dataset and adds controlled noise.
+#' Continuous columns receive Gaussian noise; categorical columns are changed
+#' with a small probability. By default every numeric column except
+#' \code{id_var} is continuous and every factor or logical column is
+#' categorical. Numeric-coded categories (for example 0/1 indicators) are
+#' therefore treated as continuous unless \code{continuous_vars} is given
+#' without them; naming them in \code{cat_vars} alone adds the categorical
+#' change without removing the noise. This function is useful for generating
 #' synthetic datasets that maintain the general structure of the original data
 #' while introducing controlled variation.
 #'
@@ -391,10 +425,20 @@ generate_gbsg_bootstrap_general <- function(n = 686, seed = 123, noise_level = 0
 #' @param n Integer. Number of observations in the output dataset. If NULL (default),
 #'   uses the same number of rows as the input data.
 #' @param continuous_vars Character vector of column names to treat as continuous
-#'   variables. If NULL (default), automatically detects numeric columns.
-#' @param cat_vars Character vector of column names to treat as categorical variables.
-#'   If NULL (default), automatically detects factors, logical columns, and numeric
-#'   columns with 10 or fewer unique values.
+#'   variables. If NULL (default), every numeric column except \code{id_var} is
+#'   used, including numeric columns with few distinct values. A column named
+#'   here must be numeric: a factor or character column stops the call with an
+#'   error, and a logical column is returned as a numeric 0/1 column.
+#' @param cat_vars Character vector of column names to treat as categorical
+#'   variables. If NULL (default), factor and logical columns are used, together
+#'   with numeric columns that have 10 or fewer unique values; columns in
+#'   \code{continuous_vars} and \code{id_var} are left out, and character
+#'   columns are not used. When \code{continuous_vars} is also NULL, every
+#'   numeric column other than \code{id_var} is already in the continuous set,
+#'   so no numeric column is treated as categorical. When \code{cat_vars} is
+#'   given and \code{continuous_vars} is NULL, a numeric column named here is
+#'   also in the auto-detected continuous set and receives both kinds of change;
+#'   give \code{continuous_vars} as well to avoid this.
 #' @param id_var Character string specifying the name of the ID variable column.
 #'   This column will be reset to sequential values (1:n) in the output.
 #'   Default is "pid".
@@ -404,8 +448,12 @@ generate_gbsg_bootstrap_general <- function(n = 686, seed = 123, noise_level = 0
 #'   determine noise magnitude. For categorical variables, this is divided by 2
 #'   to determine the probability of value changes. Default is 0.1.
 #'
-#' @return A data frame with the same structure as the input data, containing
-#'   bootstrap sampled observations with added noise.
+#' @return A data frame of \code{n} rows, with the columns of \code{data} in
+#'   the same order and row names \code{1:n}, containing bootstrap sampled
+#'   observations with added noise. Column types are kept, except that every
+#'   column in \code{continuous_vars} is returned as double (an integer column
+#'   comes back double, holding whole numbers) and \code{id_var}, if present,
+#'   is replaced by the integer sequence \code{1:n}.
 #'
 #' @details
 #' The function performs the following operations:
@@ -416,18 +464,26 @@ generate_gbsg_bootstrap_general <- function(n = 686, seed = 123, noise_level = 0
 #'
 #' \subsection{Continuous Variable Noise}{
 #'   \itemize{
-#'     \item Adds Gaussian noise with standard deviation = original SD × noise_level
+#'     \item Adds Gaussian noise with standard deviation = original SD times noise_level
 #'     \item Constrains values to remain within original variable bounds
-#'     \item Preserves integer type for variables that appear to be integers
+#'     \item Rounds to whole numbers the variables that appear to be integers
+#'       (see below); the column is returned as double, not integer
+#'     \item Leaves missing values missing
 #'   }
+#'   Integer-valued columns (every non-missing value a whole number) are
+#'   rounded after the noise is added, so a 0/1 column treated as continuous is
+#'   usually unchanged at a small \code{noise_level}.
 #' }
 #'
 #' \subsection{Categorical Variable Perturbation}{
+#'   Applies to the columns in \code{cat_vars}, given or auto-detected as
+#'   described for that argument.
 #'   \itemize{
 #'     \item Changes values with probability = noise_level / 2
 #'     \item Binary variables: flips to opposite value
 #'     \item Multi-level unordered: randomly selects from other levels
-#'     \item Ordered factors: weights selection toward adjacent levels
+#'     \item Ordered factors, or a column named \code{grade}, with more than two
+#'       levels: selection is weighted toward adjacent levels
 #'     \item Preserves factor levels and ordering from original data
 #'   }
 #' }
@@ -435,9 +491,11 @@ generate_gbsg_bootstrap_general <- function(n = 686, seed = 123, noise_level = 0
 #' @examples
 #' \dontrun{
 #' # Load example dataset
-#' data(gbsg, package = "survival")
+#' gbsg <- survival::gbsg
 #'
 #' # Basic usage with automatic variable detection
+#' # (all gbsg columns are numeric, so all except pid, the id_var, are
+#' # treated as continuous)
 #' synthetic_data <- generate_bootstrap_with_noise(
 #'   data = gbsg,
 #'   seed = 123
@@ -464,10 +522,25 @@ generate_gbsg_bootstrap_general <- function(n = 686, seed = 123, noise_level = 0
 #' \itemize{
 #'   \item The function assumes that categorical variables with numeric encoding
 #'     should maintain their numeric type unless they are factors in the input
-#'   \item Missing values (NA) are handled appropriately in calculations but
-#'     are not imputed
-#'   \item For ordered factors or variables named "grade", the perturbation
-#'     favors transitions to adjacent levels over distant levels
+#'   \item Missing values (NA) in a column treated only as continuous (not
+#'     also in \code{cat_vars}) stay missing. In a
+#'     categorical column a missing value is selected for change with the same
+#'     probability, \code{noise_level / 2}, as any other value; if it is not
+#'     selected it stays missing. A selected missing value in an ordered
+#'     factor, or a column named \code{grade}, with more than two levels stops
+#'     the call with the error "replacement has length zero". Otherwise, in a
+#'     column with two levels (for a non-factor column, two distinct
+#'     non-missing values in \code{data}) it is replaced by the first level
+#'     (for a non-factor column, the smallest value); in a column with more
+#'     than two levels, by a level drawn at random from all its levels; and in
+#'     a column with fewer than two levels (for a non-factor column, fewer than
+#'     two distinct non-missing values) it stays missing.
+#'   \item For an ordered factor, or a column named \code{grade}, that is
+#'     processed as categorical and has more than two levels, the perturbation
+#'     favors adjacent levels. A numeric \code{grade} column is processed as
+#'     categorical only when it is named in \code{cat_vars}, or when
+#'     \code{cat_vars} is NULL, \code{continuous_vars} is given without it and
+#'     it has 10 or fewer unique values.
 #' }
 #'
 #' @seealso
@@ -510,6 +583,8 @@ generate_bootstrap_with_noise <- function(data,
     n <- nrow(data)
   }
 
+  # By design (L. Leon, 2026-11-12): under auto-detection every numeric column
+  # except id_var is continuous. Not a defect; see the help page.
   # Auto-detect variable types if not specified
   if (is.null(continuous_vars)) {
     continuous_vars <- names(data)[vapply(data, is.numeric, logical(1))]

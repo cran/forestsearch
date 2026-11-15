@@ -165,7 +165,11 @@ early_stop_decision <- function(n_success, n_total, threshold,
 #'   Ignored when `adjust_covariates` is supplied (the default coxph
 #'   starting values are used so the init length matches the number of
 #'   model coefficients).
-#' @param adjust_covariates Character vector or `NULL`. Additional terms
+#' @param adjust_covariates This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character vector or `NULL`. Additional terms
 #'   appended to the model right-hand side after `Treat`.  Terms are pasted
 #'   verbatim, so `"strata(x1)"` produces a stratified Cox model.  The
 #'   referenced columns must be present in `df`.  `NULL` (default) fits the
@@ -236,7 +240,11 @@ get_split_hr_fast <- function(df, cox_init = 0, adjust_covariates = NULL) {
 #'   (uses Cox model).
 #' @param consistency_threshold Numeric or \code{NULL}. Threshold for GLM
 #'   consistency evaluation.  Default \code{NULL} (uses \code{hr.consistency}).
-#' @param adjust_covariates Character vector or \code{NULL}. Additional Cox
+#' @param adjust_covariates This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character vector or \code{NULL}. Additional Cox
 #'   model terms (e.g. \code{"strata(x1)"}) passed to
 #'   \code{\link{get_split_hr_fast}} on the survival path.  Ignored on the
 #'   GLM path.  Default \code{NULL} (unadjusted).
@@ -326,8 +334,12 @@ run_single_consistency_split <- function(df.x, N.x, hr.consistency, cox_init = 0
 #' model coefficient with a well-defined influence function. That holds for
 #' OR/RR (logistic / log-binomial), RD (identity-link binomial), MD (OLS), and
 #' IRR (Poisson with offset). It does not hold for IRD (a delta-method rate
-#' difference) or propensity-adjusted (IPTW / G-computation) effects, for which
-#' the caller falls back to literal splitting.
+#' difference), for which the caller falls back to literal splitting.
+#' The decision reads `spec$effect_measure` only.  The spec carries no
+#' propensity setting, so a propensity-adjusted (IPTW / G-computation)
+#' analysis with a supported measure also takes the resampling path, whose
+#' model is fitted without the propensity weights (see
+#' `.consistency_glm_pieces()`).
 #'
 #' @param spec List; the `glm_resample_spec` threaded from [forestsearch()].
 #' @return Logical scalar.
@@ -1020,7 +1032,9 @@ plot_subgroup <- function(df.sub, df.subC, by.risk, confs_labels, this.1_label, 
 #' \dontrun{
 #' # sg_consistency_out is called internally by forestsearch().
 #' # See forestsearch() for the standard entry point.
-#' fs <- forestsearch(gbsg,
+#' gbsg <- survival::gbsg
+#' gbsg$grade3 <- as.integer(gbsg$grade == 3)
+#' fs <- forestsearch(gbsg, id.name = "pid",
 #'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
 #'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
 #' fs$grp.consistency$out_sg
@@ -1320,7 +1334,11 @@ remove_redundant_subgroups <- function(found.hrs) {
 #'   (uses Cox model).
 #' @param consistency_threshold Numeric or \code{NULL}. Threshold for GLM
 #'   consistency evaluation.  Default \code{NULL} (uses \code{hr.consistency}).
-#' @param adjust_covariates Character vector or \code{NULL}. Additional Cox
+#' @param adjust_covariates This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character vector or \code{NULL}. Additional Cox
 #'   model terms (e.g. \code{"strata(x1)"}) used when scoring survival
 #'   subgroups.  Referenced columns must be present in \code{df}.  Ignored
 #'   on the GLM path.  Default \code{NULL} (unadjusted).
@@ -1346,7 +1364,9 @@ remove_redundant_subgroups <- function(found.hrs) {
 #' \dontrun{
 #' # evaluate_subgroup_consistency() is called internally by forestsearch().
 #' # Use forestsearch() as the entry point:
-#' fs <- forestsearch(gbsg,
+#' gbsg <- survival::gbsg
+#' gbsg$grade3 <- as.integer(gbsg$grade == 3)
+#' fs <- forestsearch(gbsg, id.name = "pid",
 #'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
 #'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
 #' }
@@ -1607,7 +1627,11 @@ evaluate_subgroup_consistency <- function(
 #'   (uses Cox model).
 #' @param consistency_threshold Numeric or \code{NULL}. Threshold for GLM
 #'   consistency evaluation.  Default \code{NULL} (uses \code{hr.consistency}).
-#' @param adjust_covariates Character vector or \code{NULL}. Additional Cox
+#' @param adjust_covariates This option is implemented but has not been
+#'   tested against the manuscript analyses or the simulation studies of
+#'   León and Anderson (2026a, 2026b), which use the unadjusted
+#'   treatment-only fits.
+#'   Character vector or \code{NULL}. Additional Cox
 #'   model terms (e.g. \code{"strata(x1)"}) used when scoring survival
 #'   subgroups.  Referenced columns must be present in \code{df}.  Ignored
 #'   on the GLM path.  Default \code{NULL} (unadjusted).
@@ -1626,7 +1650,9 @@ evaluate_subgroup_consistency <- function(
 #' \dontrun{
 #' # evaluate_consistency_twostage() is called internally by forestsearch()
 #' # when use_twostage = TRUE. Use forestsearch() as the entry point:
-#' fs <- forestsearch(gbsg,
+#' gbsg <- survival::gbsg
+#' gbsg$grade3 <- as.integer(gbsg$grade == 3)
+#' fs <- forestsearch(gbsg, id.name = "pid",
 #'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
 #'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status",
 #'   use_twostage = TRUE)

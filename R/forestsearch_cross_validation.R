@@ -187,7 +187,8 @@
 #'
 #' @param fs.est List. ForestSearch results object from \code{\link{forestsearch}}.
 #'   Must contain \code{df.est} (data frame) and \code{args_call_all} (list of arguments).
-#' @param Kfolds Integer. Number of folds (default: \code{nrow(fs.est$df.est)} for LOO).
+#' @param Kfolds Integer. Number of folds (default: \code{nrow(fs.est$df.est)} for LOO;
+#'   when no subgroup was found, the number of rows of the original analysis data).
 #' @param seedit Integer. Random seed for fold assignment (default: 8316951).
 #' @param parallel_args List. Parallelization configuration with elements:
 #'   \itemize{
@@ -294,6 +295,7 @@ forestsearch_Kfold <- function(
     details = FALSE,
     mr_in_replicates = FALSE
 ) {
+  .fs_preserve_rng()
 
   # ===========================================================================
   # SECTION 1: INPUT VALIDATION
@@ -548,6 +550,18 @@ forestsearch_Kfold <- function(
       if (inherits(x, "condition")) NULL else attr(x, "mr_rep")) else NULL
 
   resCV <- .collect_cv_results(resCV)
+
+  # Held-out subjects with no subgroup assignment (a missing value in a
+  # covariate of their fold's subgroup).  One warning for the call, raised
+  # here in the calling session after the folds are collected (the fold loop
+  # runs under suppressWarnings()); the assignments are returned as they are.
+  n_na_cv <- sum(is.na(resCV$treat.recommend))
+  if (n_na_cv > 0L)
+    warning(sprintf(paste0("%d of %d held-out subjects have no subgroup ",
+                           "assignment (treat.recommend is NA): a covariate ",
+                           "that defines their fold's subgroup has missing ",
+                           "values."), n_na_cv, nrow(resCV)),
+            call. = FALSE)
 
   # ===========================================================================
   # SECTION 7: POST-PROCESSING AND VALIDATION
@@ -810,6 +824,7 @@ forestsearch_tenfold <- function(
     keep_resCV = FALSE,
     mr_in_replicates = FALSE
 ) {
+  .fs_preserve_rng()
 
   # ===========================================================================
   # SECTION 1: INPUT VALIDATION
@@ -990,6 +1005,11 @@ forestsearch_tenfold <- function(
     # candidates passed the threshold); NA_integer_ when the training
     # FS call errored or consistency evaluation did not run at all.
     n_candidates_list <- rep(NA_integer_, Kfolds)
+
+    # The K forestsearch() calls below run one after another in this
+    # evaluation; in a worker they must not restore the generator between
+    # folds (see .fs_rng_hold()).
+    .fs_rng_hold()
 
     for (cv_index in seq_len(Kfolds)) {
       testIndexes <- which(folds == cv_index, arr.ind = TRUE)
@@ -1173,7 +1193,11 @@ forestsearch_tenfold <- function(
       sim_id                = ksim,
       fold_summary          = fold_summary_i,
       resCV                 = if (isTRUE(keep_resCV)) resCV else NULL,
-      mr_replicates         = if (isTRUE(mr_in_replicates)) mr_list else NULL
+      mr_replicates         = if (isTRUE(mr_in_replicates)) mr_list else NULL,
+      # NA held-out assignments, counted here and reported by the caller
+      # (one warning per call, after collection); not part of the result.
+      n_na_assign           = sum(is.na(resCV$treat.recommend)),
+      n_assign              = nrow(resCV)
     )
   }
 })
@@ -1197,6 +1221,20 @@ forestsearch_tenfold <- function(
   if (length(valid_results) < sims && details) {
     warning(sims - length(valid_results), " simulations failed and were excluded.")
   }
+
+  # Held-out assignments with no subgroup (see forestsearch_Kfold()): one
+  # warning for the call, raised here in the calling session from the
+  # per-simulation counts, after the simulations are collected.
+  n_na_cv <- sum(vapply(valid_results, `[[`, integer(1), "n_na_assign"))
+  if (n_na_cv > 0L)
+    warning(sprintf(paste0("%d of %d held-out assignments across %d ",
+                           "simulations have no subgroup assignment ",
+                           "(treat.recommend is NA): a covariate that defines ",
+                           "the fold's subgroup has missing values."),
+                    n_na_cv,
+                    sum(vapply(valid_results, `[[`, integer(1), "n_assign")),
+                    length(valid_results)),
+            call. = FALSE)
 
   sens_out <- do.call(rbind, lapply(valid_results, `[[`, "sens_metrics_original"))
   find_out <- do.call(rbind, lapply(valid_results, `[[`, "find_metrics"))
@@ -1285,6 +1323,20 @@ forestsearch_tenfold <- function(
 #'
 #' @return If \code{outall=FALSE}, a list with \code{sens_metrics_original} and
 #'   \code{find_metrics}. If \code{outall=TRUE}, a list with summary tables and metrics.
+#'   For GLM outcomes the tables (\code{itt_tab}, \code{SG_tab_original},
+#'   \code{SG_tab_Kfold}, \code{tab_all}) are built by
+#'   \code{\link{SG_tab_estimates_glm}}.  Their effect column follows the
+#'   fit's orientation (the fit's stored \code{adverse_outcome} or, when
+#'   none is stored, \code{\link{forestsearch}}'s rule: \code{TRUE} for
+#'   binary and count outcomes, \code{FALSE} otherwise), while, for a fit
+#'   with the default \code{est.scale = "hr"}, the arm columns
+#'   (\code{Rate(C)} or \code{Mean(C)}, \code{Rate(T)} or \code{Mean(T)})
+#'   and their raw difference \code{Diff} (treated minus control) do not.
+#'   So for an unadjusted fit where a lower outcome is
+#'   adverse (\code{adverse_outcome = FALSE}, the default for continuous
+#'   outcomes) the effect and \code{Diff} have opposite signs.  Count
+#'   outcomes and the rate measures (IRR, IRD) are not reoriented.  See
+#'   \code{\link{sg_tables}} for the details.
 #'
 
 #' @examples
@@ -1406,18 +1458,38 @@ forestsearch_KfoldOut <- function(res, details = FALSE, outall = FALSE,
     names(find_metrics) <- c("Any", "Exact", "At least 1", "Cov1", "Cov2",
                              "Cov 1 & 2", "Cov1 exact", "Cov2 exact")
 
-    if (n_sgfound == 2) {
-      tabit <- with(df_CV, table(treat.recommend, treat.recommend.original))
+    # Fold-by-original table (table() leaves out NA assignments).  Fold
+    # assignments {1, NA} or {0, NA} count as two values in n_sgfound but
+    # give a one-row table, so the two-level branch is taken only when the
+    # table has two rows and two columns; other shapes use the single-level
+    # branch.
+    tabit <- with(df_CV, table(treat.recommend, treat.recommend.original))
+    if (n_sgfound == 2 && nrow(tabit) == 2L && ncol(tabit) == 2L) {
       sensH <- tabit[1, 1] / sum(tabit[, 1])
       sensHc <- tabit[2, 2] / sum(tabit[, 2])
       ppvH <- tabit[1, 1] / sum(tabit[1, ])
       ppvHc <- tabit[2, 2] / sum(tabit[2, ])
     } else {
-      tabit <- with(df_CV, table(treat.recommend, treat.recommend.original))
-      sensH <- if (nrow(tabit) > 0 && ncol(tabit) > 0) tabit[1, 1] / sum(tabit[, 1]) else NA
-      sensHc <- NA
-      ppvH <- if (nrow(tabit) > 0) tabit[1, 1] / sum(tabit[1, ]) else NA
-      ppvHc <- NA
+      if (nrow(tabit) == 1L && identical(colnames(tabit), c("0", "1")) &&
+          all(tabit[1, ] > 0)) {
+        # The folds assign a single level while the full-data assignment has
+        # both: the two-level definitions above, with the missing fold level
+        # counted as zero subjects and 0/0 = 0.  Folds identifying nothing
+        # give 0, 1, 0 and the full-data complement share; folds putting
+        # everyone in H give 1, 0, the full-data H share and 0.
+        tab2 <- with(df_CV, table(factor(treat.recommend, levels = c(0, 1)),
+                                  factor(treat.recommend.original, levels = c(0, 1))))
+        .agree <- function(num, den) if (den > 0) num / den else 0
+        sensH  <- .agree(tab2[1, 1], sum(tab2[, 1]))
+        sensHc <- .agree(tab2[2, 2], sum(tab2[, 2]))
+        ppvH   <- .agree(tab2[1, 1], sum(tab2[1, ]))
+        ppvHc  <- .agree(tab2[2, 2], sum(tab2[2, ]))
+      } else {
+        sensH <- if (nrow(tabit) > 0 && ncol(tabit) > 0) tabit[1, 1] / sum(tabit[, 1]) else NA
+        sensHc <- NA
+        ppvH <- if (nrow(tabit) > 0) tabit[1, 1] / sum(tabit[1, ]) else NA
+        ppvHc <- NA
+      }
     }
 
     sens_metrics_original <- c(sensH, sensHc, ppvH, ppvHc)
@@ -1437,6 +1509,16 @@ forestsearch_KfoldOut <- function(res, details = FALSE, outall = FALSE,
     outcome_type <- res$cv_args$outcome_type
     is_glm <- !is.null(outcome_type) && outcome_type != "survival"
 
+    # Orientation for the GLM effect column: the fit's resolved
+    # adverse_outcome (cv_args is the fit's args_call_all), so the table's
+    # estimate is the fit's own, sign included.  NULL only on an object not
+    # built by forestsearch(); resolved by forestsearch()'s rule.  Arm means
+    # and Diff stay raw.
+    adverse_outcome <- res$cv_args$adverse_outcome
+    if (is_glm && is.null(adverse_outcome)) {
+      adverse_outcome <- outcome_type %in% c("binary", "count")
+    }
+
     if (no_original_sg) {
       # No original subgroup identified: return ITT-only tables.  There is no
       # subgroup to tabulate, and the survival subgroup-table path would split
@@ -1455,6 +1537,7 @@ forestsearch_KfoldOut <- function(res, details = FALSE, outall = FALSE,
             outcome.name      = outcome.name,
             offset.name       = res$cv_args$offset.name,
             effect_measure    = effect_measure,
+            adverse_outcome   = adverse_outcome,
             adjust_covariates = res$cv_args$adjust_covariates),
           error = function(e) NULL)
         itt_tab <- tryCatch(
@@ -1511,6 +1594,7 @@ forestsearch_KfoldOut <- function(res, details = FALSE, outall = FALSE,
           outcome.name      = outcome.name,
           offset.name       = offset.name,
           effect_measure    = effect_measure,
+          adverse_outcome   = adverse_outcome,
           adjust_covariates = res$cv_args$adjust_covariates
         ),
         error = function(e) NULL
@@ -1753,7 +1837,32 @@ forestsearch_KfoldOut <- function(res, details = FALSE, outall = FALSE,
 #' @param sg_analysis Character vector. Subgroup analysis labels.
 #'
 #' @return List with indicators for any match, exact match, one match, and
-#'   covariate-specific matches.
+#'   covariate-specific matches, one value per fold (\code{sg1[i]},
+#'   \code{sg2[i]} are the factor labels of fold \code{i}'s subgroup,
+#'   \code{NA} for an empty slot):
+#'   \describe{
+#'     \item{any_found}{1 if the fold found a subgroup (either slot not
+#'       \code{NA}), else 0.}
+#'     \item{exact_match}{1 if the fold's subgroup is the full-data
+#'       subgroup \code{sg_analysis}, else 0.  For a two-factor
+#'       \code{sg_analysis}, both factors appear in the fold's two slots,
+#'       in either order.  For a one-factor \code{sg_analysis}, the fold's
+#'       subgroup is that factor alone: one slot holds it and the other is
+#'       \code{NA}.  A fold subgroup that combines it with a second factor
+#'       is not exact; it counts in \code{one_match}.}
+#'     \item{one_match}{1 if at least one full-data factor appears in
+#'       either slot, else 0.}
+#'     \item{cov1_any, cov2_any}{1 if the fold's subgroup uses the
+#'       covariate of the first (second) full-data factor, with any cut
+#'       (see \code{\link{find_covariate_any_match}}), else 0.}
+#'     \item{cov1_exact, cov2_exact}{1 if the first (second) full-data
+#'       factor appears in either slot, else 0.}
+#'   }
+#'   \code{cov2_any} and \code{cov2_exact} are \code{NA} unless
+#'   \code{sg_analysis} has two factors.  A comparison with \code{NA}
+#'   counts as 0.  When \code{sg_analysis} has no element, or more than
+#'   two, \code{exact_match}, \code{one_match}, \code{cov1_any} and
+#'   \code{cov1_exact} are 0 for every fold.
 #'
 
 #' @examples
@@ -1794,12 +1903,16 @@ CV_sgs <- function(sg1, sg2, confs, sg_analysis) {
   } else if (sg_depth == 1) {
     sg1a <- sg_analysis[1]
 
-    # Exact match
-    exact_match <- ifelse((sg1 == sg1a | sg2 == sg1a), 1, 0)
+    # Factor appears in the fold's subgroup (either slot)
+    contains_match <- ifelse((sg1 == sg1a | sg2 == sg1a), 1, 0)
+    contains_match[is.na(contains_match)] <- 0.0
+
+    # Exact match: the fold's subgroup is that factor alone (other slot NA)
+    exact_match <- ifelse((sg1 == sg1a & is.na(sg2)) | (sg2 == sg1a & is.na(sg1)), 1, 0)
     exact_match[is.na(exact_match)] <- 0.0
 
-    one_match <- exact_match
-    cov1_match <- exact_match
+    one_match <- contains_match
+    cov1_match <- contains_match
     cov2_match <- NA
 
     # Find covariate any match
@@ -1975,7 +2088,9 @@ resolve_cv_parallel_args <- function(parallel_args, fs_args, details = FALSE) {
 #'   K-fold summary.
 #' @examples
 #' \dontrun{
-#' fs <- forestsearch(gbsg,
+#' gbsg <- survival::gbsg
+#' gbsg$grade3 <- as.integer(gbsg$grade == 3)
+#' fs <- forestsearch(gbsg, id.name = "pid",
 #'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
 #'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
 #' oob <- forestsearch_Kfold(fs.est = fs)
@@ -2004,7 +2119,9 @@ print.fs_kfold <- function(x, ...) {
 #'   repeated K-fold summary.
 #' @examples
 #' \dontrun{
-#' fs <- forestsearch(gbsg,
+#' gbsg <- survival::gbsg
+#' gbsg$grade3 <- as.integer(gbsg$grade == 3)
+#' fs <- forestsearch(gbsg, id.name = "pid",
 #'   confounders.name = c("age", "meno", "size", "grade3", "nodes", "pgr", "er"),
 #'   outcome.name = "rfstime", treat.name = "hormon", event.name = "status")
 #' kfold <- forestsearch_tenfold(fs.est = fs, sims = 5)
